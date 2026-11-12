@@ -456,9 +456,11 @@ static void spu_drain_call_impl(spu_context* ctx, uint32_t return_pc);
 /* Resistance port: [spu-jobs] per-job timing and the focus-job lane boost.
  * A job starts at the indirect branch that enters it (spu_indirect_branch
  * calls spu_jobtime_begin when the link register holds a job-return pc) and
- * ends when the drain that waits for that return pc comes back:
- *   igkernel jobs (R3 "ig" SPURS, igpm image SPU_IGJOB_IMG=2): link
- *     SPU_IGJOB_LINK=0x3F8F4; the job is the image owning the target pc.
+ * ends when control comes back to that return pc (an indirect branch to it,
+ * or the drain that waits for it):
+ *   igkernel jobs (R3 "ig" SPURS): link SPU_IGJOB_LINK=0x3F8F4; the job is
+ *     the resident code image owning the target pc (SPU_IGJOB_IMG=<n>
+ *     restricts the kernel image id, default 0 = any).
  *   WWS jobs (pm_wwsjob, policy mode): link 0x2AA0.
  * SPU_JOB_TIMING=0 turns it all off. Every ~5 s it prints, for the focus
  * images (SPU_JOB_FOCUS, default 419 = the ADS depth-of-field job) and the
@@ -482,7 +484,7 @@ typedef struct {
 static sjt_stat s_sjt[SJT_NIMG];
 static volatile long s_sjt_active;
 static volatile long long s_sjt_next;
-static int s_sjt_on = -1, s_sjt_igimg = 2;
+static int s_sjt_on = -1, s_sjt_igimg = 0;
 static int s_sjt_focus[8], s_sjt_nfocus, s_sjt_boost[8], s_sjt_nboost;
 static long long s_sjt_qf, s_sjt_q0; static unsigned long long s_sjt_t0;
 uint32_t g_sjt_link_a = 0x3F8F4u, g_sjt_link_b = 0x2AA0u;
@@ -537,6 +539,7 @@ static void sjt_drop(void)
     _InterlockedDecrement(&s_sjt_active);
 }
 
+static void spu_jobtime_end(void);
 void spu_jobtime_begin(spu_context* ctx, uint32_t link)
 {
     if (__builtin_expect(s_sjt_on < 0, 0)) {
@@ -546,18 +549,23 @@ void spu_jobtime_begin(spu_context* ctx, uint32_t link)
         if (!s_sjt_on || (link != g_sjt_link_a && link != g_sjt_link_b)) return;
     }
     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
-    if (pc == link) return;                      /* the job's own return */
-    int img;
-    if (link == g_sjt_link_b) {
-        if (!ctx->policy_mode) return;
-        img = ctx->resident_ovl;
-    } else {
-        if (ctx->image_id != s_sjt_igimg) return;
-        img = 0;
+    if (pc == link) {
+        /* The job's own return. WWS jobs (and ig jobs left by a jump) come
+         * back by an indirect branch to the link, not through a drain. */
+        if (t_sjt_link == link) spu_jobtime_end();
+        return;
     }
+    int img = 0;
+    if (link == g_sjt_link_b && !ctx->policy_mode) return;
+    /* The ig kernel's own image id is current here (spu_img_restore), so the
+     * job is identified by the resident code slot owning the target pc;
+     * SPU_IGJOB_IMG=<n> (default 0 = any) restricts the kernel image. */
+    if (link == g_sjt_link_a && s_sjt_igimg > 0 && ctx->image_id != s_sjt_igimg) return;
     for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
         if (ctx->resident_code[s].image_id && pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size) {
             img = ctx->resident_code[s].image_id; break; }
+    if (link == g_sjt_link_b && !img) img = ctx->resident_ovl;
+    if (link == g_sjt_link_a && !img) return;
     LARGE_INTEGER q; QueryPerformanceCounter(&q);
     if (t_sjt_link) {
         /* Already in a job: an internal jump with lr still holding the link.

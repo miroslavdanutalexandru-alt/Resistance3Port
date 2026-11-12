@@ -717,6 +717,205 @@ index 8f79b7c..9a1ab93 100644
  	logs::listener::sync_all();
  
  	if (IsDebuggerPresent())
+diff --git a/Utilities/mutex.cpp.bak_overnight b/Utilities/mutex.cpp.bak_overnight
+new file mode 100644
+index 0000000..6019245
+--- /dev/null
++++ b/Utilities/mutex.cpp.bak_overnight
+@@ -0,0 +1,193 @@
++#include "mutex.h"
++
++#include "util/asm.hpp"
++
++void shared_mutex::imp_lock_shared(u32 val)
++{
++	ensure(val < c_err); // "shared_mutex underflow"
++
++	// Try to steal the notification bit
++	if (val & c_sig && m_value.compare_exchange(val, val - c_sig + 1))
++	{
++		return;
++	}
++
++	for (int i = 0; i < 10; i++)
++	{
++		if (try_lock_shared())
++		{
++			return;
++		}
++
++		const u32 old = m_value.observe();
++
++		if (old & c_sig && m_value.compare_and_swap_test(old, old - c_sig + 1))
++		{
++			return;
++		}
++
++		busy_wait();
++	}
++
++	// Acquire writer lock and downgrade
++	const u32 old = m_value.fetch_add(c_one);
++
++	if (old == 0)
++	{
++		lock_downgrade();
++		return;
++	}
++
++	ensure((old % c_sig) + c_one < c_sig); // "shared_mutex overflow"
++	imp_wait();
++	lock_downgrade();
++}
++
++void shared_mutex::imp_unlock_shared(u32 old)
++{
++	ensure(old - 1 < c_err); // "shared_mutex underflow"
++
++	// Check reader count, notify the writer if necessary
++	if ((old - 1) % c_one == 0)
++	{
++		imp_signal();
++	}
++}
++
++void shared_mutex::imp_wait()
++{
++	while (true)
++	{
++		const auto [old, ok] = m_value.fetch_op([](u32& value)
++		{
++			if (value >= c_sig)
++			{
++				value -= c_sig;
++				return true;
++			}
++
++			return false;
++		});
++
++		if (ok)
++		{
++			break;
++		}
++
++		m_value.wait(old);
++	}
++}
++
++void shared_mutex::imp_signal()
++{
++	m_value += c_sig;
++	m_value.notify_one();
++}
++
++void shared_mutex::imp_lock(u32 val)
++{
++	ensure(val < c_err); // "shared_mutex underflow"
++
++	// Try to steal the notification bit
++	if (val & c_sig && m_value.compare_exchange(val, val - c_sig + c_one))
++	{
++		return;
++	}
++
++	for (int i = 0; i < 10; i++)
++	{
++		busy_wait();
++
++		const u32 old = m_value.observe();
++
++		if (!old && try_lock())
++		{
++			return;
++		}
++
++		if (old & c_sig && m_value.compare_and_swap_test(old, old - c_sig + c_one))
++		{
++			return;
++		}
++	}
++
++	const u32 old = m_value.fetch_add(c_one);
++
++	if (old == 0)
++	{
++		return;
++	}
++
++	ensure((old % c_sig) + c_one < c_sig); // "shared_mutex overflow"
++	imp_wait();
++}
++
++void shared_mutex::imp_unlock(u32 old)
++{
++	ensure(old - c_one < c_err); // "shared_mutex underflow"
++
++	// 1) Notify the next writer if necessary
++	// 2) Notify all readers otherwise if necessary (currently indistinguishable from writers)
++	if (old - c_one)
++	{
++		imp_signal();
++	}
++}
++
++void shared_mutex::imp_lock_upgrade()
++{
++	for (int i = 0; i < 10; i++)
++	{
++		busy_wait();
++
++		if (try_lock_upgrade())
++		{
++			return;
++		}
++	}
++
++	// Convert to writer lock
++	const u32 old = m_value.fetch_add(c_one - 1);
++
++	ensure((old % c_sig) + c_one - 1 < c_sig); // "shared_mutex overflow"
++
++	if (old % c_one == 1)
++	{
++		return;
++	}
++
++	imp_wait();
++}
++
++void shared_mutex::imp_lock_unlock()
++{
++	u32 _max = 1;
++
++	for (int i = 0; i < 30; i++)
++	{
++		const u32 val = m_value.observe();
++
++		if (val % c_one == 0 && (val / c_one < _max || val >= c_sig))
++		{
++			// Return if have cought a state where:
++			// 1) Mutex is free
++			// 2) Total number of waiters decreased since last check
++			// 3) Signal bit is set (if used on the platform)
++			return;
++		}
++
++		_max = val / c_one;
++
++		busy_wait(1500);
++	}
++
++	// Lock and unlock
++	if (!m_value.fetch_add(c_one))
++	{
++		unlock();
++		return;
++	}
++
++	imp_wait();
++	unlock();
++}
 diff --git a/rpcs3/Emu/Memory/vm.h b/rpcs3/Emu/Memory/vm.h
 index 9e8aa9e..1a1028f 100644
 --- a/rpcs3/Emu/Memory/vm.h
@@ -1633,10 +1832,10 @@ index 4176076..cb58e38 100644
  		}
  		else
 diff --git a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
-index af17bac..b47026a 100644
+index af17bac..050f50c 100644
 --- a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
 +++ b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
-@@ -9,6 +9,7 @@
+@@ -9,17 +9,119 @@
  #include "Emu/RSX/RSXThread.h"
  #include "Emu/RSX/rsx_methods.h"
  #include "Emu/system_config.h"
@@ -1644,7 +1843,19 @@ index af17bac..b47026a 100644
  
  #include "Emu/RSX/NV47/HW/context_accessors.define.h"
  
-@@ -20,6 +21,99 @@ namespace rsx
+ namespace rsx
+ {
++	// R2PORT: RSX_ZPASS_DEPTH=1 enables the #19608 backport (keep the depth buffer bound while zpass counting is on).
++	// Off by default: on this tree it darkens/shifts R3 Haven lighting (left quarter of the screen goes dark).
++	bool zpass_keeps_depth()
++	{
++		static const bool on = [] { const char* e = std::getenv("RSX_ZPASS_DEPTH"); return e && *e == '1'; }();
++		return on;
++	}
++
+ 	constexpr u32 fs_export_config_mask =
+ 		RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE |
+ 		RSX_SHADER_CONTROL_ROP_MULTISAMPLED |
  		RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING |
  		RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE;
  
@@ -1744,7 +1955,20 @@ index af17bac..b47026a 100644
  	static bool evaluate_programmable_blending_state(rsx::context* ctx, u32& fragment_ctrl)
  	{
  		const bool is_blend_config_dirty = ctx->graphics_state.test(rsx::blend_config_dirty);
-@@ -316,6 +410,50 @@ namespace rsx
+@@ -303,6 +405,12 @@ namespace rsx
+ 					{
+ 						depth_buffer_unused = false;
+ 					}
++					else if (zpass_keeps_depth() && REGS(m_ctx)->registers[NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE])
++					{
++						// Upstream #19608: zpass occlusion queries count against the bound depth buffer even when
++						// depth test is off; dropping it makes the counts wrong (R3 flickering lights, #18827)
++						depth_buffer_unused = false;
++					}
+ 				}
+ 			}
+ 
+@@ -316,6 +424,50 @@ namespace rsx
  			fmt::throw_exception("Unknown framebuffer context 0x%x", static_cast<u32>(context));
  		}
  
@@ -1795,7 +2019,7 @@ index af17bac..b47026a 100644
  		// Swizzled render does tight packing of bytes
  		bool packed_render = false;
  		u32 minimum_color_pitch = 64u;
-@@ -1006,6 +1144,7 @@ namespace rsx
+@@ -1006,6 +1158,7 @@ namespace rsx
  		m_ctx->program.fragment_program.total_length = m_ctx->program.fp_metadata.program_ucode_length + m_ctx->program.fp_metadata.program_start_offset;
  		m_ctx->program.fragment_program.texture_state.import(m_ctx->program.fp_texture_state, m_ctx->program.fp_metadata.referenced_textures_mask);
  		m_ctx->program.fragment_program.valid = true;
@@ -1803,7 +2027,7 @@ index af17bac..b47026a 100644
  
  		// Verify current texture state is valid
  		if (m_ctx->textures.fragment_textures_dirty & m_ctx->program.fp_metadata.referenced_textures_mask)
-@@ -1046,6 +1185,8 @@ namespace rsx
+@@ -1046,6 +1199,8 @@ namespace rsx
  		);
  
  		m_ctx->program.vertex_program.texture_state.import(m_ctx->program.vp_texture_state, m_ctx->program.vp_metadata.referenced_textures_mask);
@@ -1812,7 +2036,7 @@ index af17bac..b47026a 100644
  
  		// Verify current texture state is valid
  		if (m_ctx->textures.vertex_textures_dirty & m_ctx->program.vp_metadata.referenced_textures_mask)
-@@ -1056,7 +1197,69 @@ namespace rsx
+@@ -1056,7 +1211,69 @@ namespace rsx
  
  	void graph_engine::analyse_current_rsx_pipeline()
  	{
@@ -1883,7 +2107,7 @@ index af17bac..b47026a 100644
  
  		if (u32 export_ctrl = get_fragment_program_export_config();
  			(m_ctx->program.fragment_program.ctrl & fs_export_config_mask) != export_ctrl)
-@@ -1069,6 +1272,7 @@ namespace rsx
+@@ -1069,6 +1286,7 @@ namespace rsx
  			m_ctx->graphics_state.set(rsx::pipeline_state::fragment_program_state_dirty);
  		}
  
@@ -1891,7 +2115,7 @@ index af17bac..b47026a 100644
  		prefetch_vertex_program();
  		prefetch_fragment_program();
  	}
-@@ -1148,6 +1352,10 @@ namespace rsx
+@@ -1148,6 +1366,10 @@ namespace rsx
  		m_ctx->program.fragment_program.ctrl &= fs_export_config_mask;
  		m_ctx->program.fragment_program.ctrl |= REGS(m_ctx)->shader_control() & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT | RSX_SHADER_CONTROL_USES_KIL);
  		m_ctx->program.fragment_program.texcoord_control_mask = REGS(m_ctx)->texcoord_control_mask();
@@ -2034,7 +2258,7 @@ index 311a8ec..709b9f8 100644
  			if (!success)
  			{
 diff --git a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
-index 7cb1137..ad50088 100644
+index 7cb1137..dbd0a9f 100644
 --- a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
 +++ b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
 @@ -11,6 +11,59 @@ namespace rsx
@@ -2123,7 +2347,14 @@ index 7cb1137..ad50088 100644
  				// Flip semaphore doesnt need wake-up delay
  				if (addr != ctx->fw.label_addr + 0x10)
  				{
-@@ -56,6 +126,11 @@ namespace rsx
+@@ -52,10 +122,18 @@ namespace rsx
+ 			else
+ 			{
+ 				//RSX(ctx)->flush_fifo();
++
++				// R2PORT (#20055): the application may wait on GET reaching PUT while the puller is blocked
++				RSX(ctx)->fifo_ctrl->sync_get_for_wait();
+ 			}
  
  			u64 start = get_system_time();
  			u64 last_check_val = start;
@@ -2135,7 +2366,7 @@ index 7cb1137..ad50088 100644
  
  			while (sema != arg)
  			{
-@@ -71,6 +146,41 @@ namespace rsx
+@@ -71,6 +149,41 @@ namespace rsx
  					break;
  				}
  
@@ -2177,7 +2408,7 @@ index 7cb1137..ad50088 100644
  				if (const auto tdr = static_cast<u64>(g_cfg.video.driver_recovery_timeout))
  				{
  					const u64 current = get_system_time();
-@@ -89,6 +199,7 @@ namespace rsx
+@@ -89,6 +202,7 @@ namespace rsx
  					{
  						// If longer than driver timeout force exit
  						rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
@@ -2185,7 +2416,7 @@ index 7cb1137..ad50088 100644
  						break;
  					}
  				}
-@@ -106,6 +217,14 @@ namespace rsx
+@@ -106,6 +220,14 @@ namespace rsx
  				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
  			}
  
@@ -2200,11 +2431,288 @@ index 7cb1137..ad50088 100644
  			RSX(ctx)->fifo_wake_delay();
  			RSX(ctx)->performance_counters.idle_time += (get_system_time() - start);
  		}
+diff --git a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp.bak_overnight b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp.bak_overnight
+new file mode 100644
+index 0000000..ad50088
+--- /dev/null
++++ b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp.bak_overnight
+@@ -0,0 +1,271 @@
++#include "stdafx.h"
++#include "nv406e.h"
++#include "nv47_sync.hpp"
++
++#include "Emu/RSX/RSXThread.h"
++#include "Emu/system_config.h"
++
++#include "context_accessors.define.h"
++
++namespace rsx
++{
++	namespace nv406e
++	{
++		// R3_SEMWAIT_ZCULL (default 1, 0 = off): while an acquire waits, keep retiring the queued ZCULL/report writes.
++		// R3 ADS: the PPU polls an occlusion report (u64 timer != 0, then value at +8) before it kicks the SPU job
++		// that clears label 77. Reports queued behind host queries only retire from the main loop, which never runs
++		// while rsx::thread sits in this acquire, so the three of them wait on each other until the timeout/cap.
++		static u32 r3_semwait_zcull_us()
++		{
++			static const u32 us = []
++			{
++				const char* v = std::getenv("R3_SEMWAIT_ZCULL");
++				if (v && *v == '0' && !v[1]) return ~0u;
++				const char* d = std::getenv("R3_SEMWAIT_ZCULL_US");
++				return d && *d ? static_cast<u32>(std::max(0, std::atoi(d))) : 200u;
++			}();
++			return us;
++		}
++
++		static void r3_semwait_zcull(context* ctx, u32 addr, u64 waited, u64 now, u64& next_sync)
++		{
++			const u32 delay = r3_semwait_zcull_us();
++			if (delay == ~0u)
++			{
++				return;
++			}
++
++			auto rsx = RSX(ctx);
++			auto& zc = rsx->zcull();
++			if (!zc.has_pending())
++			{
++				return;
++			}
++
++			const u64 retired0 = zc.m_r2_retired;
++			if (waited < delay)
++			{
++				// Non-blocking: submit the queries and retire what is already available
++				zc.update(rsx, 0, true);
++			}
++			else if (now >= next_sync)
++			{
++				// Blocking read of the claimed reports (only waits when the guest reads report memory), then labels
++				zc.sync(rsx);
++				zc.update(rsx, 0, true);
++				rsx->r2_poll_deferred_labels(true);
++				next_sync = now + 1000;
++			}
++
++			if (g_semlog_on && zc.m_r2_retired != retired0)
++			{
++				semlog_set_base(ctx->fw.label_addr);
++				semlog_note_val(addr, vm::read32(addr), 8, static_cast<u32>(zc.m_r2_retired - retired0), static_cast<u32>(waited));
++			}
++		}
++
++		void set_reference(context* ctx, u32 /*reg*/, u32 arg)
++		{
++			RSX(ctx)->sync();
++
++			// Write ref+get (get will be written again with the same value at command end)
++			auto& dma = *vm::_ptr<RsxDmaControl>(RSX(ctx)->dma_address);
++			//dma.get.store(RSX(ctx)->fifo_ctrl->get_pos() + 4);
++			dma.ref.store(arg);
++		}
++
++		void semaphore_acquire(context* ctx, u32 /*reg*/, u32 arg)
++		{
++			RSX(ctx)->sync_point_request.release(true);
++			const u32 addr = get_address(ctx, REGS(ctx)->semaphore_offset_406e(), REGS(ctx)->semaphore_context_dma_406e());
++
++			// Syncronization point, may be associated with memory changes without actually changing addresses
++			ctx->graphics_state |= rsx::pipeline_state::fragment_program_needs_rehash;
++
++			// Ensure atomic seq-cst memory ordering for FIFO GET update
++			atomic_fence_seq_cst();
++
++			const auto& sema = vm::_ref<RsxSemaphore>(addr);
++			const auto& atomic_sema = vm::_ref<atomic_t<RsxSemaphore>>(addr);
++
++			RSX(ctx)->last_sema_cmd = RSX(ctx)->fifo_ctrl->get_pos() - 4;
++			RSX(ctx)->last_sema_addr = addr;
++
++			// R2PORT: deferred labels whose reports are done land first; the rest drain if this has to wait
++			RSX(ctx)->r2_poll_deferred_labels(false);
++			if (sema != arg && RSX(ctx)->r2_has_deferred_labels())
++			{
++				RSX(ctx)->r2_poll_deferred_labels(true);
++			}
++
++			// R3_SEMFIX: an SPU clear of this label that a late RSX release overwrote counts as landed
++			semfix_set_base(ctx->fw.label_addr);
++			if (sema != arg && g_semfix_base && semfix_try_acquire(addr, arg) && g_semlog_on)
++			{
++				semlog_set_base(ctx->fw.label_addr);
++				semlog_note_val(addr, arg, 7, RSX(ctx)->last_sema_cmd, 0);
++			}
++
++			if (sema == arg)
++			{
++				if (g_semfix_base) semfix_acquired(addr);
++
++				// Flip semaphore doesnt need wake-up delay
++				if (addr != ctx->fw.label_addr + 0x10)
++				{
++					//RSX(ctx)->flush_fifo();
++					RSX(ctx)->fifo_wake_delay(2);
++				}
++
++				return;
++			}
++			else
++			{
++				//RSX(ctx)->flush_fifo();
++			}
++
++			u64 start = get_system_time();
++			u64 last_check_val = start;
++			const u64 r3_wait_begin = start; // R3_SEMLOG
++			int r3_timed_out = 0; // 1 driver timeout, 2 R3_SEMFIX_MS cap
++			// R3_SEMFIX_MS: shorter bound when the expected value is the one an SPU job stores to this label
++			const u64 r3_cap = g_semfix_base ? semfix_wait_cap_us(addr, arg) : 0;
++			u64 r3_next_wake = 0, r3_next_prog = 250'000, r3_next_zsync = 0;
++
++			while (sema != arg)
++			{
++				if (RSX(ctx)->test_stopped())
++				{
++					RSX(ctx)->state += cpu_flag::again;
++					return;
++				}
++
++				if (ctx->fw.free_requested)
++				{
++					// lv2 waits for the context to be freed, which only happens once this method returns
++					break;
++				}
++
++				// R3_SEMFIX: the SPU store and a late RSX release can also race after the check above
++				if (g_semfix_base && semfix_try_acquire(addr, arg))
++				{
++					if (g_semlog_on) semlog_note_val(addr, arg, 7, RSX(ctx)->last_sema_cmd, 1);
++					break;
++				}
++
++				{
++					const u64 r3_now = get_system_time();
++					const u64 r3_waited = r3_now - r3_wait_begin;
++
++					r3_semwait_zcull(ctx, addr, r3_waited, r3_now, r3_next_zsync);
++
++					// The short circular-wait cap only applies once no report the guest may be polling is still queued
++					if (r3_cap && r3_waited > r3_cap &&
++						(r3_waited > r3_cap + 50'000 || r3_semwait_zcull_us() == ~0u || !RSX(ctx)->zcull().has_pending()))
++					{
++						semfix_cap_taken(addr, arg, sema, r3_waited);
++						r3_timed_out = 2;
++						break;
++					}
++
++					if (const auto wake = g_rsx_label_wake_hook; wake && r3_now >= r3_next_wake)
++					{
++						wake(0); // R3_SEMWAKE: SPURS polls now, not after its idle back-off
++						r3_next_wake = r3_now + 1000;
++					}
++
++					if (g_semlog_on > 0 && r3_waited >= r3_next_prog)
++					{
++						semlog_wait_progress(addr, arg, sema, r3_waited, r3_next_prog == 250'000);
++						r3_next_prog += 250'000;
++					}
++				}
++
++				if (const auto tdr = static_cast<u64>(g_cfg.video.driver_recovery_timeout))
++				{
++					const u64 current = get_system_time();
++
++					if (current - last_check_val > 20'000)
++					{
++						// Suspicious amnount of time has passed
++						// External pause such as debuggers' pause or operating system sleep may have taken place
++						// Ignore it
++						start += current - last_check_val;
++					}
++
++					last_check_val = current;
++
++					if ((current - start) > tdr)
++					{
++						// If longer than driver timeout force exit
++						rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
++						r3_timed_out = 1;
++						break;
++					}
++				}
++
++				if (RSX(ctx)->external_interrupt_lock ||
++					(RSX(ctx)->state & (cpu_flag::dbg_global_pause + cpu_flag::exit)) == cpu_flag::dbg_global_pause)
++				{
++					RSX(ctx)->cpu_wait({});
++					continue;
++				}
++
++				RSX(ctx)->renderer()->on_semaphore_acquire_wait();
++
++				// Wait until the value changes or until 100us pass.
++				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
++			}
++
++			if (g_semfix_base && sema == arg) semfix_acquired(addr);
++
++			if (g_semlog_on)
++			{
++				semlog_set_base(ctx->fw.label_addr);
++				semlog_report(addr, arg, sema, RSX(ctx)->last_sema_cmd, get_system_time() - r3_wait_begin, r3_timed_out);
++			}
++
++			RSX(ctx)->fifo_wake_delay();
++			RSX(ctx)->performance_counters.idle_time += (get_system_time() - start);
++		}
++
++		void semaphore_release(context* ctx, u32 reg, u32 arg)
++		{
++			const u32 offset = REGS(ctx)->semaphore_offset_406e();
++
++			if (offset % 4)
++			{
++				rsx_log.warning("NV406E semaphore release is using unaligned semaphore, ignoring. (offset=0x%x)", offset);
++				return;
++			}
++
++			const u32 ctxt = REGS(ctx)->semaphore_context_dma_406e();
++
++			// By avoiding doing this on flip's semaphore release
++			// We allow last gcm's registers reset to occur in case of a crash
++			if (const bool is_flip_sema = (offset == 0x10 && ctxt == CELL_GCM_CONTEXT_DMA_SEMAPHORE_R);
++				!is_flip_sema)
++			{
++				RSX(ctx)->sync_point_request.release(true);
++			}
++
++			const u32 addr = get_address(ctx, offset, ctxt);
++
++			// TODO: Check if possible to write on reservations
++			if (ctx->fw.label_addr >> 28 != addr >> 28)
++			{
++				rsx_log.error("NV406E semaphore unexpected address. Please report to the developers. (offset=0x%x, addr=0x%x)", offset, addr);
++				RSX(ctx)->recover_fifo();
++				return;
++			}
++
++			if (addr == RSX(ctx)->device_addr + 0x30 && !arg)
++			{
++				// HW flip synchronization related, 1 is not written without display queue command (TODO: make it behave as real hw)
++				arg = 1;
++			}
++
++			util::write_gcm_label<false, true>(ctx, reg, addr, arg);
++		}
++	}
++}
 diff --git a/rpcs3/Emu/RSX/NV47/HW/nv4097.cpp b/rpcs3/Emu/RSX/NV47/HW/nv4097.cpp
-index e6f0a4b..66ade0c 100644
+index e6f0a4b..151d609 100644
 --- a/rpcs3/Emu/RSX/NV47/HW/nv4097.cpp
 +++ b/rpcs3/Emu/RSX/NV47/HW/nv4097.cpp
-@@ -5,6 +5,7 @@
+@@ -5,11 +5,14 @@
  #include "Emu/RSX/RSXThread.h"
  #include "Emu/RSX/Common/BufferUtils.h"
  #include "Emu/system_config.h"
@@ -2212,7 +2720,14 @@ index e6f0a4b..66ade0c 100644
  
  #include "context_accessors.define.h"
  
-@@ -51,6 +52,7 @@ namespace rsx
+ namespace rsx
+ {
++	bool zpass_keeps_depth(); // RSXGraphEngine.cpp
++
+ 	namespace nv4097
+ 	{
+ 		///// Program management
+@@ -51,6 +54,7 @@ namespace rsx
  			}
  
  			*get_constants_ptr(ctx, range.first_word) = arg;
@@ -2220,7 +2735,7 @@ index e6f0a4b..66ade0c 100644
  		}
  
  		void set_transform_constant::batch_decode(context* ctx, u32 reg, const std::span<const u32>& args, const std::function<bool(context*, u32, u32)>& notify)
-@@ -62,6 +64,7 @@ namespace rsx
+@@ -62,6 +66,7 @@ namespace rsx
  			}
  
  			copy_data_swap_u32(get_constants_ptr(ctx, range.first_word), args.data(), range.word_count);
@@ -2228,7 +2743,7 @@ index e6f0a4b..66ade0c 100644
  
  			// Notify using the range of vec4 constants touched by the write
  			const u32 first_constant = range.first_word / 4;
-@@ -82,11 +85,13 @@ namespace rsx
+@@ -82,11 +87,13 @@ namespace rsx
  			{
  				// Minor optimization: don't compare values if we already know we need invalidation
  				copy_data_swap_u32(dst, src, count);
@@ -2242,6 +2757,28 @@ index e6f0a4b..66ade0c 100644
  				// Transform constants invalidation is expensive (~8k bytes per update)
  				ctx->graphics_state |= rsx::pipeline_state::transform_constants_dirty;
  			}
+@@ -752,6 +759,21 @@ namespace rsx
+ 		void set_zcull_pixel_count_enable(context* ctx, u32, u32)
+ 		{
+ 			RSX(ctx)->notify_zcull_info_changed();
++
++			// Upstream #19608: if the current framebuffer dropped its depth buffer (contested config), rebind it so
++			// zpass counting has the depth buffer to count against
++			if (!zpass_keeps_depth() || !REGS(ctx)->registers[NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE] ||
++				ctx->graphics_state.test(rtt_config_dirty) || !ctx->graphics_state.test(rtt_config_contested))
++			{
++				return;
++			}
++
++			if (ctx->fb.layout.zeta_address)
++			{
++				return;
++			}
++
++			ctx->graphics_state.set(rtt_config_dirty);
+ 		}
+ 
+ 		///// Misc (sync objects, etc)
 diff --git a/rpcs3/Emu/RSX/NV47/HW/nv47_sync.hpp b/rpcs3/Emu/RSX/NV47/HW/nv47_sync.hpp
 index 11910b8..1eb7150 100644
 --- a/rpcs3/Emu/RSX/NV47/HW/nv47_sync.hpp
@@ -2732,7 +3269,7 @@ index 7cab474..da22f2f 100644
  
  	bool two_sided_lighting = false;
 diff --git a/rpcs3/Emu/RSX/RSXFIFO.cpp b/rpcs3/Emu/RSX/RSXFIFO.cpp
-index 107f5b2..876f7b2 100644
+index 107f5b2..c6e1fc5 100644
 --- a/rpcs3/Emu/RSX/RSXFIFO.cpp
 +++ b/rpcs3/Emu/RSX/RSXFIFO.cpp
 @@ -10,16 +10,27 @@
@@ -2783,7 +3320,29 @@ index 107f5b2..876f7b2 100644
  		}
  
  		u32 FIFO_control::translate_address(u32 address) const
-@@ -105,6 +129,19 @@ namespace rsx
+@@ -34,9 +58,20 @@ namespace rsx
+ 			return m_iotable->get_addr(address);
+ 		}
+ 
++		// R2PORT (RPCS3 PR #20055, not merged upstream): R2_FIFO_GET_EXEC / R3_FIFO_GET_EXEC (1 = on). While the last
++		// atomic fetch stopped at PUT, publish the execution position as GET instead of the end of the cache. The game
++		// links a command segment into the ring, moves PUT past it and reuses the segment memory (including the exit JUMP
++		// at the old PUT, which the cache does not hold) as soon as GET says it is done; publishing the cache end let the
++		// puller later execute a data word as a JUMP (FIFO desync). A blocking NV406E acquire still publishes the cache end.
++		static const bool g_fifo_get_exec = [] {
++			const char* e = std::getenv("R2_FIFO_GET_EXEC");
++			if (!e) e = std::getenv("R3_FIFO_GET_EXEC");
++			return e && *e == '1';
++		}();
++
+ 		void FIFO_control::sync_get() const
+ 		{
+-			if (m_fifo_pos - m_cache_addr <= m_cache_size)
++			if (m_fifo_pos - m_cache_addr <= m_cache_size && !m_cache_ends_at_put)
+ 			{
+ 				// Atomic FIFO only path
+ 				m_ctrl->get.release(m_cache_addr + m_cache_size);
+@@ -105,6 +140,19 @@ namespace rsx
  			}
  		}
  
@@ -2803,7 +3362,15 @@ index 107f5b2..876f7b2 100644
  		std::pair<bool, u32> FIFO_control::fetch_u32(u32 addr)
  		{
  			if (addr - m_cache_addr >= m_cache_size)
-@@ -170,7 +207,18 @@ namespace rsx
+@@ -134,6 +182,7 @@ namespace rsx
+ 					 	// No GET update here
+ 					 	m_cache_addr = addr;
+ 					 	m_cache_size = 4;
++					 	m_cache_ends_at_put = false;
+ 					 	return {true, cmd};
+ 					 }
+ 				}
+@@ -170,7 +219,18 @@ namespace rsx
  				u32 bytes_read = 0;
  
  				u32 fifo_code_path = m_next_cmd_entry;
@@ -2823,7 +3390,7 @@ index 107f5b2..876f7b2 100644
  
  				// Find the next set bit after every iteration
  				for (int i = 0;; i = (std::countr_zero<u32>(std::rotl<u8>(to_fetch, 0 - i - 1)) + i + 1) % 8)
-@@ -256,6 +304,7 @@ namespace rsx
+@@ -256,6 +316,7 @@ namespace rsx
  						const auto then = std::exchange(now, get_system_time());
  						start_time = now;
  						m_thread->performance_counters.idle_time += now - then;
@@ -2831,7 +3398,34 @@ index 107f5b2..876f7b2 100644
  					}
  					else
  					{
-@@ -355,7 +404,7 @@ namespace rsx
+@@ -268,6 +329,9 @@ namespace rsx
+ 					}
+ 				}
+ 
++				// R2PORT (#20055): PUT as seen by this fetch; a later PUT move does not put the next word in the cache
++				m_cache_ends_at_put = g_fifo_get_exec && m_cache_addr + m_cache_size == put;
++
+ 				// Update FIFO GET
+ 				sync_get();
+ 				atomic_fence_seq_cst();
+@@ -278,6 +342,16 @@ namespace rsx
+ 			return {true, ret};
+ 		}
+ 
++		void FIFO_control::sync_get_for_wait()
++		{
++			if (m_cache_ends_at_put && m_fifo_pos - m_cache_addr <= m_cache_size)
++			{
++				// GET reaches the end of the cache and stays there until the next fetch, so it never moves backwards
++				m_ctrl->get.release(m_cache_addr + m_cache_size);
++				m_cache_ends_at_put = false;
++			}
++		}
++
+ 		void FIFO_control::set_get(u32 get, u32 spin_cmd)
+ 		{
+ 			invalidate_cache();
+@@ -355,7 +429,7 @@ namespace rsx
  
  				if (g_cfg.core.rsx_fifo_accuracy) [[ unlikely ]]
  				{
@@ -2840,7 +3434,7 @@ index 107f5b2..876f7b2 100644
  
  					if (!ok)
  					{
-@@ -391,6 +440,16 @@ namespace rsx
+@@ -391,6 +465,16 @@ namespace rsx
  				return true;
  			}
  
@@ -2857,7 +3451,7 @@ index 107f5b2..876f7b2 100644
  			m_fifo_pos += 4;
  			return false;
  		}
-@@ -416,10 +475,13 @@ namespace rsx
+@@ -416,10 +500,13 @@ namespace rsx
  		void FIFO_control::abort()
  		{
  			m_remaining_commands = 0;
@@ -2871,7 +3465,7 @@ index 107f5b2..876f7b2 100644
  			if (m_remaining_commands)
  			{
  				// Previous block aborted to wait for PUT pointer
-@@ -529,7 +591,7 @@ namespace rsx
+@@ -529,7 +616,7 @@ namespace rsx
  			{
  				m_fifo_pos += 4;
  
@@ -2880,7 +3474,7 @@ index 107f5b2..876f7b2 100644
  
  				if (!ok)
  				{
-@@ -588,8 +650,29 @@ namespace rsx
+@@ -588,8 +675,29 @@ namespace rsx
  			}
  		}
  
@@ -2910,7 +3504,7 @@ index 107f5b2..876f7b2 100644
  			if (!enabled)
  			{
  				if (fifo_hint == optimization_hint::application_not_compatible)
-@@ -598,7 +681,7 @@ namespace rsx
+@@ -598,7 +706,7 @@ namespace rsx
  					return;
  				}
  
@@ -2919,7 +3513,7 @@ index 107f5b2..876f7b2 100644
  				{
  					// Low draw call pressure
  					fifo_hint = optimization_hint::load_low;
-@@ -615,7 +698,7 @@ namespace rsx
+@@ -615,7 +723,7 @@ namespace rsx
  			if (enabled)
  			{
  				// Currently activated. Check if there is any benefit
@@ -2928,7 +3522,7 @@ index 107f5b2..876f7b2 100644
  				{
  					// Not worth it, disable
  					enabled = false;
-@@ -623,7 +706,7 @@ namespace rsx
+@@ -623,7 +731,7 @@ namespace rsx
  				}
  
  				u32 real_total = total_draw_count + num_collapsed;
@@ -2937,7 +3531,7 @@ index 107f5b2..876f7b2 100644
  				{
  					// Low total number of draws submitted, no need to keep trying for now
  					enabled = false;
-@@ -635,7 +718,7 @@ namespace rsx
+@@ -635,7 +743,7 @@ namespace rsx
  			else
  			{
  				// Not enabled, check if we should try enabling
@@ -2946,7 +3540,7 @@ index 107f5b2..876f7b2 100644
  				if (fifo_hint != load_unoptimizable)
  				{
  					// If its set to unoptimizable, we already tried and it did not work
-@@ -761,10 +844,15 @@ namespace rsx
+@@ -761,10 +869,15 @@ namespace rsx
  				{
  					performance_counters.FIFO_idle_timestamp = get_system_time();
  					performance_counters.state = FIFO::state::empty;
@@ -2963,7 +3557,15 @@ index 107f5b2..876f7b2 100644
  				}
  
  				return;
-@@ -803,6 +891,7 @@ namespace rsx
+@@ -777,6 +890,7 @@ namespace rsx
+ 			case FIFO::FIFO_ERROR:
+ 			{
+ 				rsx_log.error("FIFO error: possible desync event (last cmd = 0x%x)", get_fifo_cmd());
++				{ static u32 s_desyncs = 0; if (++s_desyncs <= 50) std::fprintf(stderr, "[fifo] desync #%u (last cmd 0x%x, get 0x%x)\n", s_desyncs, get_fifo_cmd(), fifo_ctrl->get_pos()); } // R2PORT: counted in run.log
+ 				recover_fifo();
+ 				return;
+ 			}
+@@ -803,6 +917,7 @@ namespace rsx
  				else
  				{
  					last_known_code_start = offs;
@@ -2971,7 +3573,7 @@ index 107f5b2..876f7b2 100644
  				}
  
  				//rsx_log.warning("rsx jump(0x%x) #addr=0x%x, cmd=0x%x, get=0x%x, put=0x%x", offs, m_ioAddress + get, cmd, get, put);
-@@ -820,6 +909,7 @@ namespace rsx
+@@ -820,6 +935,7 @@ namespace rsx
  				}
  
  				const u32 offs = cmd & RSX_METHOD_CALL_OFFSET_MASK;
@@ -2979,7 +3581,7 @@ index 107f5b2..876f7b2 100644
  				fifo_ret_addr = fifo_ctrl->get_pos() + 4;
  				fifo_ctrl->set_get(offs);
  				last_known_code_start = offs;
-@@ -834,6 +924,7 @@ namespace rsx
+@@ -834,6 +950,7 @@ namespace rsx
  					return;
  				}
  
@@ -2987,7 +3589,7 @@ index 107f5b2..876f7b2 100644
  				// Optimize returning to another CALL
  				if ((ctrl->put & ~3) != fifo_ret_addr)
  				{
-@@ -875,11 +966,15 @@ namespace rsx
+@@ -875,11 +992,15 @@ namespace rsx
  			}
  
  			// Update performance counters with time spent in idle mode
@@ -3004,7 +3606,7 @@ index 107f5b2..876f7b2 100644
  			if (capture_current_frame) [[unlikely]]
  			{
  				const u32 reg = (command.reg & 0xfffc) >> 2;
-@@ -982,6 +1077,16 @@ namespace rsx
+@@ -982,6 +1103,16 @@ namespace rsx
  			m_ctx->register_state->decode(reg, value);
  
  			const bool value_changed = m_ctx->register_state->latch != value;
@@ -3021,8 +3623,1130 @@ index 107f5b2..876f7b2 100644
  			if (value_changed)
  			{
  				// Mark the decoded draw state that depends on this register. Applies to method registers too.
+diff --git a/rpcs3/Emu/RSX/RSXFIFO.cpp.bak_overnight b/rpcs3/Emu/RSX/RSXFIFO.cpp.bak_overnight
+new file mode 100644
+index 0000000..876f7b2
+--- /dev/null
++++ b/rpcs3/Emu/RSX/RSXFIFO.cpp.bak_overnight
+@@ -0,0 +1,1116 @@
++#include "stdafx.h"
++
++#include "Emu/System.h"
++#include "RSXFIFO.h"
++#include "RSXThread.h"
++#include "Capture/rsx_capture.h"
++#include "Core/RSXReservationLock.hpp"
++#include "Emu/Memory/vm_reservation.h"
++#include "Emu/Cell/lv2/sys_rsx.h"
++#include "NV47/HW/context.h"
++
++#include "util/asm.hpp"
++#include "port_backoff.h" // R2PORT
++#include "port_prof.h" // R2PORT
++#include "../../../../../include/ps3emu/port_hitch.h" // R2PORT: [hitch] logger
++#include <cstdlib>
++
++#include <thread>
++
++using spu_rdata_t = std::byte[128];
++
++// R2_DRAWLOG (Core/RSXCoreRenderer.cpp)
++extern u32 g_r2_fifo_methods;
++void r2_drawlog_flow(const char* what, u32 from, u32 to);
++void r2_drawlog_method(u32 reg, u32 value);
++
++extern void mov_rdata(spu_rdata_t& _dst, const spu_rdata_t& _src);
++extern bool cmp_rdata(const spu_rdata_t& _lhs, const spu_rdata_t& _rhs);
++
++namespace rsx
++{
++	static thread_local port_backoff s_r2_empty_backoff; // R2PORT: FIFO-empty wait on the RSX thread
++
++	namespace FIFO
++	{
++		FIFO_control::FIFO_control(::rsx::thread* pctrl)
++		{
++			m_thread = pctrl;
++			m_ctrl = pctrl->ctrl;
++			m_iotable = &pctrl->iomap_table;
++
++			// R2PORT: R2_FIFO=fast|atomic|ordered overrides the FIFO fetch mode. The port never parses
++			// rpcs3_config.yml's Core section, so the mode is upstream's default, atomic: every 1 KB
++			// command fetch is copied and compared in 128-byte lines against reservation timestamps the
++			// port's guest writers never bump. fast reads guest memory directly (less rsx::thread work)
++			// but does not guard against the game rewriting commands it already published: opt-in.
++			if (const char* e = std::getenv("R2_FIFO"))
++			{
++				const std::string_view v{e};
++				const rsx_fifo_mode m = v == "fast" ? rsx_fifo_mode::fast : v == "ordered" ? rsx_fifo_mode::atomic_ordered : rsx_fifo_mode::atomic;
++				g_cfg.core.rsx_fifo_accuracy.set(m);
++				rsx_log.notice("R2_FIFO: FIFO fetch mode %s", v == "fast" ? "fast" : v == "ordered" ? "atomic_ordered" : "atomic");
++			}
++		}
++
++		u32 FIFO_control::translate_address(u32 address) const
++		{
++			return m_iotable->get_addr(address);
++		}
++
++		void FIFO_control::sync_get() const
++		{
++			if (m_fifo_pos - m_cache_addr <= m_cache_size)
++			{
++				// Atomic FIFO only path
++				m_ctrl->get.release(m_cache_addr + m_cache_size);
++			}
++			else
++			{
++				m_ctrl->get.release(m_fifo_pos);
++			}
++		}
++
++		void FIFO_control::restore_state(u32 cmd, u32 count, u32 position)
++		{
++			m_cmd = cmd;
++			m_command_inc = ((m_cmd & RSX_METHOD_NON_INCREMENT_CMD_MASK) == RSX_METHOD_NON_INCREMENT_CMD) ? 0 : 4;
++			m_remaining_commands = count;
++			m_fifo_pos = position - (count ? 4 : 0);
++			m_args_ptr = m_iotable->get_addr(m_fifo_pos);
++			m_command_reg = (m_cmd & 0xffff) + m_command_inc * (((m_cmd >> 18) - count) & 0x7ff) - m_command_inc;
++			m_next_cmd_entry = position + m_remaining_commands * 4;
++		}
++
++		void FIFO_control::set_channel(RsxDmaControl* ctrl)
++		{
++			invalidate_cache();
++
++			m_ctrl = ctrl;
++			m_memwatch_addr = 0;
++			m_memwatch_cmp = 0;
++			m_remaining_commands = 0;
++		}
++
++		void FIFO_control::inc_get(bool wait)
++		{
++			m_fifo_pos += 4;
++
++			if (!m_cache_size && wait && read_put<false>() == m_fifo_pos)
++			{
++				// NOTE: Only supposed to be invoked to wait for a single arg on command[0] (4 bytes)
++				// Wait for put to allow us to proceed execution
++				sync_get();
++				invalidate_cache();
++
++				// NOTE: lv2 waits for a freed context to go away, which only happens once this command returns
++				while (read_put() == m_fifo_pos && !Emu.IsStopped() && !m_thread->get_context()->fw.free_requested)
++				{
++					m_thread->cpu_wait({});
++				}
++			}
++		}
++
++		template <bool Full>
++		inline u32 FIFO_control::read_put() const
++		{
++			if constexpr (!Full)
++			{
++				return m_ctrl->put & ~3;
++			}
++			else
++			{
++				if (u32 put = m_ctrl->put; (put & 3) == 0) [[likely]]
++				{
++					return put;
++				}
++
++				return m_ctrl->put.and_fetch(~3);
++			}
++		}
++
++		// R2PORT: cache-hit fast path of fetch_u32 (one call per method argument, ~125k/frame). Identical result to
++		// fetch_u32's hit path; misses still take the full call. R2_FIFO_INLINE=0 always calls fetch_u32.
++		static const bool g_fifo_inline = [] { const char* e = std::getenv("R2_FIFO_INLINE"); return e && *e == '1'; }(); // opt-in (default off since the 2026-11-11 freeze report)
++
++		FORCE_INLINE std::pair<bool, u32> FIFO_control::fetch_u32_fast(u32 addr)
++		{
++			if (g_fifo_inline && addr - m_cache_addr < m_cache_size && addr < m_cache_addr + m_cache_size) [[likely]]
++			{
++				return {true, read_from_ptr_unsafe<be_t<u32>>(+m_cache[0], addr - m_cache_addr)};
++			}
++
++			return fetch_u32(addr);
++		}
++		std::pair<bool, u32> FIFO_control::fetch_u32(u32 addr)
++		{
++			if (addr - m_cache_addr >= m_cache_size)
++			{
++				const u32 put = read_put();
++
++				if (put == addr)
++				{
++					return {false, FIFO_EMPTY};
++				}
++
++				m_cache_addr = addr & -128;
++
++				const u32 addr1 = m_iotable->get_addr(m_cache_addr);
++
++				if (addr1 == umax)
++				{
++					m_cache_size = 0;
++					return {false, FIFO_ERROR};
++				}
++
++				if (addr == m_next_cmd_entry)
++				{
++					 if (u32 cmd = vm::read32(addr1 | (addr & 127)); cmd & RSX_METHOD_NON_METHOD_CMD_MASK)
++					 {
++					 	// FIFO control commands (including invalid)
++					 	// No GET update here
++					 	m_cache_addr = addr;
++					 	m_cache_size = 4;
++					 	return {true, cmd};
++					 }
++				}
++
++				m_cache_size = std::min<u32>((put | 0x7f) - m_cache_addr, u32{sizeof(m_cache)} - 1) + 1;
++
++				if (0x100000 - (m_cache_addr & 0xfffff) < m_cache_size)
++				{
++					// Check if memory layout changes in the next 1MB page boundary
++					if ((addr1 >> 20) + 1 != (m_iotable->get_addr(m_cache_addr + 0x100000) >> 20))
++					{
++						// Trim cache as needed if memory layout changes
++						m_cache_size = 0x100000 - (m_cache_addr & 0xfffff);
++					}
++				}
++
++				// Make mask of cache lines to fetch
++				u8 to_fetch = static_cast<u8>((1u << (m_cache_size / 128)) - 1);
++
++				if (addr < put && put < m_cache_addr + m_cache_size)
++				{
++					// Adjust to knownly-prepared FIFO buffer bounds
++					m_cache_size = put - m_cache_addr;
++				}
++
++				// Atomic FIFO debug options
++				const bool force_cache_fill = g_cfg.core.rsx_fifo_accuracy == rsx_fifo_mode::atomic_ordered;
++				const bool strict_fetch_ordering = g_cfg.core.rsx_fifo_accuracy >= rsx_fifo_mode::atomic_ordered;
++
++				rsx::reservation_lock<true, 1> rsx_lock(addr1, m_cache_size, true);
++				const auto src = vm::_ptr<spu_rdata_t>(addr1);
++
++				u64 start_time = 0;
++				u32 bytes_read = 0;
++
++				u32 fifo_code_path = m_next_cmd_entry;
++				if (!(m_next_cmd_entry >= m_fifo_pos && m_next_cmd_entry < m_fifo_pos + 8192)) [[unlikely]]
++				{
++					// R2PORT: upstream ensure() here terminated rsx::thread. Command-entry tracking lost after a desync:
++					// parse from the fetch address (only the cache trim at FIFO control commands depends on it).
++					static u32 s_warned = 0;
++					if (s_warned++ < 8)
++					{
++						rsx_log.error("FIFO: command entry 0x%x out of step with GET 0x%x (fetch 0x%x); resyncing", m_next_cmd_entry, m_fifo_pos, addr);
++					}
++
++					m_next_cmd_entry = fifo_code_path = addr;
++				}
++
++				// Find the next set bit after every iteration
++				for (int i = 0;; i = (std::countr_zero<u32>(std::rotl<u8>(to_fetch, 0 - i - 1)) + i + 1) % 8)
++				{
++					// If a reservation is being updated, try to load another
++					const auto& res = vm::reservation_acquire(addr1 + i * 128);
++					const u64 time0 = res;
++
++					if (!(time0 & 127))
++					{
++						mov_rdata(m_cache[i], src[i]);
++
++						if (time0 == res && cmp_rdata(m_cache[i], src[i]))
++						{
++							// The fetch of the cache line content has been successful, unset its bit
++							to_fetch &= ~(1u << i);
++
++							if ((to_fetch & ((1u << i) - 1)) == 0)
++							{
++								const u32 highest_clear = std::min<u32>(m_cache_size, to_fetch ? std::bit_width<u8>(to_fetch & ~(to_fetch - 1)) * 128 - 128 : bytes_read + 128);
++
++								ensure(highest_clear <= 1024);
++
++								const u32 high_addr = m_cache_addr + highest_clear;
++
++								while (fifo_code_path < high_addr)
++								{
++									const auto cmd = read_from_ptr_unsafe<be_t<u32>>(+m_cache[0], fifo_code_path - m_cache_addr);
++
++									if (cmd & RSX_METHOD_NON_METHOD_CMD_MASK) [[unlikely]]
++									{
++										// FIFO control commands (including invalid)
++										fifo_code_path += 4;
++										break;
++									}
++
++									const u32 count = (cmd >> 18) & 0x7ff;
++									fifo_code_path += count * 4 + 4;
++								}
++
++
++								if (fifo_code_path < high_addr)
++								{
++									// Cache trimmed due to FIFO control command
++									m_cache_size = std::max<u32>(fifo_code_path, addr + 4) - m_cache_addr;
++									break;
++								}
++							}
++
++							if (!to_fetch)
++							{
++								break;
++							}
++
++							bytes_read += 128;
++							continue;
++						}
++					}
++
++					if (!start_time)
++					{
++						if (bytes_read >= 256 && !force_cache_fill)
++						{
++							// Cut our losses if we have something to work with.
++							// This is the first time falling out of the reservation loop above, so we have clean data with no holes.
++							m_cache_size = bytes_read;
++							break;
++						}
++
++						start_time = get_system_time();
++					}
++
++					auto now = get_system_time();
++					if (now - start_time >= 50u)
++					{
++						if (m_thread->is_stopped())
++						{
++							return {};
++						}
++
++						m_thread->cpu_wait({});
++
++						const auto then = std::exchange(now, get_system_time());
++						start_time = now;
++						m_thread->performance_counters.idle_time += now - then;
++						port_hitch_add_ns(PH_FIFOIDLE, (now - then) * 1000); // R2PORT: [hitch]
++					}
++					else
++					{
++						busy_wait(200);
++					}
++
++					if (strict_fetch_ordering)
++					{
++						i = (i - 1) % 8;
++					}
++				}
++
++				// Update FIFO GET
++				sync_get();
++				atomic_fence_seq_cst();
++			}
++
++			ensure(addr < m_cache_addr + m_cache_size);
++			const auto ret = read_from_ptr_unsafe<be_t<u32>>(+m_cache[0], addr - m_cache_addr);
++			return {true, ret};
++		}
++
++		void FIFO_control::set_get(u32 get, u32 spin_cmd)
++		{
++			invalidate_cache();
++
++			m_thread->last_code_jump = m_fifo_pos;
++			m_next_cmd_entry = get;
++
++			if (spin_cmd && m_fifo_pos == get)
++			{
++				m_memwatch_addr = get;
++				m_memwatch_cmp = spin_cmd;
++				m_ctrl->get.release(get);
++				return;
++			}
++
++			// Update ctrl registers
++			m_ctrl->get.release(m_fifo_pos = get);
++			m_remaining_commands = 0;
++		}
++
++		std::span<const u32> FIFO_control::get_current_arg_ptr(u32 length_in_words) const
++		{
++			if (!length_in_words)
++			{
++				// This means the caller is doing something stupid
++				rsx_log.error("Invalid access to FIFO args data, requested length = 0");
++				return {};
++			}
++
++			if (g_cfg.core.rsx_fifo_accuracy)
++			{
++				// Return a pointer to the cache storage with confined access
++				const u32 cache_offset_in_words = (m_fifo_pos - m_cache_addr) / 4;
++				const u32 cache_size_in_words = m_cache_size / 4;
++				return {reinterpret_cast<const u32*>(&m_cache) + cache_offset_in_words, cache_size_in_words - cache_offset_in_words};
++			}
++
++			// Return a raw pointer to contiguous memory
++			constexpr u32 _1M = 0x100000;
++			const u32 size = length_in_words * sizeof(u32);
++			const u32 from = m_iotable->get_addr(m_fifo_pos);
++
++			for (u32 remaining = size, addr = m_fifo_pos, ptr = from; remaining > 0;)
++			{
++				const u32 next_block = utils::align(addr + 1, _1M);
++				const u32 available = (next_block - addr);
++				if (remaining <= available)
++				{
++					return { static_cast<const u32*>(vm::base(from)), length_in_words };
++				}
++
++				remaining -= available;
++				const u32 next_ptr = m_iotable->get_addr(next_block);
++				if (next_ptr != (ptr + available))
++				{
++					return { static_cast<const u32*>(vm::base(from)), (size - remaining) / sizeof(u32)};
++				}
++
++				ptr = next_ptr;
++				addr = next_block;
++			}
++
++			fmt::throw_exception("Unreachable");
++		}
++
++		bool FIFO_control::read_unsafe(register_pair& data)
++		{
++			// Fast read with no processing, only safe inside a PACKET_BEGIN+count block
++			if (m_remaining_commands)
++			{
++				bool ok{};
++				u32 arg = 0;
++
++				m_fifo_pos += 4;
++
++				if (g_cfg.core.rsx_fifo_accuracy) [[ unlikely ]]
++				{
++					std::tie(ok, arg) = fetch_u32_fast(m_fifo_pos);
++
++					if (!ok)
++					{
++						if (arg == FIFO_ERROR)
++						{
++							m_thread->recover_fifo();
++						}
++						else
++						{
++							m_fifo_pos -= 4;
++						}
++
++						return false;
++					}
++				}
++				else
++				{
++					if (m_fifo_pos == read_put<false>())
++					{
++						m_fifo_pos -= 4;
++						return false;
++					}
++
++					m_args_ptr += 4;
++					arg = vm::read32(m_args_ptr);
++				}
++
++				m_command_reg += m_command_inc;
++
++				--m_remaining_commands;
++
++				data.set(m_command_reg, arg);
++				return true;
++			}
++
++			// R2PORT: a method handler that recovered the FIFO (recover_fifo: set_get(restore point) + abort) leaves
++			// m_fifo_pos on the new GET. Upstream stepped 4 bytes past it here, so the next fetch saw GET != the
++			// command entry and, with atomic FIFO fetch, died on the ensure in fetch_u32 (bench rp9: invalid method
++			// 0x5b00 from a desynced FIFO -> recovery -> rsx::thread terminated, game spinning on 0 draws).
++			if (m_aborted) [[unlikely]]
++			{
++				m_aborted = false;
++				return false;
++			}
++
++			m_fifo_pos += 4;
++			return false;
++		}
++
++		// Optimization for methods which can be batched together
++		// Beware, can be easily misused
++		bool FIFO_control::skip_methods(u32 count)
++		{
++			if (m_remaining_commands > count)
++			{
++				m_command_reg += m_command_inc * count;
++				m_remaining_commands -= count;
++				m_fifo_pos += 4 * count;
++				m_args_ptr += 4 * count;
++				return true;
++			}
++
++			m_fifo_pos += 4 * m_remaining_commands;
++			m_remaining_commands = 0;
++			return false;
++		}
++
++		void FIFO_control::abort()
++		{
++			m_remaining_commands = 0;
++			m_aborted = true; // R2PORT
++		}
++
++		void FIFO_control::read(register_pair& data)
++		{
++			m_aborted = false; // R2PORT: only meaningful within one batch
++
++			if (m_remaining_commands)
++			{
++				// Previous block aborted to wait for PUT pointer
++				if (!read_unsafe(data))
++				{
++					// failed reads leave data unchanged
++					data.reg = FIFO_EMPTY;
++				}
++
++				return;
++			}
++
++			if (m_memwatch_addr)
++			{
++				if (m_fifo_pos == m_memwatch_addr)
++				{
++					if (const u32 addr = m_iotable->get_addr(m_memwatch_addr); addr + 1)
++					{
++						if (vm::read32(addr) == m_memwatch_cmp)
++						{
++							// Still spinning in place
++							data.reg = FIFO_EMPTY;
++							return;
++						}
++					}
++				}
++
++				m_memwatch_addr = 0;
++				m_memwatch_cmp = 0;
++			}
++
++			if (!g_cfg.core.rsx_fifo_accuracy) [[ likely ]]
++			{
++				const u32 put = read_put();
++
++				if (put == m_fifo_pos)
++				{
++					// Nothing to do
++					data.reg = FIFO_EMPTY;
++					return;
++				}
++
++				if (const u32 addr = m_iotable->get_addr(m_fifo_pos); addr + 1)
++				{
++					m_cmd = vm::read32(addr);
++				}
++				else
++				{
++					data.reg = FIFO_ERROR;
++					return;
++				}
++			}
++			else
++			{
++				if (auto [ok, arg] = fetch_u32(m_fifo_pos); ok)
++				{
++					m_cmd = arg;
++				}
++				else
++				{
++					data.reg = arg;
++					return;
++				}
++			}
++
++			if (m_cmd & RSX_METHOD_NON_METHOD_CMD_MASK) [[unlikely]]
++			{
++				m_next_cmd_entry = umax;
++
++				if ((m_cmd & RSX_METHOD_OLD_JUMP_CMD_MASK) == RSX_METHOD_OLD_JUMP_CMD ||
++					(m_cmd & RSX_METHOD_NEW_JUMP_CMD_MASK) == RSX_METHOD_NEW_JUMP_CMD ||
++					(m_cmd & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD ||
++					(m_cmd & RSX_METHOD_RETURN_MASK) == RSX_METHOD_RETURN_CMD)
++				{
++					// Flow control, stop reading
++					data.reg = m_cmd;
++					return;
++				}
++
++				// Malformed command, optional recovery
++				data.reg = FIFO_ERROR;
++				return;
++			}
++
++			ensure(!m_remaining_commands);
++			const u32 count = (m_cmd >> 18) & 0x7ff;
++
++			m_next_cmd_entry = m_fifo_pos + count * 4 + 4;
++
++			if (!count)
++			{
++				m_fifo_pos += 4;
++				sync_get();
++				data.reg = FIFO_NOP;
++				return;
++			}
++
++			if (count > 1)
++			{
++				// Set up readback parameters
++				m_command_reg = m_cmd & 0xfffc;
++				m_command_inc = ((m_cmd & RSX_METHOD_NON_INCREMENT_CMD_MASK) == RSX_METHOD_NON_INCREMENT_CMD) ? 0 : 4;
++				m_remaining_commands = count - 1;
++			}
++
++			if (g_cfg.core.rsx_fifo_accuracy)
++			{
++				m_fifo_pos += 4;
++
++				auto [ok, arg] = fetch_u32_fast(m_fifo_pos);
++
++				if (!ok)
++				{
++					// Optional recovery
++					if (arg == FIFO_ERROR)
++					{
++						data.reg = FIFO_ERROR;
++					}
++					else
++					{
++						// Rewind to the header so read_unsafe() resumes from the first argument
++						// (it pre-increments both the FIFO position and the method register)
++						data.reg = FIFO_EMPTY;
++						m_fifo_pos -= 4;
++						m_command_inc = ((m_cmd & RSX_METHOD_NON_INCREMENT_CMD_MASK) == RSX_METHOD_NON_INCREMENT_CMD) ? 0 : 4;
++						m_command_reg = (m_cmd & 0xfffc) - m_command_inc;
++						m_remaining_commands++;
++					}
++
++					return;
++				}
++
++				data.set(m_cmd & 0xfffc, arg);
++				return;
++			}
++
++			inc_get(true); // Wait for data block to become available
++
++			// Validate the args ptr if the command attempts to read from it
++			m_args_ptr = m_iotable->get_addr(m_fifo_pos);
++			if (m_args_ptr == umax) [[unlikely]]
++			{
++				// Optional recovery
++				data.reg = FIFO_ERROR;
++				return;
++			}
++
++			data.set(m_cmd & 0xfffc, vm::read32(m_args_ptr));
++		}
++
++		void flattening_helper::reset(bool _enabled)
++		{
++			enabled = _enabled;
++			num_collapsed = 0;
++			in_begin_end = false;
++		}
++
++		void flattening_helper::force_disable()
++		{
++			if (enabled)
++			{
++				rsx_log.warning("FIFO optimizations have been disabled as the application is not compatible with per-frame analysis");
++
++				reset(false);
++				fifo_hint = optimization_hint::application_not_compatible;
++			}
++		}
++
++		// R2PORT round 8: R2_FIFO_MERGE tunes when the flattener (upstream's merge of back-to-back BEGIN/DRAW/END blocks
++		// with no state change between them into one multi-range draw) is tried. Unset/0: upstream thresholds (2000
++		// draws per frame, keep if >= 500 collapsed). 1: try from 400 draws, keep if >= max(draws/40, 8) collapsed.
++		// N > 1: try from N draws. Read once.
++		static u32 r2_merge_mode()
++		{
++			static const u32 v = []
++			{
++				const char* e = std::getenv("R2_FIFO_MERGE");
++				return e && e[0] ? static_cast<u32>(std::strtoul(e, nullptr, 10)) : 0u;
++			}();
++			return v;
++		}
++
++		void flattening_helper::evaluate_performance(u32 total_draw_count)
++		{
++			const u32 r2_mode = r2_merge_mode();
++			const u32 r2_min_draws = r2_mode == 0 ? 2000u : (r2_mode == 1 ? 400u : r2_mode);
++			const u32 r2_min_collapsed = r2_mode == 0 ? 500u : std::max<u32>((total_draw_count + num_collapsed) / 40, 8u);
++			if (enabled)
++			{
++				r2prof::addx(r2prof::fifo_merged, num_collapsed);
++			}
++			if (!enabled)
++			{
++				if (fifo_hint == optimization_hint::application_not_compatible)
++				{
++					// Not compatible, do nothing
++					return;
++				}
++
++				if (total_draw_count <= r2_min_draws)
++				{
++					// Low draw call pressure
++					fifo_hint = optimization_hint::load_low;
++					return;
++				}
++
++				if (fifo_hint == optimization_hint::load_unoptimizable)
++				{
++					// Nope, wait for stats to change
++					return;
++				}
++			}
++
++			if (enabled)
++			{
++				// Currently activated. Check if there is any benefit
++				if (num_collapsed < r2_min_collapsed)
++				{
++					// Not worth it, disable
++					enabled = false;
++					fifo_hint = load_unoptimizable;
++				}
++
++				u32 real_total = total_draw_count + num_collapsed;
++				if (real_total <= r2_min_draws)
++				{
++					// Low total number of draws submitted, no need to keep trying for now
++					enabled = false;
++					fifo_hint = load_low;
++				}
++
++				reset(enabled);
++			}
++			else
++			{
++				// Not enabled, check if we should try enabling
++				ensure(total_draw_count > r2_min_draws);
++				if (fifo_hint != load_unoptimizable)
++				{
++					// If its set to unoptimizable, we already tried and it did not work
++					// If it resets to load low (usually after some kind of loading screen) we can try again
++					ensure(in_begin_end == false); // "Incorrect initial state"
++					ensure(num_collapsed == 0);
++					enabled = true;
++				}
++			}
++		}
++
++		flatten_op flattening_helper::test(register_pair& command)
++		{
++			u32 flush_cmd = ~0u;
++			switch (const u32 reg = (command.reg >> 2))
++			{
++			case NV4097_SET_BEGIN_END:
++			{
++				in_begin_end = !!command.value;
++
++				if (command.value)
++				{
++					// This is a BEGIN call
++					if (!deferred_primitive) [[likely]]
++					{
++						// New primitive block
++						deferred_primitive = command.value;
++					}
++					else if (deferred_primitive == command.value)
++					{
++						// Same primitive can be chanined; do nothing
++						command.reg = FIFO_DISABLED_COMMAND;
++					}
++					else
++					{
++						// Primitive command has changed!
++						// Flush
++						flush_cmd = command.value;
++					}
++				}
++				else if (deferred_primitive)
++				{
++					command.reg = FIFO_DRAW_BARRIER;
++					draw_count++;
++				}
++				else
++				{
++					rsx_log.error("Fifo flattener misalignment, disable FIFO reordering and report to developers");
++					in_begin_end = false;
++					flush_cmd = 0u;
++				}
++
++				break;
++			}
++			case NV4097_DRAW_ARRAYS:
++			case NV4097_DRAW_INDEX_ARRAY:
++			{
++				// TODO: Check type
++				break;
++			}
++			default:
++			{
++				if (draw_count) [[unlikely]]
++				{
++					if (m_register_properties[reg] & register_props::always_ignore) [[unlikely]]
++					{
++						// Always ignore
++						command.reg = FIFO_DISABLED_COMMAND;
++					}
++					else
++					{
++						// Flush
++						flush_cmd = (in_begin_end) ? deferred_primitive : 0u;
++					}
++				}
++				else
++				{
++					// Nothing to do
++					return NOTHING;
++				}
++
++				break;
++			}
++			}
++
++			if (flush_cmd != ~0u)
++			{
++				num_collapsed += draw_count? (draw_count - 1) : 0;
++				draw_count = 0;
++				deferred_primitive = flush_cmd;
++
++				return in_begin_end ? EMIT_BARRIER : EMIT_END;
++			}
++
++			return NOTHING;
++		}
++	}
++
++	void thread::run_FIFO()
++	{
++		FIFO::register_pair command;
++		fifo_ctrl->read(command);
++		const auto cmd = command.reg;
++
++		if (cmd & (0xffff0000 | RSX_METHOD_NON_METHOD_CMD_MASK)) [[unlikely]]
++		{
++			// Check for special FIFO commands
++			switch (cmd)
++			{
++			case FIFO::FIFO_NOP:
++			{
++				if (performance_counters.state == FIFO::state::running)
++				{
++					performance_counters.FIFO_idle_timestamp = get_system_time();
++					performance_counters.state = FIFO::state::nop;
++				}
++
++				return;
++			}
++			case FIFO::FIFO_EMPTY:
++			{
++				if (performance_counters.state == FIFO::state::running)
++				{
++					performance_counters.FIFO_idle_timestamp = get_system_time();
++					performance_counters.state = FIFO::state::empty;
++					s_r2_empty_backoff.n = 0; // R2PORT
++				}
++				else
++				{
++					// R2PORT: >= 8 logical CPUs keep the upstream yield. On smaller CPUs, after a short
++					// spin, Sleep(0) hands the slice to any ready thread (SPU/PPU) instead of only this core's.
++					static const bool big = ps3_host_prio_boost() != 0;
++					if (big) std::this_thread::yield();
++					else s_r2_empty_backoff();
++				}
++
++				return;
++			}
++			case FIFO::FIFO_BUSY:
++			{
++				// Do something else
++				return;
++			}
++			case FIFO::FIFO_ERROR:
++			{
++				rsx_log.error("FIFO error: possible desync event (last cmd = 0x%x)", get_fifo_cmd());
++				recover_fifo();
++				return;
++			}
++			}
++
++			// Check for flow control
++			if (bit_set<2> jump_type; jump_type
++				.set_unsafe(0, (cmd & RSX_METHOD_OLD_JUMP_CMD_MASK) == RSX_METHOD_OLD_JUMP_CMD)
++				.set_unsafe(1, (cmd & RSX_METHOD_NEW_JUMP_CMD_MASK) == RSX_METHOD_NEW_JUMP_CMD)
++				.any())
++			{
++				const u32 offs = cmd & (jump_type.test_unsafe(0) ? RSX_METHOD_OLD_JUMP_OFFSET_MASK : RSX_METHOD_NEW_JUMP_OFFSET_MASK);
++				if (offs == fifo_ctrl->get_pos())
++				{
++					//Jump to self. Often preceded by NOP
++					if (performance_counters.state == FIFO::state::running)
++					{
++						performance_counters.FIFO_idle_timestamp = get_system_time();
++						sync_point_request.release(true);
++					}
++
++					performance_counters.state = FIFO::state::spinning;
++				}
++				else
++				{
++					last_known_code_start = offs;
++					r2_drawlog_flow("JUMP", fifo_ctrl->get_pos(), offs);
++				}
++
++				//rsx_log.warning("rsx jump(0x%x) #addr=0x%x, cmd=0x%x, get=0x%x, put=0x%x", offs, m_ioAddress + get, cmd, get, put);
++				fifo_ctrl->set_get(offs, cmd);
++				return;
++			}
++			if ((cmd & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD)
++			{
++				if (fifo_ret_addr != RSX_CALL_STACK_EMPTY)
++				{
++					// Only one layer is allowed in the call stack.
++					rsx_log.error("FIFO: CALL found inside a subroutine (last cmd = 0x%x)", get_fifo_cmd());
++					recover_fifo();
++					return;
++				}
++
++				const u32 offs = cmd & RSX_METHOD_CALL_OFFSET_MASK;
++				r2_drawlog_flow("CALL", fifo_ctrl->get_pos(), offs);
++				fifo_ret_addr = fifo_ctrl->get_pos() + 4;
++				fifo_ctrl->set_get(offs);
++				last_known_code_start = offs;
++				return;
++			}
++			if ((cmd & RSX_METHOD_RETURN_MASK) == RSX_METHOD_RETURN_CMD)
++			{
++				if (fifo_ret_addr == RSX_CALL_STACK_EMPTY)
++				{
++					rsx_log.error("FIFO: RET found without corresponding CALL (last cmd = 0x%x)", get_fifo_cmd());
++					recover_fifo();
++					return;
++				}
++
++				r2_drawlog_flow("RET", fifo_ctrl->get_pos(), fifo_ret_addr);
++				// Optimize returning to another CALL
++				if ((ctrl->put & ~3) != fifo_ret_addr)
++				{
++					if (u32 addr = iomap_table.get_addr(fifo_ret_addr); addr != umax)
++					{
++						const u32 cmd0 = vm::read32(addr);
++
++						// Check for missing step flags, in case the user is single-stepping in the debugger
++						if ((cmd0 & RSX_METHOD_CALL_CMD_MASK) == RSX_METHOD_CALL_CMD && cpu_flag::dbg_step - state)
++						{
++							fifo_ctrl->set_get(cmd0 & RSX_METHOD_CALL_OFFSET_MASK);
++							last_known_code_start = ctrl->get;
++							fifo_ret_addr += 4;
++							return;
++						}
++					}
++				}
++
++				fifo_ctrl->set_get(std::exchange(fifo_ret_addr, RSX_CALL_STACK_EMPTY));
++				last_known_code_start = fifo_ctrl->get_pos();
++				return;
++			}
++
++			// If we reached here, this is likely an error
++			fmt::throw_exception("Unexpected command 0x%x (last cmd: 0x%x)", cmd, fifo_ctrl->last_cmd());
++		}
++
++		if (const auto state = performance_counters.state;
++			state != FIFO::state::running)
++		{
++			performance_counters.state = FIFO::state::running;
++
++			// Hack: Delay FIFO wake-up according to setting
++			// NOTE: The typical spin setup is a NOP followed by a jump-to-self
++			// NOTE: There is a small delay when the jump address is dynamically edited by cell
++			if (state != FIFO::state::nop)
++			{
++				fifo_wake_delay();
++			}
++
++			// Update performance counters with time spent in idle mode
++			const u64 r2_idle_us = get_system_time() - performance_counters.FIFO_idle_timestamp; // R2PORT: [hitch]
++			performance_counters.idle_time += r2_idle_us;
++			port_hitch_add_ns(PH_FIFOIDLE, r2_idle_us * 1000);
++		}
++
++		do
++		{
++			g_r2_fifo_methods++;
++			r2_drawlog_method(command.reg, command.value);
++			if (capture_current_frame) [[unlikely]]
++			{
++				const u32 reg = (command.reg & 0xfffc) >> 2;
++				const u32 value = command.value;
++
++				frame_debug.command_queue.emplace_back(reg, value);
++
++				if (!(reg == NV406E_SET_REFERENCE || reg == NV406E_SEMAPHORE_RELEASE || reg == NV406E_SEMAPHORE_ACQUIRE))
++				{
++					// todo: handle nv406e methods better?, do we care about call/jumps?
++					rsx::frame_capture_data::replay_command replay_cmd;
++					replay_cmd.rsx_command = std::make_pair((reg << 2) | (1u << 18), value);
++
++					auto& commands = frame_capture.replay_commands;
++					commands.push_back(replay_cmd);
++
++					switch (reg)
++					{
++					case NV3089_IMAGE_IN:
++						capture::capture_image_in(this, commands.back());
++						break;
++					case NV0039_BUFFER_NOTIFY:
++						capture::capture_buffer_notify(this, commands.back());
++						break;
++					default:
++					{
++						static constexpr std::array<std::pair<u32, u32>, 3> ranges
++						{{
++							{NV308A_COLOR, 0x700},
++							{NV4097_SET_TRANSFORM_PROGRAM, 32},
++							{NV4097_SET_TRANSFORM_CONSTANT, 32}
++						}};
++
++						// Use legacy logic - enqueue leading command with count
++						// Then enqueue each command arg alone with a no-op command
++						for (const auto& range : ranges)
++						{
++							if (reg >= range.first && reg < range.first + range.second)
++							{
++								const u32 remaining = std::min<u32>(fifo_ctrl->get_remaining_args_count() + 1,
++									(fifo_ctrl->last_cmd() & RSX_METHOD_NON_INCREMENT_CMD_MASK) ? -1 : (range.first + range.second) - reg);
++
++								commands.back().rsx_command.first = (fifo_ctrl->last_cmd() & RSX_METHOD_NON_INCREMENT_CMD_MASK) | (reg << 2) | (remaining << 18);
++
++								for (u32 i = 1; i < remaining && fifo_ctrl->get_pos() + i * 4 != (ctrl->put & ~3); i++)
++								{
++									replay_cmd.rsx_command = std::make_pair(0, vm::read32(iomap_table.get_addr(fifo_ctrl->get_pos()) + (i * 4)));
++
++									commands.push_back(replay_cmd);
++								}
++
++								break;
++							}
++						}
++
++						break;
++					}
++					}
++				}
++			}
++
++			if (m_flattener.is_enabled()) [[unlikely]]
++			{
++				switch(m_flattener.test(command))
++				{
++				case FIFO::NOTHING:
++				{
++					break;
++				}
++				case FIFO::EMIT_END:
++				{
++					// Emit end command to close existing scope
++					AUDIT(m_ctx->in_begin_end);
++					methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, 0);
++					break;
++				}
++				case FIFO::EMIT_BARRIER:
++				{
++					AUDIT(m_ctx->in_begin_end);
++					methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, 0);
++					methods[NV4097_SET_BEGIN_END](m_ctx, NV4097_SET_BEGIN_END, m_flattener.get_primitive());
++					break;
++				}
++				default:
++				{
++					fmt::throw_exception("Unreachable");
++				}
++				}
++
++				if (command.reg == FIFO::FIFO_DISABLED_COMMAND)
++				{
++					// Optimized away
++					continue;
++				}
++			}
++
++			const u32 reg = (command.reg & 0xffff) >> 2;
++			const u32 value = command.value;
++
++			m_ctx->register_state->decode(reg, value);
++
++			const bool value_changed = m_ctx->register_state->latch != value;
++			if (r2prof::enabled) [[unlikely]]
++			{
++				r2prof::addx(r2prof::fifo_methods);
++				if (!value_changed) r2prof::addx(r2prof::fifo_same);
++				if (r2prof::census_on) // R2PORT round 9
++				{
++					r2prof::census_inc(r2prof::census.meth[reg & 0x3fff]);
++					if (!value_changed) r2prof::census_inc(r2prof::census.meth_same[reg & 0x3fff]);
++				}
++			}
++			if (value_changed)
++			{
++				// Mark the decoded draw state that depends on this register. Applies to method registers too.
++				m_ctx->draw_state.pending |= draw_state_signals[reg];
++			}
++
++			if (auto method = methods[reg])
++			{
++				method(m_ctx, reg, value);
++
++				if (state & cpu_flag::again)
++				{
++					m_ctx->register_state->decode(reg, m_ctx->register_state->latch);
++					break;
++				}
++			}
++			else if (value_changed)
++			{
++				// Something changed, set signal flags if any specified
++				m_ctx->graphics_state |= state_signals[reg];
++			}
++		}
++		while (fifo_ctrl->read_unsafe(command));
++
++		fifo_ctrl->sync_get();
++	}
++}
 diff --git a/rpcs3/Emu/RSX/RSXFIFO.h b/rpcs3/Emu/RSX/RSXFIFO.h
-index d0611bc..cf03517 100644
+index d0611bc..9005668 100644
 --- a/rpcs3/Emu/RSX/RSXFIFO.h
 +++ b/rpcs3/Emu/RSX/RSXFIFO.h
 @@ -123,6 +123,8 @@ namespace rsx
@@ -3034,7 +4758,7 @@ index d0611bc..cf03517 100644
  			inline flatten_op test(register_pair& command);
  		};
  
-@@ -162,6 +164,7 @@ namespace rsx
+@@ -162,9 +164,11 @@ namespace rsx
  			u32 m_args_ptr = 0;
  			u32 m_cmd = ~0u;
  			u32 m_next_cmd_entry = ~0u;
@@ -3042,7 +4766,11 @@ index d0611bc..cf03517 100644
  
  			u32 m_cache_addr = 0;
  			u32 m_cache_size = 0;
-@@ -174,6 +177,7 @@ namespace rsx
++			bool m_cache_ends_at_put = false; // R2PORT (RPCS3 PR #20055): the last atomic fetch stopped at PUT
+ 			alignas(64) std::byte m_cache[8][128];
+ 
+ 		public:
+@@ -174,11 +178,14 @@ namespace rsx
  			u32 translate_address(u32 addr) const;
  
  			std::pair<bool, u32> fetch_u32(u32 addr);
@@ -3050,6 +4778,224 @@ index d0611bc..cf03517 100644
  			void invalidate_cache() { m_cache_size = 0; }
  
  			u32 get_pos() const { return m_fifo_pos; }
+ 			u32 last_cmd() const { return m_cmd; }
+ 			void sync_get() const;
++			// R2PORT (RPCS3 PR #20055): GET when the puller blocks on a semaphore acquire (the end of the fetched words)
++			void sync_get_for_wait();
+ 			std::span<const u32> get_current_arg_ptr(u32 length_in_words) const;
+ 			u32 get_remaining_args_count() const { return m_remaining_commands; }
+ 			void restore_state(u32 cmd, u32 count, u32 position);
+diff --git a/rpcs3/Emu/RSX/RSXFIFO.h.bak_overnight b/rpcs3/Emu/RSX/RSXFIFO.h.bak_overnight
+new file mode 100644
+index 0000000..cf03517
+--- /dev/null
++++ b/rpcs3/Emu/RSX/RSXFIFO.h.bak_overnight
+@@ -0,0 +1,205 @@
++#pragma once
++
++#include "util/types.hpp"
++#include "Emu/RSX/gcm_enums.h"
++
++#include <span>
++
++struct RsxDmaControl;
++
++namespace rsx
++{
++	class thread;
++	struct rsx_iomap_table;
++
++	namespace FIFO
++	{
++		enum internal_commands : u32
++		{
++			FIFO_NOP = 0xBABEF1F4,
++			FIFO_EMPTY = 0xDEADF1F0,
++			FIFO_BUSY = 0xBABEF1F0,
++			FIFO_ERROR = 0xDEADBEEF,
++			FIFO_PACKET_BEGIN = 0xF1F0,
++			FIFO_DISABLED_COMMAND = 0xF1F4,
++			FIFO_DRAW_BARRIER = 0xF1F8,
++		};
++
++		enum flatten_op : u32
++		{
++			NOTHING = 0,
++			EMIT_END = 1,
++			EMIT_BARRIER = 2
++		};
++
++		enum class state : u8
++		{
++			running = 0,
++			empty = 1,    // PUT == GET
++			spinning = 2, // Puller continuously jumps to self addr (synchronization technique)
++			nop = 3,      // Puller is processing a NOP command
++			lock_wait = 4,// Puller is processing a lock acquire
++			paused = 5,   // Puller is paused externallly
++		};
++
++		enum class interrupt_hint : u8
++		{
++			conditional_render_eval = 1,
++			zcull_sync = 2
++		};
++
++		struct register_pair
++		{
++			u32 reg;
++			u32 value;
++
++			void set(u32 reg, u32 val)
++			{
++				this->reg = reg;
++				this->value = val;
++			}
++		};
++
++		class flattening_helper
++		{
++			enum register_props : u8
++			{
++				none = 0,
++				skip_on_match = 1,
++				always_ignore = 2
++			};
++
++			enum optimization_hint : u8
++			{
++				unknown,
++				load_low,
++				load_unoptimizable,
++				application_not_compatible
++			};
++
++			// Workaround for MSVC, C2248
++			static constexpr u8 register_props_always_ignore = register_props::always_ignore;
++
++			static constexpr std::array<u8, 0x10000 / 4> m_register_properties = []
++			{
++				constexpr std::array<std::pair<u32, u32>, 4> ignorable_ranges =
++				{{
++					// General
++					{ NV4097_INVALIDATE_VERTEX_FILE, 3 }, // PSLight clears VERTEX_FILE[0-2]
++					{ NV4097_INVALIDATE_VERTEX_CACHE_FILE, 1 },
++					{ NV4097_INVALIDATE_L2, 1 },
++					{ NV4097_INVALIDATE_ZCULL, 1 }
++				}};
++
++				std::array<u8, 0x10000 / 4> register_properties{};
++
++				for (const auto& method : ignorable_ranges)
++				{
++					for (u32 i = 0; i < method.second; ++i)
++					{
++						register_properties[method.first + i] |= register_props_always_ignore;
++					}
++				}
++
++				return register_properties;
++			}();
++
++			u32 deferred_primitive = 0;
++			u32 draw_count = 0;
++			bool in_begin_end = false;
++
++			bool enabled = false;
++			u32  num_collapsed = 0;
++			optimization_hint fifo_hint = unknown;
++
++			void reset(bool _enabled);
++
++		public:
++			flattening_helper() = default;
++			~flattening_helper() = default;
++
++			u32 get_primitive() const { return deferred_primitive; }
++			bool is_enabled() const { return enabled; }
++
++			void force_disable();
++			void evaluate_performance(u32 total_draw_count);
++			// R2PORT: FIFO desync recovery drops the stream position; forget any deferred (merged) draw state
++			void r2_abort_pending() { deferred_primitive = 0; draw_count = 0; in_begin_end = false; }
++			inline flatten_op test(register_pair& command);
++		};
++
++		// A context's virtual FIFO channel while the puller runs another one.
++		// Real hardware construct. PFIFO keeps these in RAMFC.
++		struct channel_state
++		{
++			RsxDmaControl* ctrl = nullptr;
++			u32 dma_address = 0;
++
++			// Where the puller stopped. Channels only switch between packets.
++			u32 get = 0;
++
++			// Call stack and rollback point
++			u32 ret_addr = RSX_CALL_STACK_EMPTY;
++			u32 saved_ret_addr = RSX_CALL_STACK_EMPTY;
++			u32 restore_point = 0;
++
++			state puller_state = state::running;
++			flattening_helper flattener;
++		};
++
++		class FIFO_control
++		{
++		private:
++			mutable rsx::thread* m_thread;
++			RsxDmaControl* m_ctrl = nullptr;
++			const rsx::rsx_iomap_table* m_iotable;
++			u32 m_fifo_pos = 0;
++
++			u32 m_memwatch_addr = 0;
++			u32 m_memwatch_cmp = 0;
++
++			u32 m_command_reg = 0;
++			u32 m_command_inc = 0;
++			u32 m_remaining_commands = 0;
++			u32 m_args_ptr = 0;
++			u32 m_cmd = ~0u;
++			u32 m_next_cmd_entry = ~0u;
++			bool m_aborted = false; // R2PORT: abort() inside a method batch; the batch loop must not step past the new GET
++
++			u32 m_cache_addr = 0;
++			u32 m_cache_size = 0;
++			alignas(64) std::byte m_cache[8][128];
++
++		public:
++			FIFO_control(rsx::thread* pctrl);
++			~FIFO_control() = default;
++
++			u32 translate_address(u32 addr) const;
++
++			std::pair<bool, u32> fetch_u32(u32 addr);
++			std::pair<bool, u32> fetch_u32_fast(u32 addr);
++			void invalidate_cache() { m_cache_size = 0; }
++
++			u32 get_pos() const { return m_fifo_pos; }
++			u32 last_cmd() const { return m_cmd; }
++			void sync_get() const;
++			std::span<const u32> get_current_arg_ptr(u32 length_in_words) const;
++			u32 get_remaining_args_count() const { return m_remaining_commands; }
++			void restore_state(u32 cmd, u32 count, u32 position);
++
++			// Channel switch. The caller is expected to manually set GET afterwards.
++			void set_channel(RsxDmaControl* ctrl);
++
++			void inc_get(bool wait);
++			void set_get(u32 get, u32 spin_cmd = 0);
++			void abort();
++
++			template <bool = true>
++			u32 read_put() const;
++
++			void read(register_pair& data);
++			inline bool read_unsafe(register_pair& data);
++			bool skip_methods(u32 count);
++		};
++	}
++}
 diff --git a/rpcs3/Emu/RSX/RSXOffload.cpp b/rpcs3/Emu/RSX/RSXOffload.cpp
 index 493fc8c..baf968e 100644
 --- a/rpcs3/Emu/RSX/RSXOffload.cpp
@@ -3738,7 +5684,7 @@ index d262cec..936bc48 100644
  			bool has_active_queries() const { return host_queries_active; }
  
 diff --git a/rpcs3/Emu/RSX/VK/VKDraw.cpp b/rpcs3/Emu/RSX/VK/VKDraw.cpp
-index 2c736de..b8b6c8c 100644
+index 2c736de..bdb0b4e 100644
 --- a/rpcs3/Emu/RSX/VK/VKDraw.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKDraw.cpp
 @@ -5,11 +5,14 @@
@@ -3765,7 +5711,20 @@ index 2c736de..b8b6c8c 100644
  		auto polygon_offset_bias = raster.poly_offset_bias;
  
  		if (!m_draw_fbo->attachments.empty() &&
-@@ -499,7 +502,7 @@ rsx::flags32_t VKGSRender::load_texture_env()
+@@ -303,6 +306,12 @@ rsx::flags32_t VKGSRender::load_texture_env()
+ 
+ 	std::lock_guard lock(m_sampler_mutex);
+ 
++	// R2PORT: RSX_AA_MIPBIAS_ATEST, alpha-tested / KIL draws get their own (less negative) upscaler LOD bias
++	if (vk::r2aa_alpha_tested(REGS(m_ctx)->alpha_test_enabled() || !!(REGS(m_ctx)->shader_control() & RSX_SHADER_CONTROL_USES_KIL)))
++	{
++		m_ctx->textures.fragment_textures_dirty = ~0u;
++	}
++
+ 	for (u32 textures_ref = m_ctx->program.fp_metadata.referenced_textures_mask, i = 0; textures_ref; textures_ref >>= 1, ++i)
+ 	{
+ 		if (!(textures_ref & 1))
+@@ -499,7 +508,7 @@ rsx::flags32_t VKGSRender::load_texture_env()
  			{
  				min_lod = tex.min_lod();
  				max_lod = tex.max_lod();
@@ -3774,7 +5733,7 @@ index 2c736de..b8b6c8c 100644
  
  				min_lod = std::min(min_lod, actual_mipmaps - 1.f);
  				max_lod = std::min(max_lod, actual_mipmaps - 1.f);
-@@ -1100,7 +1103,10 @@ void VKGSRender::emit_geometry(u32 sub_index)
+@@ -1100,7 +1109,10 @@ void VKGSRender::emit_geometry(u32 sub_index)
  	}
  
  	// Update vertex fetch parameters
@@ -3786,7 +5745,7 @@ index 2c736de..b8b6c8c 100644
  
  	if (update_descriptors)
  	{
-@@ -1152,10 +1158,14 @@ void VKGSRender::emit_geometry(u32 sub_index)
+@@ -1152,10 +1164,14 @@ void VKGSRender::emit_geometry(u32 sub_index)
  
  	// Bind both pipe and descriptors in one go
  	// FIXME: We only need to rebind the pipeline when reload state is set. Flags?
@@ -3802,7 +5761,7 @@ index 2c736de..b8b6c8c 100644
  		update_draw_state();
  		begin_render_pass();
  
-@@ -1174,10 +1184,12 @@ void VKGSRender::emit_geometry(u32 sub_index)
+@@ -1174,10 +1190,12 @@ void VKGSRender::emit_geometry(u32 sub_index)
  
  	// Bind the new set of descriptors for use with this draw call
  	m_ctx->stats.setup_time += m_profiler.duration();
@@ -3815,7 +5774,7 @@ index 2c736de..b8b6c8c 100644
  	if (!upload_info.index_info)
  	{
  		if (draw_call.is_trivial_instanced_draw)
-@@ -1256,6 +1268,12 @@ void VKGSRender::emit_geometry(u32 sub_index)
+@@ -1256,6 +1274,12 @@ void VKGSRender::emit_geometry(u32 sub_index)
  			}
  		}
  	}
@@ -3828,7 +5787,7 @@ index 2c736de..b8b6c8c 100644
  
  	m_ctx->stats.draw_exec_time += m_profiler.duration();
  }
-@@ -1292,7 +1310,14 @@ bool VKGSRender::resolve_sampler_state(rsx::flags32_t& invalidated_programs)
+@@ -1292,7 +1316,14 @@ bool VKGSRender::resolve_sampler_state(rsx::flags32_t& invalidated_programs)
  		m_current_frame->flags &= ~frame_context_state::dirty;
  	}
  
@@ -3844,7 +5803,7 @@ index 2c736de..b8b6c8c 100644
  	return true;
  }
  
-@@ -1300,20 +1325,48 @@ bool VKGSRender::end_draw()
+@@ -1300,20 +1331,48 @@ bool VKGSRender::end_draw()
  {
  	// Groups changed since the last executed draw. Loading an interpreter program adds both programs.
  	m_interpreter_state = m_ctx->draw_state.dirty;
@@ -3852,12 +5811,12 @@ index 2c736de..b8b6c8c 100644
  
 -	if (!load_program())
 +	bool r2_prog_ok; // R2PORT: program phase split
-+	{
+ 	{
 +		r2prof::scope_x r2_pl(r2prof::prog_load_ns);
 +		r2_prog_ok = load_program();
 +	}
 +	if (!r2_prog_ok)
- 	{
++	{
 +		r2prof::addx(r2prof::pipe_not_ready); // R2PORT round 8
 +		r2pd_note(1); // R2PORT: pass dump
  		// Program is not ready, skip drawing this
@@ -3896,7 +5855,7 @@ index 2c736de..b8b6c8c 100644
  	if (auto ds = std::get<1>(res()->surface_cache.m_bound_depth_stencil))
  	{
  		ds->write_barrier(*m_current_command_buffer);
-@@ -1339,9 +1392,11 @@ bool VKGSRender::end_draw()
+@@ -1339,9 +1398,11 @@ bool VKGSRender::end_draw()
  		}
  	}
  
@@ -3908,7 +5867,7 @@ index 2c736de..b8b6c8c 100644
  	for (int retry = 0; retry < 3; ++retry)
  	{
  		if (retry > 0 && m_samplers_dirty) [[ unlikely ]]
-@@ -1371,6 +1426,7 @@ bool VKGSRender::end_draw()
+@@ -1371,6 +1432,7 @@ bool VKGSRender::end_draw()
  	}
  
  	res()->texture_cache.release_uncached_temporary_subresources();
@@ -3916,7 +5875,7 @@ index 2c736de..b8b6c8c 100644
  	m_ctx->stats.textures_upload_time += m_profiler.duration();
  
  	u32 sub_index = 0;               // RSX subdraw ID
-@@ -1400,11 +1456,15 @@ bool VKGSRender::end_draw()
+@@ -1400,11 +1462,15 @@ bool VKGSRender::end_draw()
  
  	if (m_current_command_buffer->flags & vk::command_buffer::cb_has_conditional_render)
  	{
@@ -5041,7 +7000,7 @@ index b101a27..36c5e62 100644
  		// Gather data
  		for (const auto occlusion_id : data.indices)
 diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.h b/rpcs3/Emu/RSX/VK/VKGSRender.h
-index 07a6b7d..1437ffa 100644
+index 07a6b7d..8c92a31 100644
 --- a/rpcs3/Emu/RSX/VK/VKGSRender.h
 +++ b/rpcs3/Emu/RSX/VK/VKGSRender.h
 @@ -23,6 +23,7 @@
@@ -5081,7 +7040,7 @@ index 07a6b7d..1437ffa 100644
  
  	//Vulkan internals
  	std::unique_ptr<vk::query_pool_manager> m_occlusion_query_manager;
-@@ -267,7 +283,44 @@ private:
+@@ -267,7 +283,46 @@ private:
  	static vk::context_resources* res(rsx::context* ctx) { return static_cast<vk::context_resources*>(ctx->resources.get()); }
  	vk::context_resources* res() const { return res(m_ctx); }
  
@@ -5118,6 +7077,8 @@ index 07a6b7d..1437ffa 100644
 +	bool r2gx_is_display(u32 addr) const;
 +	void r2fg_on_draw();                       // load_program_env: frame generation HUD classifier + Reflex marker (VKR2FrameGen.cpp)
 +	void r2gx_ssao();
++	void r2gx_ssao_apply(vk::render_target* rt, vk::render_target* ds, u32 w, u32 h, u32 dw, u32 dh, const char* path);
++	void r2gx_ssao_upscaler(vk::render_target* rt, vk::render_target* ds, u32 w, u32 h, u32 dw, u32 dh); // r2aa_run: SSAO on the upscaler input
 +
  public:
 +	void r2_on_query_wait(); // R2PORT: fault flush requests during ZCULL GPU waits
@@ -7361,10 +9322,10 @@ index 0000000..36a656d
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..11a75e3
+index 0000000..96d97f0
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2271 @@
+@@ -0,0 +1,2313 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -7764,6 +9725,21 @@ index 0000000..11a75e3
 +
 +	bool sl_device() { return g_sl.inited && g_sl.device != VK_NULL_HANDLE; }
 +
++	// Streamline's vkCreateDevice initialises its plugins (sl.common, DLSS-G, Reflex; possibly driver-downloaded
++	// override builds) inside the call. A fault there must not take the game down: the caller turns frame
++	// generation off and creates the device natively.
++	VkResult sl_create_device_guarded(PFN_vkCreateDevice create, VkPhysicalDevice pdev, const VkDeviceCreateInfo* info, VkDevice* device, DWORD* code)
++	{
++		__try
++		{
++			return create(pdev, info, nullptr, device);
++		}
++		__except (*code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER)
++		{
++			return VK_ERROR_INITIALIZATION_FAILED;
++		}
++	}
++
 +#ifdef R2PORT_HAVE_FFX
 +	// FSR 3 frame interpolation (AMD FidelityFX API, amd_fidelityfx_vk.dll)
 +	struct fx_state
@@ -8018,8 +9994,33 @@ index 0000000..11a75e3
 +			return vkCreateDevice(pdev, info, nullptr, device);
 +		}
 +
++		// The interposer's vkCreateDevice looks the instance up in a map that only its own vkEnumeratePhysicalDevices
++		// fills. RPCS3 enumerated through the loader, so without this Streamline initialises its plugins with a null
++		// instance (null instance functions: sl.common crashes calling vkGetPhysicalDeviceMemoryProperties).
++		const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(g_sl.gipa(g_sl.instance, "vkEnumeratePhysicalDevices"));
++		std::vector<VkPhysicalDevice> listed;
++		u32 count = 0;
++		if (enumerate && enumerate(g_sl.instance, &count, nullptr) == VK_SUCCESS && count)
++		{
++			listed.resize(count);
++			if (enumerate(g_sl.instance, &count, listed.data()) < 0) count = 0;
++			listed.resize(count);
++		}
++		if (std::find(listed.begin(), listed.end(), pdev) == listed.end())
++		{
++			fglog("frame generation off: Streamline does not list the renderer's GPU (%u GPUs listed)", count);
++			return vkCreateDevice(pdev, info, nullptr, device);
++		}
++
 +		const auto create = reinterpret_cast<PFN_vkCreateDevice>(g_sl.gipa(g_sl.instance, "vkCreateDevice"));
-+		const VkResult res = create ? create(pdev, info, nullptr, device) : VK_ERROR_INITIALIZATION_FAILED;
++		DWORD fault = 0;
++		const VkResult res = create ? sl_create_device_guarded(create, pdev, info, device, &fault) : VK_ERROR_INITIALIZATION_FAILED;
++		if (fault)
++		{
++			fglog("frame generation off: Streamline crashed creating the Vulkan device (exception 0x%08X; NVIDIA driver/plugin problem)", static_cast<unsigned>(fault));
++			*device = VK_NULL_HANDLE;
++			return vkCreateDevice(pdev, info, nullptr, device);
++		}
 +		if (res != VK_SUCCESS)
 +		{
 +			fglog("frame generation off: the Streamline Vulkan device failed (%d)", static_cast<int>(res));
@@ -8793,8 +10794,10 @@ index 0000000..11a75e3
 +		to_sl(A, c.clipToPrevClip);
 +		to_sl(Ai, c.prevClipToClip);
 +
-+		// nominal camera: DLSS-G only uses it for heuristics, the motion comes from clipToPrevClip and the vectors
-+		const double n = 0.1, fa = 1000.0, fov = 1.0, aspect = f.rh ? static_cast<double>(f.rw) / f.rh : 16.0 / 9.0;
++		// camera: DLSS-G only uses it for heuristics, the motion comes from clipToPrevClip and the vectors
++		float cn = 0.1f, cf = 1000.f, cv = 1.0f;
++		vk::r2aa_camera(cn, cf, cv);
++		const double n = cn, fa = cf, fov = cv, aspect = f.rh ? static_cast<double>(f.rw) / f.rh : 16.0 / 9.0;
 +		const double ys = 1.0 / std::tan(fov * 0.5), xs = ys / aspect;
 +		mat4 P{};
 +		P[0][0] = xs;
@@ -8957,13 +10960,15 @@ index 0000000..11a75e3
 +		if (r != sl::Result::eOk) fglog("slDLSSGSetOptions failed (code %d)", static_cast<int>(r));
 +	}
 +
-+	void fg_set_reflex_cap(bool on, u32 n)
++	void fg_set_reflex_cap(bool on)
 +	{
 +		auto& f = g_fg;
-+		// rendered frames x N must stay under the refresh rate (VRR range); the game's own cap still applies on top
++		// presented frames (generated ones included) must stay under the refresh rate (VRR range). With FG on,
++		// Streamline applies frameLimitUs to presented frames, so it already scales the rendered rate by 1/N.
++		// The game's own cap still applies on top.
 +		u32 limit = 0;
 +		if (fgcfg().cap && f.refresh_hz > 1.0 && (on || f.sc_immediate))
-+			limit = static_cast<u32>(1e6 * (on ? n : 1) / (f.refresh_hz * 0.95));
++			limit = static_cast<u32>(1e6 / (f.refresh_hz * 0.95));
 +		if (limit == f.reflex_limit) return;
 +		f.reflex_limit = limit;
 +		sl::ReflexOptions ro{};
@@ -8991,7 +10996,7 @@ index 0000000..11a75e3
 +		{
 +			on = tok && f.ready && f.want_on && f.depth && f.mv && (f.debug_view || (f.have_ui && f.hudless && f.ui));
 +			fg_set_options(on, n);
-+			fg_set_reflex_cap(on, n);
++			fg_set_reflex_cap(on);
 +			if (on)
 +			{
 +				const bool reset = !f.prev_on || f.sc_new || f.reset;
@@ -9358,9 +11363,7 @@ index 0000000..11a75e3
 +		p.jitterOffset = { f.jx, f.jy };
 +		p.motionVectorScale = { f.mvsx * static_cast<float>(f.rw), f.mvsy * static_cast<float>(f.rh) };
 +		p.frameTimeDelta = dt;
-+		p.cameraNear = 0.1f;
-+		p.cameraFar = 1000.f;
-+		p.cameraFovAngleVertical = 1.0f;
++		vk::r2aa_camera(p.cameraNear, p.cameraFar, p.cameraFovAngleVertical);
 +		p.viewSpaceToMetersFactor = 1.f;
 +		p.depth = fx_res(f.depth.get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
 +		p.motionVectors = fx_res(f.mv.get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
@@ -9704,10 +11707,10 @@ index 0000000..3890feb
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
 new file mode 100644
-index 0000000..a314ba5
+index 0000000..eb690aa
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
-@@ -0,0 +1,967 @@
+@@ -0,0 +1,1023 @@
 +// R2PORT: optional graphics-quality upgrades for the Resistance ports (see VKR2Gfx.h for the switches).
 +//
 +// Per-surface resolution: RPCS3 already supports surfaces of different resolution scales side by side (the
@@ -9789,6 +11792,8 @@ index 0000000..a314ba5
 +		float ssao_strength = 0.6f;
 +		float ssao_radius = 1.0f;
 +		int ssao_debug = 0;
++		bool ssao_ups = true;  // RSX_SSAO_UPSCALER: under DLSS/FSR/XeSS, SSAO runs on the upscaler's input
++		int ssao_log = 0;      // RSX_SSAO_LOG: log the targets of the first SSAO runs (and every N-th)
 +		bool any = false;
 +	};
 +
@@ -9809,20 +11814,23 @@ index 0000000..a314ba5
 +			}
 +			if (const char* e = std::getenv("RSX_HUD_FIX")) r.hud = std::atoi(e) > 0 || !_stricmp(e, "on");
 +			if (const char* e = std::getenv("RSX_SSAO")) r.ssao = std::atoi(e) > 0 || !_stricmp(e, "on");
-+			// Beta: the SSAO pass is off when DLSS is the upscaler (RSX_FSR=2): it gave shadowy patches under DLSS.
-+			// RSX_SSAO_DLSS=1 forces it on; ssao=1 without DLSS is unchanged.
++			// SSAO follows RSX_SSAO under every upscaler. RSX_SSAO_DLSS=0 turns it off when DLSS is the upscaler (RSX_FSR=2).
++			// (Beta 0.2 forced it off under DLSS: the pass ran at the end of whichever scene-size pass came last and was
++			// not tied to the upscaler; it now runs inside the upscaler on the exact scene it consumes.)
 +			bool ssao_dlss_off = false;
 +			if (r.ssao && vk::r2aa_mode() == 2)
 +			{
 +				const char* e = std::getenv("RSX_SSAO_DLSS");
-+				ssao_dlss_off = !(e && std::atoi(e) > 0);
++				ssao_dlss_off = e && *e && std::atoi(e) <= 0;
 +				if (ssao_dlss_off) r.ssao = false;
 +			}
 +			r.ssao_strength = env_f("RSX_SSAO_STRENGTH", 0.6f, 0.f, 1.f);
 +			r.ssao_radius = env_f("RSX_SSAO_RADIUS", 1.0f, 0.1f, 8.f);
 +			if (const char* e = std::getenv("RSX_SSAO_DEBUG")) r.ssao_debug = std::atoi(e);
++			if (const char* e = std::getenv("RSX_SSAO_UPSCALER")) r.ssao_ups = std::atoi(e) != 0;
++			if (const char* e = std::getenv("RSX_SSAO_LOG")) r.ssao_log = std::max(0, std::atoi(e));
 +			r.any = r.shadow > 1 || r.fx > 0 || r.hud || r.ssao;
-+			if (ssao_dlss_off) gxlog("SSAO disabled: DLSS is the active upscaler (RSX_SSAO_DLSS=1 forces it on)");
++			if (ssao_dlss_off) gxlog("SSAO disabled under DLSS (RSX_SSAO_DLSS=0)");
 +			gxlog("shadow map scale %dx, effects full-res %d, HUD fix %s, SSAO %s (strength %.2f, radius %.2f)",
 +				r.shadow, r.fx, r.hud ? "on" : "off", r.ssao ? "on" : "off", r.ssao_strength, r.ssao_radius);
 +			return r;
@@ -9914,7 +11922,10 @@ index 0000000..a314ba5
 +				// a world radius at a distance proportional to zc: its size on screen is proportional to 1/zc
 +				"	float rpx = clamp(a.w * a.y * 40.0 / zc, 2.0, b.x);\n"
 +				"	float rel = rpx / (0.87 * a.y);\n" // world radius / distance
-+				"	float ang = 6.2831853 * fract(52.9829189 * fract(dot(vec2(p), vec2(0.06711056, 0.00583715))));\n"
++				// 16 rotations on a 4x4 grid (Bayer order): the 4x4 blur of the apply pass averages every rotation exactly, so
++				// the result has no noise and does not change as content moves by sub-pixel amounts (upscaler jitter)
++				"	const float bayer[16] = float[16](0., 8., 2., 10., 12., 4., 14., 6., 3., 11., 1., 9., 15., 7., 13., 5.);\n"
++				"	float ang = 6.2831853 * (bayer[(p.y & 3) * 4 + (p.x & 3)] + 0.5) / 16.0;\n"
 +				"	float occ = 0.0;\n"
 +				"	for (int i = 0; i < 8; ++i)\n"
 +				"	{\n"
@@ -10000,7 +12011,7 @@ index 0000000..a314ba5
 +				"	for (int y = -2; y < 2; ++y)\n"
 +				"		for (int x = -2; x < 2; ++x)\n"
 +				"		{\n"
-+				"			vec2 q = uv + (vec2(x, y) + 0.5) * px;\n"
++				"			vec2 q = uv + vec2(x, y) * px;\n" // texel centres (half-texel offsets were exact texel edges: NEAREST picked either side)
 +				"			float w = 1.0 / (1e-3 + abs(vz(q) - zc) / zc * 50.0);\n"
 +				"			s += textureLod(AoIn, clamp(q, 0.5 / a.xy, 1.0 - 0.5 / a.xy) * b.zw, 0.0).r * w;\n"
 +				"			wsum += w;\n"
@@ -10108,8 +12119,9 @@ index 0000000..a314ba5
 +	{
 +		// SSAO at the end of the last scene-sized colour+depth pass, when the first smaller colour pass
 +		// (the post-processing chain) is bound. Depth-only binds (shadow maps) in between don't end it.
++		// Under an active upscaler it runs inside r2aa_run instead (r2gx_ssao_upscaler).
 +		if (c.ssao && st.cur_scene && !st.ao_done && st.cur_draws >= 8 && layout_has_color(L) &&
-+			!(L.width == st.scene_w && L.height == st.scene_h))
++			!(L.width == st.scene_w && L.height == st.scene_h) && !(c.ssao_ups && vk::r2aa_active()))
 +		{
 +			st.ao_done = true;
 +			r2gx_ssao();
@@ -10215,12 +12227,53 @@ index 0000000..a314ba5
 +	g_gx.env_y = g_gx.hud_y;
 +}
 +
++namespace
++{
++	// RSX_SSAO_UV (default 1): sample depth and AO in the drawn region only. Under DLSS/FSR the scene is drawn at a
++	// reduced scale inside surfaces allocated for the full scale, and the AO image keeps the largest size seen;
++	// normalised 0..1 coordinates over the whole image stretched the depth / AO term (a dark offset copy of every
++	// character, growing toward the bottom right). 0 = old behaviour.
++	bool gx_uv_fix()
++	{
++		static const bool on = [] { const char* e = std::getenv("RSX_SSAO_UV"); return !e || std::atoi(e) != 0; }();
++		return on;
++	}
++}
++
 +void VKGSRender::r2gx_ssao()
 +{
 +	auto& st = g_gx;
 +	auto& sc = res()->surface_cache;
 +	auto* rt = sc.m_bound_render_targets[0].second;
 +	auto* ds = sc.m_bound_depth_stencil.second;
++	if (!rt || !ds)
++	{
++		if (!st.ao_warned)
++		{
++			st.ao_warned = true;
++			gxlog("SSAO skipped: no scene targets bound");
++		}
++		return;
++	}
++	const auto [sw, sh] = rsx::apply_resolution_scale<true>(rt->resolution_scaling_config, st.cur_w, st.cur_h);
++	const auto [dsw, dsh] = rsx::apply_resolution_scale<true>(ds->resolution_scaling_config, st.cur_w, st.cur_h);
++	const bool uv_fix = gx_uv_fix();
++	r2gx_ssao_apply(rt, ds, std::min<u32>(sw, rt->info.extent.width), std::min<u32>(sh, rt->info.extent.height),
++		uv_fix ? std::min<u32>(dsw, ds->info.extent.width) : ds->info.extent.width,
++		uv_fix ? std::min<u32>(dsh, ds->info.extent.height) : ds->info.extent.height, "scene pass end");
++}
++
++void VKGSRender::r2gx_ssao_upscaler(vk::render_target* rt, vk::render_target* ds, u32 w, u32 h, u32 dw, u32 dh)
++{
++	const auto& c = gxcfg();
++	if (!c.ssao || !c.ssao_ups || !rt || !ds) return;
++	r2gx_ssao_apply(rt, ds, w, h, dw, dh, "upscaler input");
++}
++
++// AO of the w x h region of 'ds' (its top-left dw x dh texels cover the same area) multiplied into the w x h region of 'rt'
++void VKGSRender::r2gx_ssao_apply(vk::render_target* rt, vk::render_target* ds, u32 w, u32 h, u32 dw, u32 dh, const char* path)
++{
++	auto& st = g_gx;
 +	const auto skip = [&](const char* why)
 +	{
 +		if (!st.ao_warned)
@@ -10229,16 +12282,15 @@ index 0000000..a314ba5
 +			gxlog("SSAO skipped: %s", why);
 +		}
 +	};
-+	if (!rt || !ds) return skip("no scene targets bound");
 +	if (rt->samples() > 1 || ds->samples() > 1) return skip("the scene is multisampled (set R2_MSAA=0 or use DLSS/FSR)");
 +	const VkFormat cfmt = rt->info.format;
 +	const bool half = cfmt == VK_FORMAT_R16G16B16A16_SFLOAT;
 +	const bool swap = cfmt == VK_FORMAT_B8G8R8A8_UNORM;
 +	if (!half && !swap && cfmt != VK_FORMAT_R8G8B8A8_UNORM) return skip("unsupported scene colour format");
-+
-+	const auto [sw, sh] = rsx::apply_resolution_scale<true>(rt->resolution_scaling_config, st.cur_w, st.cur_h);
-+	const u32 w = std::min<u32>(sw, rt->info.extent.width);
-+	const u32 h = std::min<u32>(sh, rt->info.extent.height);
++	w = std::min<u32>(w, rt->info.extent.width);
++	h = std::min<u32>(h, rt->info.extent.height);
++	dw = std::max<u32>(1, std::min<u32>(dw, ds->info.extent.width));
++	dh = std::max<u32>(1, std::min<u32>(dh, ds->info.extent.height));
 +	if (w < 64 || h < 64) return;
 +
 +	const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -10246,6 +12298,9 @@ index 0000000..a314ba5
 +	if (!st.ao || st.ao->width() < w || st.ao->height() < h || st.ao_out_fmt != ofmt)
 +	{
 +		const u32 aw = std::max<u32>(w, st.ao ? st.ao->width() : 0), ah = std::max<u32>(h, st.ao ? st.ao->height() : 0);
++		// the old images may still be in use by submitted work
++		if (st.ao) vk::get_resource_manager()->dispose(st.ao);
++		if (st.ao_out) vk::get_resource_manager()->dispose(st.ao_out);
 +		st.ao = gx_make_image(VK_FORMAT_R8_UNORM, aw, ah, usage);
 +		st.ao_out = gx_make_image(ofmt, aw, ah, usage);
 +		st.ao_out_fmt = ofmt;
@@ -10256,28 +12311,32 @@ index 0000000..a314ba5
 +	if (vk::is_renderpass_open(cmd)) vk::end_renderpass(cmd);
 +
 +	const auto& c = gxcfg();
++	rt->read_barrier(cmd);
++	ds->read_barrier(cmd);
 +	rt->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +	ds->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +	st.ao->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
 +
 +	auto* depth_view = gx_view(ds, VK_IMAGE_ASPECT_DEPTH_BIT);
-+	// RSX_SSAO_UV (default 1): sample depth and AO in the drawn region only. Under DLSS/FSR the scene is drawn at a
-+	// reduced scale inside surfaces allocated for the full scale, and the AO image keeps the largest size seen;
-+	// normalised 0..1 coordinates over the whole image stretched the depth / AO term (a dark offset copy of every
-+	// character, growing toward the bottom right). 0 = old behaviour.
-+	static const bool uv_fix = [] { const char* e = std::getenv("RSX_SSAO_UV"); return !e || std::atoi(e) != 0; }();
-+	const auto [dsw, dsh] = rsx::apply_resolution_scale<true>(ds->resolution_scaling_config, st.cur_w, st.cur_h);
-+	const float dx = uv_fix ? static_cast<float>(std::min<u32>(dsw, ds->info.extent.width)) / ds->info.extent.width : 1.f;
-+	const float dy = uv_fix ? static_cast<float>(std::min<u32>(dsh, ds->info.extent.height)) / ds->info.extent.height : 1.f;
++	const bool uv_fix = gx_uv_fix();
++	const float dx = static_cast<float>(dw) / ds->info.extent.width;
++	const float dy = static_cast<float>(dh) / ds->info.extent.height;
 +	const float ax = uv_fix ? static_cast<float>(w) / st.ao->width() : 1.f;
 +	const float ay = uv_fix ? static_cast<float>(h) / st.ao->height() : 1.f;
-+	if (st.ao_geom_log < 4 && (st.ao_geom[0] != w || st.ao_geom[1] != h || st.ao_geom[2] != ds->info.extent.width || st.ao_geom[3] != dsw))
++	if (st.ao_geom_log < 4 && (st.ao_geom[0] != w || st.ao_geom[1] != h || st.ao_geom[2] != ds->info.extent.width || st.ao_geom[3] != dw))
 +	{
 +		st.ao_geom_log++;
-+		st.ao_geom[0] = w; st.ao_geom[1] = h; st.ao_geom[2] = ds->info.extent.width; st.ao_geom[3] = dsw;
-+		gxlog("SSAO geometry: colour region %ux%u (image %ux%u), depth region %ux%u (image %ux%u), AO image %ux%u, region-only sampling %s",
-+			w, h, rt->info.extent.width, rt->info.extent.height, dsw, dsh, ds->info.extent.width, ds->info.extent.height,
++		st.ao_geom[0] = w; st.ao_geom[1] = h; st.ao_geom[2] = ds->info.extent.width; st.ao_geom[3] = dw;
++		gxlog("SSAO geometry (%s): colour region %ux%u (image %ux%u), depth region %ux%u (image %ux%u), AO image %ux%u, region-only sampling %s",
++			path, w, h, rt->info.extent.width, rt->info.extent.height, dw, dh, ds->info.extent.width, ds->info.extent.height,
 +			st.ao->width(), st.ao->height(), uv_fix ? "on" : "off (RSX_SSAO_UV=0)");
++	}
++	if (c.ssao_log && (st.ao_runs < 8 || (st.ao_runs % static_cast<u32>(c.ssao_log)) == 0))
++	{
++		gxlog("SSAO run %u (%s): colour %08x %ux%u (%u%%, fmt %d) depth %08x %ux%u (%u%%), region %ux%u / depth %ux%u, guest bind %ux%u, %u scene draws",
++			st.ao_runs, path, rt->get_memory_range().start, rt->info.extent.width, rt->info.extent.height, rt->resolution_scaling_config.scale_percent,
++			static_cast<int>(cfmt), ds->get_memory_range().start, ds->info.extent.width, ds->info.extent.height, ds->resolution_scaling_config.scale_percent,
++			w, h, dw, dh, st.cur_w, st.cur_h, st.cur_draws);
 +	}
 +	{
 +		auto pass = vk::get_compute_task<vk::r2gx_ao_pass>();
@@ -12171,10 +14230,10 @@ index 0000000..41cee9c
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..2b0efbf
+index 0000000..317b3e7
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,5650 @@
+@@ -0,0 +1,5745 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -12323,6 +14382,8 @@ index 0000000..2b0efbf
 +		// positive (the 17:38 build: 0 for res=3 into 900p). "auto" = log2(RSX_UPSCALE), or a number (0 = the original).
 +		float mipbias = 0.f;
 +		int mipbias_mode = 1; // 0 fixed (mipbias), 1 output (NVIDIA), 2 display
++		bool atest = false;       // RSX_AA_MIPBIAS_ATEST=on|<bias>: alpha-tested/KIL draws keep at least atest_floor bias (opt-in)
++		float atest_floor = 0.f;
 +		// RSX_AA_CLASSIFY=0: old scene vote (most depth-tested draws). Default: the scene pair must also have a colour
 +		// target larger than 512 and at least half the largest candidate's area, a depth buffer that is written, and
 +		// colour targets sampled by a later pass are preferred.
@@ -12486,6 +14547,11 @@ index 0000000..2b0efbf
 +				r.mipbias_mode = v == "output" ? 1 : v == "display" ? 2 : 0;
 +				r.mipbias = (e[0] == 'a' || e[0] == 'A') ? std::log2(r.upscale) : static_cast<float>(std::atof(e));
 +				r.mipbias = std::fmin(std::fmax(r.mipbias, -4.f), 0.f);
++			}
++			if (const char* e = std::getenv("RSX_AA_MIPBIAS_ATEST"))
++			{
++				r.atest = *e && std::strcmp(e, "off") != 0 && std::strcmp(e, "OFF") != 0; // "on" -> floor 0
++				if (r.atest) r.atest_floor = std::fmin(std::fmax(static_cast<float>(std::atof(e)), -4.f), 0.f);
 +			}
 +			if (const char* e = std::getenv("RSX_AA_CLASSIFY")) r.classify = std::atoi(e) != 0;
 +			if (const char* e = std::getenv("R2_UPS_LOG")) r.passlog = std::max(0, std::atoi(e));
@@ -12684,6 +14750,39 @@ index 0000000..2b0efbf
 +		r.m[2][2] = s.sz; r.m[2][3] = s.oz;
 +		r.m[3][3] = 1.0;
 +		return r;
++	}
++
++	// Camera of a perspective world -> clip matrix V (rows: clip x, y, z, w) for FSR / frame generation: distances along
++	// the view axis at depth buffer values 0 and 1 (near / far, as the upscalers' depth linearisation expects) and the
++	// vertical FOV. Window depth = S.sz * z/w + S.oz, buffer = (window - zB) / zA. False unless V is a plain pinhole
++	// projection (clip z row parallel to the w row) with plausible results.
++	bool camera_planes(const m4& V, const screen_xform& S, double zA, double zB, double& n, double& f, double& fov)
++	{
++		double ww = 0, zw = 0, zz = 0, yy = 0;
++		for (int i = 0; i < 3; ++i)
++		{
++			ww += V.m[3][i] * V.m[3][i];
++			zw += V.m[2][i] * V.m[3][i];
++			zz += V.m[2][i] * V.m[2][i];
++			yy += V.m[1][i] * V.m[1][i];
++		}
++		if (!(ww > 1e-20) || !(yy > 1e-20) || std::fabs(S.sz) < 1e-9 || std::fabs(zA) < 1e-9) return false;
++		const double a = zw / ww;                         // clip z = a * w + b
++		if (zz - a * a * ww > 1e-6 * zz) return false;
++		const double b = V.m[2][3] - a * V.m[3][3];
++		const double wl = std::sqrt(ww);                  // view distance = w / wl
++		auto dist = [&](double t)
++		{
++			const double q = ((t * zA + zB) - S.oz) / S.sz - a;
++			return std::fabs(q) > 1e-12 ? b / (wl * q) : -1.0;
++		};
++		const double d0 = dist(0.0), d1 = dist(1.0);
++		const bool p0 = std::isfinite(d0) && d0 > 0, p1 = std::isfinite(d1) && d1 > 0;
++		if (p0 && p1) { n = std::fmin(d0, d1); f = std::fmax(d0, d1); }
++		else if (p0 || p1) { n = p0 ? d0 : d1; f = n * 1e5; } // far plane at infinity
++		else return false;
++		fov = 2.0 * std::atan(wl / std::sqrt(yy));
++		return n > 1e-6 && f > n * 1.001 && std::isfinite(f) && fov > 0.05 && fov < 3.0;
 +	}
 +
 +	// ---- RSX vertex program interpreter (enough to evaluate the position output) ----
@@ -13759,6 +15858,7 @@ index 0000000..2b0efbf
 +		bool cur_jit = false;          // ... and gets the jitter (RSX_AA_JITTER_SCOPE)
 +		bool link_bind = false;        // the bound targets are linked to the scene scale (RSX_AA_LINK)
 +		float bias_now = 0.f;          // LOD bias for the bound targets (RSX_AA_MIPBIAS)
++		bool atest_now = false;        // the current draw alpha-tests or uses KIL (RSX_AA_MIPBIAS_ATEST)
 +		u32 bias_logged = 0;
 +		std::unordered_map<u32, u32> sampled_rt; // colour addresses read as textures this frame (RSX_AA_CLASSIFY)
 +		bool tex_checked = false;      // textures of the current bind's first draw were recorded
@@ -13790,6 +15890,9 @@ index 0000000..2b0efbf
 +		alignas(16) float vp_scratch[512 * 4] = {};
 +		u32 evals = 0, eval_fail = 0;
 +		screen_xform prev_S;
++		// Camera planes from the game's view-projection (camera_planes; FSR / frame generation). 0 = not known yet
++		std::atomic<float> cam_n{0.f}, cam_f{0.f}, cam_fov{0.f};
++		float cam_logged_n = 0.f, cam_logged_f = 0.f;
 +		bool prev_valid = false;
 +		bool ran_ok = false;           // the upscaler processed this frame's scene
 +		m4 last_T = m4_identity();
@@ -14926,9 +17029,39 @@ index 0000000..2b0efbf
 +
 +namespace vk
 +{
++	// Alpha-tested foliage/fences: a negative LOD bias sharpens the alpha mask, so its cut-out edge aliases at the
++	// internal resolution and DLSS cannot resolve it (shimmer). Those draws keep at least atest_floor.
 +	float r2aa_lod_bias()
 +	{
-+		return g_r2.bias_now;
++		const auto& st = g_r2;
++		return (st.atest_now && r2cfg().atest) ? std::fmax(st.bias_now, r2cfg().atest_floor) : st.bias_now;
++	}
++
++	bool r2aa_alpha_tested(bool atest)
++	{
++		auto& st = g_r2;
++		const bool changed = atest != st.atest_now;
++		st.atest_now = atest;
++		if (!changed || !r2cfg().atest || st.bias_now >= r2cfg().atest_floor) return false;
++		static bool logged = false;
++		if (!logged)
++		{
++			logged = true;
++			r2log("mip bias %.2f for alpha-tested/KIL draws (scene %.2f; RSX_AA_MIPBIAS_ATEST=on|off|<bias>)", r2cfg().atest_floor, st.bias_now);
++		}
++		return true;
++	}
++
++	bool r2aa_active()
++	{
++		return r2cfg().mode && !g_r2.disabled;
++	}
++
++	void r2aa_camera(float& n, float& f, float& fov)
++	{
++		const float cn = g_r2.cam_n, cf = g_r2.cam_f, cv = g_r2.cam_fov;
++		if (cn > 0.f && cf > cn && cv > 0.f) { n = cn; f = cf; fov = cv; }
++		else { n = 0.1f; f = 1000.f; fov = 1.0f; }
 +	}
 +
 +	// RSX_PRESENT_DOWNSCALE (default 1; 0 = RPCS3's single bilinear blit): res=3 into a 900p window shrinks the
@@ -16539,6 +18672,20 @@ index 0000000..2b0efbf
 +			int vrow = 0;
 +			if (exact_vp(st.cur_F, Vc, dc, tc, &vrow) && exact_vp(st.prev_F, Vp, dp, tp) && m4_inverse(Vc, Vci))
 +			{
++				double cn = 0, cf = 0, cfov = 0;
++				if (camera_planes(Vc, st.frame_S, zA, zB, cn, cf, cfov))
++				{
++					st.cam_n = static_cast<float>(cn);
++					st.cam_f = static_cast<float>(cf);
++					st.cam_fov = static_cast<float>(cfov);
++					if (std::fabs(cn - st.cam_logged_n) > 0.25 * st.cam_logged_n || std::fabs(cf - st.cam_logged_f) > 0.25 * st.cam_logged_f)
++					{
++						r2log("camera from the game's view-projection: near %.4g, far %.4g, vertical FOV %.1f deg (FSR / frame generation)",
++							cn, cf, cfov * 57.29578);
++						st.cam_logged_n = static_cast<float>(cn);
++						st.cam_logged_f = static_cast<float>(cf);
++					}
++				}
 +				const m4 Re = m4_mul(Vp, Vci);
 +				if (std::isfinite(m4_maxabs(Re)))
 +				{
@@ -16928,6 +19075,15 @@ index 0000000..2b0efbf
 +		pc[30] = r2cfg().om_ztol;
 +	}
 +
++	// RSX_SSAO under an upscaler: AO goes into the scene the upscaler consumes (reduced scale, same jitter as the
++	// colour and depth), so the upscaler's history and the colour it is given always agree
++	{
++		const u32 nw = rt->get_surface_width(), nh = rt->get_surface_height();
++		const u32 dw = nw ? std::min<u32>(ds->info.extent.width, static_cast<u32>(static_cast<u64>(cw) * ds->get_surface_width() / nw)) : cw;
++		const u32 dh = nh ? std::min<u32>(ds->info.extent.height, static_cast<u32>(static_cast<u64>(ch) * ds->get_surface_height() / nh)) : ch;
++		r2gx_ssao_upscaler(rt, ds, cw, ch, dw, dh);
++	}
++
 +	// 1. Scene -> FSR/DLSS inputs
 +	rt->read_barrier(cmd);
 +	ds->read_barrier(cmd);
@@ -17055,9 +19211,7 @@ index 0000000..2b0efbf
 +		d.frameTimeDelta = ms;
 +		d.preExposure = 1.f;
 +		d.reset = reset;
-+		d.cameraNear = 0.1f;
-+		d.cameraFar = 1000.f;
-+		d.cameraFovAngleVertical = 1.0f;
++		vk::r2aa_camera(d.cameraNear, d.cameraFar, d.cameraFovAngleVertical);
 +		d.viewSpaceToMetersFactor = 1.f;
 +		d.flags = half ? 0u : static_cast<uint32_t>(FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB);
 +		const ffxReturnCode_t rc = g_ffx.dispatch(&g_ffx.ctx, &d.header);
@@ -17827,10 +19981,10 @@ index 0000000..2b0efbf
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.h b/rpcs3/Emu/RSX/VK/VKR2Upscaler.h
 new file mode 100644
-index 0000000..18b6955
+index 0000000..79b6ce8
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.h
-@@ -0,0 +1,40 @@
+@@ -0,0 +1,48 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3).
 +// Temporal anti-aliasing of the 3D scene with AMD FSR 3.1 (FidelityFX API, amd_fidelityfx_vk.dll) or
 +// NVIDIA DLAA (r2_dlss.dll, NGX) or Intel XeSS (libxess.dll, VKR2XeSS.cpp). Enabled by RSX_FSR=1 (FSR 3.1) /
@@ -17851,6 +20005,13 @@ index 0000000..18b6955
 +	// 0 off, 1 FSR 3.1, 2 DLAA, 4 Intel XeSS (from RSX_FSR)
 +	int r2aa_mode();
 +
++	// The temporal upscaler is enabled and has not given up: SSAO then runs inside r2aa_run, on the scene it consumes
++	bool r2aa_active();
++
++	// Camera near / far (view distance at depth buffer 0 / 1) and vertical FOV (radians) derived from the game's
++	// view-projection constants (RSX_AA_CAMERA_EXACT); nominal 0.1 / 1000 / 1.0 until they are known
++	void r2aa_camera(float& n, float& f, float& fov);
++
 +	// RSX_AA_UV_JITTER (VKVertexProgram.cpp): bit N set = output register o[N] (texture coordinates, N >= 7) is a clip
 +	// position of the program (same clip-matrix rows and input vector as o[0]) and gets the scene jitter.
 +	// Always 0 when RSX_FSR is off or RSX_AA_UV_JITTER=0 (the generated shader is then unchanged).
@@ -17858,6 +20019,7 @@ index 0000000..18b6955
 +
 +	// VKDraw.cpp sampler setup: extra LOD bias for the draw's bound targets (RSX_AA_MIPBIAS, 0 when off)
 +	float r2aa_lod_bias();
++	bool r2aa_alpha_tested(bool atest); // per draw; true when the fragment samplers must be rebuilt (bias changed)
 +
 +	// VKPresent.cpp: area-filtered shrink (exact 2:1 box steps) of the w x h region of 'src' while it is at least twice
 +	// the dw x dh output; returns the image to present and updates w, h (RSX_PRESENT_DOWNSCALE=0: returns src)
@@ -21319,6 +23481,1460 @@ index 75b1d37..848f47f 100644
  namespace utils
  {
  	// Try to prefetch to Level 2 cache since it's not split to data/code on most processors
+diff --git a/rpcs3/util/atomic.cpp b/rpcs3/util/atomic.cpp
+index e1503ac..7c58636 100644
+--- a/rpcs3/util/atomic.cpp
++++ b/rpcs3/util/atomic.cpp
+@@ -19,14 +19,29 @@ const bool utils::g_atomic_lse2 = utils::has_lse2();
+ 
+ namespace utils
+ {
++	// R3PORT: under clang-cl these are inlined into this file's atomic_op loops, and a plain
++	// _mm_load_si128 is an ordinary load to clang: it re-read the low half separately, built the
++	// new value from that read and used the other one as the CAS comparand, so concurrent
++	// updates of the wait hashtable were lost (double-allocated slots, lost wake-ups, hangs).
++	// The asm forces exactly one 16-byte access, as on the non-MSVC x64 path.
+ 	u128 __vectorcall atomic_load16(const void* ptr)
+ 	{
++#ifdef __clang__
++		__m128i r;
++		__asm__ volatile("movdqa %1, %0" : "=x" (r) : "m" (*static_cast<const __m128i*>(ptr)) : "memory");
++		return std::bit_cast<u128>(r);
++#else
+ 		return std::bit_cast<u128>(_mm_load_si128(static_cast<const __m128i*>(ptr)));
++#endif
+ 	}
+ 
+ 	void __vectorcall atomic_store16(void* ptr, u128 value)
+ 	{
++#ifdef __clang__
++		__asm__ volatile("movdqa %1, %0" : "=m" (*static_cast<__m128i*>(ptr)) : "x" (std::bit_cast<__m128i>(value)) : "memory");
++#else
+ 		_mm_store_si128(static_cast<__m128i*>(ptr), std::bit_cast<__m128i>(value));
++#endif
+ 	}
+ }
+ #endif
+diff --git a/rpcs3/util/atomic.cpp.bak_overnight b/rpcs3/util/atomic.cpp.bak_overnight
+new file mode 100644
+index 0000000..e1503ac
+--- /dev/null
++++ b/rpcs3/util/atomic.cpp.bak_overnight
+@@ -0,0 +1,1414 @@
++#include "atomic.hpp"
++
++#if defined(ARCH_ARM64) && (defined(__linux__) || defined(_WIN32)) && !defined(ARM_FEATURE_LSE2)
++#include "sysinfo.hpp"
++
++const bool utils::g_atomic_lse2 = utils::has_lse2();
++#endif
++
++#if defined(__linux__) || defined(__APPLE__)
++#define USE_FUTEX
++#elif !defined(_WIN32)
++#define USE_STD
++#endif
++
++#ifdef _MSC_VER
++
++#include "emmintrin.h"
++#include "immintrin.h"
++
++namespace utils
++{
++	u128 __vectorcall atomic_load16(const void* ptr)
++	{
++		return std::bit_cast<u128>(_mm_load_si128(static_cast<const __m128i*>(ptr)));
++	}
++
++	void __vectorcall atomic_store16(void* ptr, u128 value)
++	{
++		_mm_store_si128(static_cast<__m128i*>(ptr), std::bit_cast<__m128i>(value));
++	}
++}
++#endif
++
++#include "Utilities/sync.h"
++#include "Utilities/StrFmt.h"
++
++#ifdef __linux__
++static bool has_waitv()
++{
++	static const bool s_has_waitv = []
++	{
++#ifndef ANDROID
++		// FIXME: it produces SIGSYS signal
++		syscall(SYS_futex_waitv, 0, 0, 0, 0, 0);
++		return errno != ENOSYS;
++#endif
++		return false;
++	}();
++
++	return s_has_waitv;
++}
++#endif
++
++#include <utility>
++#include <cstdint>
++#include <array>
++#include <random>
++#include <climits>
++
++#ifdef __linux__
++#include <pthread.h>
++#endif
++
++#if defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
++#include <pthread_np.h>
++#endif
++
++#include "asm.hpp"
++#include "endian.hpp"
++#include "tsc.hpp"
++
++// Total number of entries.
++static constexpr usz s_hashtable_size = 1u << 17;
++
++// Reference counter mask
++static constexpr uptr s_ref_mask = 0xffff'ffff;
++
++// Fix for silly on-first-use initializer
++static bool s_null_wait_cb(const void*, u64, u64){ return true; };
++
++// Callback for wait() function, returns false if wait should return
++static thread_local bool(*s_tls_wait_cb)(const void* data, u64 attempts, u64 stamp0) = s_null_wait_cb;
++
++// Callback for wait() function for a second custon condition, commonly passed with timeout
++static thread_local bool(*s_tls_one_time_wait_cb)(u64 attempts) = nullptr;
++
++// Compare data in memory with old value, and return true if they are equal
++static NEVER_INLINE bool ptr_cmp(const void* data, u32 old, atomic_wait::info* ext = nullptr)
++{
++	// Check other wait variables if provided
++	if (reinterpret_cast<const atomic_t<u32>*>(data)->load() == old)
++	{
++		if (ext) [[unlikely]]
++		{
++			for (auto e = ext; e->data; e++)
++			{
++				if (!ptr_cmp(e->data, e->old))
++				{
++					return false;
++				}
++			}
++		}
++
++		return true;
++	}
++
++	return false;
++}
++
++static atomic_t<u64> s_min_tsc{0};
++
++namespace
++{
++#ifdef USE_STD
++	// Just madness to keep some members uninitialized and get zero initialization otherwise
++	template <typename T>
++	struct alignas(T) un_t
++	{
++		std::byte data[sizeof(T)];
++
++		T* get() noexcept
++		{
++			return std::launder(reinterpret_cast<T*>(+data));
++		}
++
++		const T* get() const noexcept
++		{
++			return std::launder(reinterpret_cast<const T*>(+data));
++		}
++
++		T& operator =(const T& r) noexcept
++		{
++			return *get() = r;
++		}
++
++		T* operator ->() noexcept
++		{
++			return get();
++		}
++
++		const T* operator ->() const noexcept
++		{
++			return get();
++		}
++
++		operator T&() noexcept
++		{
++			return *get();
++		}
++
++		operator const T&() const noexcept
++		{
++			return *get();
++		}
++
++		static void init(un_t& un)
++		{
++			new (un.data) T();
++		}
++
++		void destroy()
++		{
++			get()->~T();
++		}
++	};
++#endif
++
++	// Essentially a fat semaphore
++	struct alignas(64) cond_handle
++	{
++		struct fat_ptr
++		{
++			u64 ptr{};
++			u32 reserved{};
++			u32 ref_ctr{};
++
++			auto operator<=>(const fat_ptr& other) const = default;
++		};
++
++		atomic_t<fat_ptr> ptr_ref;
++		u64 tid;
++		u32 oldv;
++
++		u64 tsc0;
++		u16 link;
++		atomic_t<u32> sync;
++
++#ifdef USE_STD
++		// Standard CV/mutex pair (often contains pthread_cond_t/pthread_mutex_t)
++		un_t<std::condition_variable> cv;
++		un_t<std::mutex> mtx;
++#endif
++
++		void init(uptr iptr)
++		{
++#ifdef _WIN32
++			tid = GetCurrentThreadId();
++#elif defined(ANDROID)
++			tid = pthread_gettid_np(pthread_self());
++#elif defined(__linux__)
++			tid = syscall(SYS_gettid);
++#elif defined(__APPLE__)
++			u64 tid_temp{};
++			pthread_threadid_np(nullptr, &tid_temp);
++			tid = tid_temp; // Use a temporary for extra safety
++#elif defined(__FreeBSD__)
++			tid = pthread_getthreadid_np();
++#else
++			tid = pthread_self();
++#endif
++
++#ifdef USE_STD
++			cv.init(cv);
++			mtx.init(mtx);
++#endif
++
++			ensure(ptr_ref.exchange(fat_ptr{iptr, 0, 1}) == fat_ptr{});
++		}
++
++		void destroy()
++		{
++			tid = 0;
++			tsc0 = 0;
++			link = 0;
++			sync.release(0);
++			oldv = 0;
++
++#ifdef USE_STD
++			mtx.destroy();
++			cv.destroy();
++#endif
++		}
++
++		bool forced_wakeup()
++		{
++			const auto [_old, ok] = sync.fetch_op([](u32& val)
++			{
++				if (val - 1 <= 1)
++				{
++					val = 3;
++					return true;
++				}
++
++				return false;
++			});
++
++			// Prevent collision between normal wake-up and forced one
++			return ok && _old == 1;
++		}
++
++		bool wakeup(u32 cmp_res)
++		{
++			if (cmp_res == 1) [[likely]]
++			{
++				const auto [_old, ok] = sync.fetch_op([](u32& val)
++				{
++					if (val == 1)
++					{
++						val = 2;
++						return true;
++					}
++
++					return false;
++				});
++
++				return ok;
++			}
++
++			if (cmp_res > 1) [[unlikely]]
++			{
++				// TODO.
++				// Used when notify function is provided with enforced new value.
++				return forced_wakeup();
++			}
++
++			return false;
++		}
++
++		bool set_sleep()
++		{
++			const auto [_old, ok] = sync.fetch_op([](u32& val)
++			{
++				if (val == 2)
++				{
++					val = 1;
++					return true;
++				}
++
++				return false;
++			});
++
++			return ok;
++		}
++
++		void alert_native()
++		{
++#ifdef USE_FUTEX
++			// Use "wake all" arg for robustness, only 1 thread is expected
++			futex(&sync, FUTEX_WAKE_PRIVATE, 0x7fff'ffff);
++#elif defined(USE_STD)
++			// Not super efficient: locking is required to avoid lost notifications
++			mtx->lock();
++			mtx->unlock();
++			cv->notify_all();
++#elif defined(_WIN32)
++			if (NtWaitForAlertByThreadId)
++			{
++				// Sets some sticky alert bit, at least I believe so
++				NtAlertThreadByThreadId(tid);
++			}
++			else
++			{
++				// Can wait in rare cases, which is its annoying weakness
++				NtReleaseKeyedEvent(nullptr, &sync, 1, nullptr);
++			}
++#endif
++		}
++
++		bool try_alert_native()
++		{
++#if defined(USE_FUTEX)
++			return false;
++#elif defined(USE_STD)
++			// Optimistic non-blocking path
++			if (mtx->try_lock())
++			{
++				mtx->unlock();
++				cv->notify_all();
++				return true;
++			}
++
++			return false;
++#elif defined(_WIN32)
++			if (NtAlertThreadByThreadId)
++			{
++				// Don't notify prematurely with this API
++				return false;
++			}
++
++			static LARGE_INTEGER instant{};
++
++			if (NtReleaseKeyedEvent(nullptr, &sync, 1, &instant) != NTSTATUS_SUCCESS)
++			{
++				// Failed to notify immediately
++				return false;
++			}
++
++			return true;
++#endif
++		}
++	};
++
++#ifndef USE_STD
++	static_assert(sizeof(cond_handle) == 64);
++#endif
++}
++
++// Produce u128 value that repeats val 8 times
++static constexpr u128 dup8(u32 val)
++{
++	const u32 shift = 32 - std::countl_zero(val);
++
++	const u128 it0 = u128{val};
++	const u128 it1 = it0 | (it0 << shift);
++	const u128 it2 = it1 | (it1 << (shift * 2));
++	const u128 it3 = it2 | (it2 << (shift * 4));
++
++	return it3;
++}
++
++// Free or put in specified tls slot
++static void cond_free(u32 cond_id, u32 tls_slot);
++
++// Semaphore tree root (level 1) - split in 8 parts (8192 in each)
++static atomic_t<u128> s_cond_sem1{1};
++
++// Semaphore tree (level 2) - split in 8 parts (1024 in each)
++static atomic_t<u128> s_cond_sem2[8]{{1}};
++
++// Semaphore tree (level 3) - split in 16 parts (128 in each)
++static atomic_t<u128> s_cond_sem3[64]{{1}};
++
++// Allocation bits (level 4) - guarantee 1 free bit
++static atomic_t<u64> s_cond_bits[65536 / 64]{1};
++
++// Max allowed thread number is chosen to fit in 16 bits
++static cond_handle s_cond_list[65536]{};
++
++namespace
++{
++	struct tls_cond_handler
++	{
++		u16 cond[4]{};
++
++		constexpr tls_cond_handler() noexcept = default;
++
++		~tls_cond_handler()
++		{
++			for (u32 cond_id : cond)
++			{
++				if (cond_id)
++				{
++					// Set fake refctr
++					s_cond_list[cond_id].ptr_ref.release(cond_handle::fat_ptr{0, 0, 1});
++					cond_free(cond_id, -1);
++				}
++			}
++		}
++	};
++}
++
++// TLS storage for few allocaded "semaphores" to allow skipping initialization
++static thread_local tls_cond_handler s_tls_conds{};
++
++static u32 cond_alloc(uptr iptr, u32 tls_slot = -1)
++{
++	// Try to get cond from tls slot instead
++	u16* ptls = tls_slot >= std::size(s_tls_conds.cond) ? nullptr : s_tls_conds.cond + tls_slot;
++
++	if (ptls && *ptls) [[likely]]
++	{
++		// Fast reinitialize
++		const u32 id = std::exchange(*ptls, 0);
++		s_cond_list[id].ptr_ref.release(cond_handle::fat_ptr{iptr, 0, 1});
++		return id;
++	}
++
++	const u32 level1 = s_cond_sem1.atomic_op([](u128& val) -> u32
++	{
++		constexpr u128 max_mask = dup8(8192);
++
++		// Leave only bits indicating sub-semaphore is full, find free one
++		const u32 pos = utils::ctz128(~val & max_mask);
++
++		if (pos == 128) [[unlikely]]
++		{
++			// No free space
++			return -1;
++		}
++
++		val += u128{1} << (pos / 14 * 14);
++
++		return pos / 14;
++	});
++
++	// Determine whether there is a free slot or not
++	if (level1 < 8) [[likely]]
++	{
++		const u32 level2 = level1 * 8 + s_cond_sem2[level1].atomic_op([](u128& val)
++		{
++			constexpr u128 max_mask = dup8(1024);
++
++			const u32 pos = utils::ctz128(~val & max_mask);
++
++			val += u128{1} << (pos / 11 * 11);
++
++			return pos / 11;
++		});
++
++		const u32 level3 = level2 * 16 + s_cond_sem3[level2].atomic_op([](u128& val)
++		{
++			constexpr u128 max_mask = dup8(64) | (dup8(64) << 56);
++
++			const u32 pos = utils::ctz128(~val & max_mask);
++
++			val += u128{1} << (pos / 7 * 7);
++
++			return pos / 7;
++		});
++
++		// Set lowest clear bit
++		const u64 bits = s_cond_bits[level3].fetch_op(AOFN(x |= x + 1, void()));
++
++		// Find lowest clear bit (before it was set in fetch_op)
++		const u32 id = level3 * 64 + std::countr_one(bits);
++
++		// Initialize new "semaphore"
++		s_cond_list[id].init(iptr);
++		return id;
++	}
++
++	fmt::throw_exception("Thread semaphore limit (65535) reached in atomic wait.");
++}
++
++static void cond_free(u32 cond_id, u32 tls_slot = -1)
++{
++	if (cond_id - 1 >= u16{umax}) [[unlikely]]
++	{
++		fmt::throw_exception("bad id %u", cond_id);
++	}
++
++	const auto cond = s_cond_list + cond_id;
++
++	// Dereference, destroy on last ref
++	const bool last = cond->ptr_ref.atomic_op([](cond_handle::fat_ptr& val)
++	{
++		ensure(val.ref_ctr);
++
++		val.ref_ctr--;
++
++		if (val.ref_ctr == 0)
++		{
++			val = cond_handle::fat_ptr{};
++			return true;
++		}
++
++		return false;
++	});
++
++	if (!last)
++	{
++		return;
++	}
++
++	u16* ptls = tls_slot >= std::size(s_tls_conds.cond) ? nullptr : s_tls_conds.cond + tls_slot;
++
++	if (ptls && !*ptls) [[likely]]
++	{
++		// Fast finalization
++		cond->sync.release(0);
++		*ptls = static_cast<u16>(cond_id);
++		return;
++	}
++
++	// Call the destructor if necessary
++	utils::prefetch_write(s_cond_bits + cond_id / 64);
++
++	const u32 level3 = cond_id / 64 % 16;
++	const u32 level2 = cond_id / 1024 % 8;
++	const u32 level1 = cond_id / 8192 % 8;
++
++	utils::prefetch_write(s_cond_sem3 + level2);
++	utils::prefetch_write(s_cond_sem2 + level1);
++	utils::prefetch_write(&s_cond_sem1);
++
++	cond->destroy();
++
++	// Release the semaphore tree in the reverse order
++	s_cond_bits[cond_id / 64] &= ~(1ull << (cond_id % 64));
++
++	s_cond_sem3[level2].atomic_op(AOFN(x -= u128{1} << (level3 * 7)));
++	s_cond_sem2[level1].atomic_op(AOFN(x -= u128{1} << (level2 * 11)));
++	s_cond_sem1.atomic_op(AOFN(x -= u128{1} << (level1 * 14)));
++}
++
++static cond_handle* cond_id_lock(u32 cond_id, uptr iptr = 0)
++{
++	bool did_ref = false;
++
++	if (cond_id - 1 >= u16{umax})
++	{
++		return nullptr;
++	}
++
++	const auto cond = s_cond_list + cond_id;
++
++	while (true)
++	{
++		const auto [old, ok] = cond->ptr_ref.fetch_op([&](cond_handle::fat_ptr& val)
++		{
++			if (val == cond_handle::fat_ptr{} || val.ref_ctr == s_ref_mask)
++			{
++				// Don't reference already deallocated semaphore
++				return false;
++			}
++
++			if (iptr && val.ptr != iptr)
++			{
++				// Pointer mismatch
++				return false;
++			}
++
++			const u32 sync_val = cond->sync;
++
++			if (sync_val == 0 || sync_val == 3)
++			{
++				return false;
++			}
++
++			if (!did_ref)
++			{
++				val.ref_ctr++;
++			}
++
++			return true;
++		});
++
++		if (ok)
++		{
++			// Check other fields again
++			if (const u32 sync_val = cond->sync; sync_val == 0 || sync_val == 3)
++			{
++				did_ref = true;
++				continue;
++			}
++
++			return cond;
++		}
++
++		if (old.ref_ctr == s_ref_mask)
++		{
++			fmt::throw_exception("Reference count limit (%u) reached in an atomic notifier.", s_ref_mask);
++		}
++
++		break;
++	}
++
++	if (did_ref)
++	{
++		cond_free(cond_id, -1);
++	}
++
++	return nullptr;
++}
++
++namespace
++{
++	struct alignas(16) slot_allocator
++	{
++		u64 maxc: 5; // Collision counter
++		u64 maxd: 11; // Distance counter
++		u64 bits: 24; // Allocated bits
++		u64 prio: 8; // Reserved
++
++		u64 ref : 16; // Ref counter
++		u64 iptr: 64; // First pointer to use slot (to count used slots)
++	};
++
++	static_assert(sizeof(slot_allocator) == 16);
++
++	// Need to spare 16 bits for ref counter
++	static constexpr u64 max_threads = 24;
++
++	// (Arbitrary, not justified) Can only allow extended allocations go as far as this
++	static constexpr u64 max_distance = 500;
++
++	// Thread list
++	struct alignas(64) root_info
++	{
++		// Allocation bits (least significant)
++		atomic_t<slot_allocator> bits;
++
++		// Allocation pool, pointers to allocated semaphores
++		atomic_t<u16> slots[max_threads];
++
++		static atomic_t<u16>* slot_alloc(uptr ptr) noexcept;
++
++		static void slot_free(uptr ptr, atomic_t<u16>* slot, u32 tls_slot) noexcept;
++
++		template <typename F>
++		static auto slot_search(uptr iptr, F func) noexcept;
++	};
++
++	static_assert(sizeof(root_info) == 64);
++}
++
++// Main hashtable for atomic wait.
++static root_info s_hashtable[s_hashtable_size]{};
++
++namespace
++{
++	struct hash_engine
++	{
++		// Pseudo-RNG, seeded with input pointer
++		using rng = std::linear_congruential_engine<u64, 2862933555777941757, 3037000493, 0>;
++
++		const u64 init;
++
++		// Subpointers
++		u16 r0;
++		u16 r1;
++
++		// Pointer to the current hashtable slot
++		u32 id;
++
++		// Initialize: PRNG on iptr, split into two 16 bit chunks, choose first chunk
++		explicit hash_engine(uptr iptr)
++			: init(rng(iptr)())
++			, r0(static_cast<u16>(init >> 48))
++			, r1(static_cast<u16>(init >> 32))
++			, id(static_cast<u32>(init) >> 31 ? r0 : r1 + 0x10000)
++		{
++		}
++
++		// Advance: linearly to prevent self-collisions, but always switch between two big 2^16 chunks
++		void advance() noexcept
++		{
++			if (id >= 0x10000)
++			{
++				id = r0++;
++			}
++			else
++			{
++				id = r1++ + 0x10000;
++			}
++		}
++
++		root_info* current() const noexcept
++		{
++			return &s_hashtable[id];
++		}
++
++		root_info* operator ->() const noexcept
++		{
++			return current();
++		}
++	};
++}
++
++u64 utils::get_unique_tsc()
++{
++	const u64 stamp0 = utils::get_tsc();
++
++	if (!s_min_tsc.fetch_op([=](u64& tsc)
++	{
++		if (stamp0 <= tsc)
++		{
++			// Add 1 if new stamp is too old
++			return false;
++		}
++		else
++		{
++			// Update last tsc with new stamp otherwise
++			tsc = stamp0;
++			return true;
++		}
++	}).second)
++	{
++		// Add 1 if new stamp is too old
++		// Avoid doing it in the atomic operaion because, if it gets here it means there is already much cntention
++		// So break the race (at least on x86)
++		return s_min_tsc.add_fetch(1);
++	}
++
++	return stamp0;
++}
++
++atomic_t<u16>* root_info::slot_alloc(uptr ptr) noexcept
++{
++	atomic_t<u16>* slot = nullptr;
++
++	u32 limit = 0;
++
++	for (hash_engine _this(ptr);; _this.advance())
++	{
++		slot = _this->bits.atomic_op([&](slot_allocator& bits) -> atomic_t<u16>*
++		{
++			// Increment reference counter on every hashtable slot we attempt to allocate on
++			if (bits.ref == u16{umax})
++			{
++				fmt::throw_exception("Thread limit (65535) reached for a single hashtable slot.");
++				return nullptr;
++			}
++
++			if (bits.iptr == 0)
++				bits.iptr = ptr;
++			if (bits.maxc == 0 && bits.iptr != ptr && bits.ref)
++				bits.maxc = 1;
++			if (bits.maxd < limit)
++				bits.maxd = limit;
++
++			bits.ref++;
++
++			if (bits.bits != (1ull << max_threads) - 1)
++			{
++				const u32 id = std::countr_one(bits.bits);
++				bits.bits |= bits.bits + 1;
++				return _this->slots + id;
++			}
++
++			return nullptr;
++		});
++
++		if (slot)
++		{
++			break;
++		}
++
++		// Keep trying adjacent slots in the hashtable, they are often free due to alignment.
++		limit++;
++
++		if (limit == max_distance) [[unlikely]]
++		{
++			fmt::throw_exception("Distance limit (500) exceeded for the atomic wait hashtable.");
++			return nullptr;
++		}
++	}
++
++	return slot;
++}
++
++void root_info::slot_free(uptr iptr, atomic_t<u16>* slot, u32 tls_slot) noexcept
++{
++	const auto begin = reinterpret_cast<uptr>(std::begin(s_hashtable));
++
++	const auto ptr = reinterpret_cast<uptr>(slot) - begin;
++
++	if (ptr >= sizeof(s_hashtable))
++	{
++		fmt::throw_exception("Failed to find slot in hashtable slot deallocation.");
++		return;
++	}
++
++	root_info* _this = &s_hashtable[ptr / sizeof(root_info)];
++
++	if (!(slot >= _this->slots && slot < std::end(_this->slots)))
++	{
++		fmt::throw_exception("Failed to find slot in hashtable slot deallocation.");
++		return;
++	}
++
++	const u32 diff = static_cast<u32>(slot - _this->slots);
++
++	ensure(slot == &_this->slots[diff]);
++
++	const u32 cond_id = slot->exchange(0);
++
++	if (cond_id)
++	{
++		cond_free(cond_id, tls_slot);
++	}
++
++	for (hash_engine curr(iptr);; curr.advance())
++	{
++		// Reset reference counter and allocation bit in every slot
++		curr->bits.atomic_op([&](slot_allocator& bits)
++		{
++			ensure(bits.ref--);
++
++			if (_this == curr.current())
++			{
++				bits.bits &= ~(1ull << diff);
++			}
++		});
++
++		if (_this == curr.current())
++		{
++			break;
++		}
++	}
++}
++
++template <typename F>
++FORCE_INLINE auto root_info::slot_search(uptr iptr, F func) noexcept
++{
++	u32 index = 0;
++	[[maybe_unused]] u32 total = 0;
++
++	for (hash_engine _this(iptr);; _this.advance())
++	{
++		const auto bits = _this->bits.load();
++
++		if (bits.ref == 0) [[likely]]
++		{
++			return;
++		}
++
++		u16 cond_ids[max_threads];
++		u32 cond_count = 0;
++
++		u64 bits_val = bits.bits;
++
++		for (u64 bits = bits_val; bits; bits &= bits - 1)
++		{
++			if (u16 cond_id = _this->slots[std::countr_zero(bits)])
++			{
++				utils::prefetch_read(s_cond_list + cond_id);
++				cond_ids[cond_count++] = cond_id;
++			}
++		}
++
++		for (u32 i = 0; i < cond_count; i++)
++		{
++			if (cond_id_lock(cond_ids[i], iptr))
++			{
++				if (func(cond_ids[i]))
++				{
++					return;
++				}
++			}
++		}
++
++		total += cond_count;
++
++		index++;
++
++		if (index == max_distance)
++		{
++			return;
++		}
++	}
++}
++
++SAFE_BUFFERS(void)
++atomic_wait_engine::wait(const void* data, u32 old_value, u64 timeout, atomic_wait::info* ext)
++{
++	uint ext_size = 0;
++
++#ifdef __linux__
++	::timespec ts{};
++	if (timeout + 1)
++	{
++		if (ext && ext->data) [[unlikely]]
++		{
++			// futex_waitv uses absolute timeout
++			::clock_gettime(CLOCK_MONOTONIC, &ts);
++		}
++
++		ts.tv_sec += timeout / 1'000'000'000;
++		ts.tv_nsec += timeout % 1'000'000'000;
++		if (ts.tv_nsec >= 1'000'000'000)
++		{
++			ts.tv_sec++;
++			ts.tv_nsec -= 1'000'000'000;
++		}
++	}
++
++	futex_waitv vec[atomic_wait::max_list]{};
++	vec[0].flags = FUTEX_32 | FUTEX_PRIVATE_FLAG;
++	vec[0].uaddr = reinterpret_cast<__u64>(data);
++	vec[0].val = old_value;
++
++	if (ext) [[unlikely]]
++	{
++		for (auto e = ext; e->data; e++)
++		{
++			ext_size++;
++			vec[ext_size].flags = FUTEX_32 | FUTEX_PRIVATE_FLAG;
++			vec[ext_size].uaddr = reinterpret_cast<__u64>(e->data);
++			vec[ext_size].val = e->old;
++		}
++	}
++
++	if (ext_size && has_waitv()) [[unlikely]]
++	{
++		if (syscall(SYS_futex_waitv, +vec, ext_size + 1, 0, timeout + 1 ? &ts : nullptr, CLOCK_MONOTONIC) == -1)
++		{
++			if (errno == ENOSYS)
++			{
++				fmt::throw_exception("futex_waitv is not supported (Linux kernel is too old)");
++			}
++			if (errno == EINVAL)
++			{
++				fmt::throw_exception("futex_waitv: bad param");
++			}
++		}
++		return;
++	}
++	else if (has_waitv())
++	{
++		if (futex(const_cast<void*>(data), FUTEX_WAIT_PRIVATE, old_value, timeout + 1 ? &ts : nullptr) == -1)
++		{
++			if (errno == EINVAL)
++			{
++				fmt::throw_exception("futex: bad param");
++			}
++		}
++		return;
++	}
++
++	ext_size = 0;
++#endif
++
++	if (!s_tls_wait_cb(data, 0, 0))
++	{
++		return;
++	}
++
++	const auto stamp0 = utils::get_unique_tsc();
++
++	const uptr iptr = reinterpret_cast<uptr>(data);
++
++	uptr iptr_ext[atomic_wait::max_list - 1]{};
++
++	if (ext) [[unlikely]]
++	{
++		for (auto e = ext; e->data; e++)
++		{
++			if (data == e->data)
++			{
++				fmt::throw_exception("Address duplication in atomic_wait::list");
++			}
++
++			for (u32 j = 0; j < ext_size; j++)
++			{
++				if (e->data == ext[j].data)
++				{
++					fmt::throw_exception("Address duplication in atomic_wait::list");
++				}
++			}
++
++			iptr_ext[ext_size] = reinterpret_cast<uptr>(e->data);
++			ext_size++;
++		}
++	}
++
++	const u32 cond_id = cond_alloc(iptr, 0);
++
++	u32 cond_id_ext[atomic_wait::max_list - 1]{};
++
++	for (u32 i = 0; i < ext_size; i++)
++	{
++		cond_id_ext[i] = cond_alloc(iptr_ext[i], i + 1);
++	}
++
++	const auto slot = root_info::slot_alloc(iptr);
++
++	std::array<atomic_t<u16>*, atomic_wait::max_list - 1> slot_ext{};
++
++	std::array<cond_handle*, atomic_wait::max_list - 1> cond_ext{};
++
++	for (u32 i = 0; i < ext_size; i++)
++	{
++		// Allocate slot for cond id location
++		slot_ext[i] = root_info::slot_alloc(iptr_ext[i]);
++
++		// Get pointers to the semaphores
++		cond_ext[i] = s_cond_list + cond_id_ext[i];
++	}
++
++	// Save for notifiers
++	const auto cond = s_cond_list + cond_id;
++
++	// Store some info for notifiers (some may be unused)
++	cond->link = 0;
++	cond->oldv = old_value;
++	cond->tsc0 = stamp0;
++
++	cond->sync.release(1);
++
++	for (u32 i = 0; i < ext_size; i++)
++	{
++		// Extensions point to original cond_id, copy remaining info
++		cond_ext[i]->link = cond_id;
++		cond_ext[i]->oldv = ext[i].old;
++		cond_ext[i]->tsc0 = stamp0;
++
++		// Cannot be notified, should be redirected to main semaphore
++		cond_ext[i]->sync.release(4);
++	}
++
++	// Final deployment
++	slot->store(static_cast<u16>(cond_id));
++
++	for (u32 i = 0; i < ext_size; i++)
++	{
++		slot_ext[i]->release(static_cast<u16>(cond_id_ext[i]));
++	}
++
++#ifdef USE_STD
++	// Lock mutex
++	std::unique_lock lock(*cond->mtx.get());
++#else
++	if (ext_size)
++		atomic_fence_seq_cst();
++#endif
++
++	// Can skip unqueue process if true
++#if defined(USE_FUTEX) || defined(USE_STD)
++	constexpr bool fallback = true;
++#else
++	bool fallback = false;
++#endif
++
++	u64 attempts = 0;
++
++	while (ptr_cmp(data, old_value, ext))
++	{
++		if (s_tls_one_time_wait_cb)
++		{
++			if (!s_tls_one_time_wait_cb(attempts))
++			{
++				break;
++			}
++		}
++
++#ifdef USE_FUTEX
++		struct timespec ts;
++		ts.tv_sec  = timeout / 1'000'000'000;
++		ts.tv_nsec = timeout % 1'000'000'000;
++
++		const u32 val = cond->sync;
++
++		if (val > 1) [[unlikely]]
++		{
++			// Signaled prematurely
++			if (!cond->set_sleep())
++			{
++				break;
++			}
++		}
++		else
++		{
++			futex(&cond->sync, FUTEX_WAIT_PRIVATE, val, timeout + 1 ? &ts : nullptr);
++		}
++#elif defined(USE_STD)
++		if (cond->sync > 1) [[unlikely]]
++		{
++			if (!cond->set_sleep())
++			{
++				break;
++			}
++		}
++		else if (timeout + 1)
++		{
++			cond->cv->wait_for(lock, std::chrono::nanoseconds(timeout));
++		}
++		else
++		{
++			cond->cv->wait(lock);
++		}
++#elif defined(_WIN32)
++		LARGE_INTEGER qw;
++		qw.QuadPart = -static_cast<s64>(timeout / 100);
++
++		if (timeout % 100)
++		{
++			// Round up to closest 100ns unit
++			qw.QuadPart -= 1;
++		}
++
++		if (fallback) [[unlikely]]
++		{
++			if (!cond->set_sleep())
++			{
++				if (cond->sync == 3)
++				{
++					break;
++				}
++			}
++
++			fallback = false;
++		}
++		else if (NtWaitForAlertByThreadId)
++		{
++			switch (DWORD status = NtWaitForAlertByThreadId(cond, timeout + 1 ? &qw : nullptr))
++			{
++			case NTSTATUS_ALERTED: fallback = true; break;
++			case NTSTATUS_TIMEOUT: break;
++			default:
++			{
++				SetLastError(status);
++				ensure(false); // Unexpected result
++			}
++			}
++		}
++		else
++		{
++			if (NtWaitForKeyedEvent(nullptr, &cond->sync, false, timeout + 1 ? &qw : nullptr) == NTSTATUS_SUCCESS)
++			{
++				// Error code assumed to be timeout
++				fallback = true;
++			}
++		}
++#endif
++		if (!s_tls_wait_cb(data, ++attempts, stamp0))
++		{
++			break;
++		}
++
++		if (timeout + 1)
++		{
++			if (s_tls_one_time_wait_cb)
++			{
++				// The condition of the callback overrides timeout escape because it makes little sense to do so when a custom condition is passed
++				continue;
++			}
++
++			// TODO: reduce timeout instead
++			break;
++		}
++	}
++
++	while (!fallback)
++	{
++#if defined(_WIN32)
++		static LARGE_INTEGER instant{};
++
++		if (cond->wakeup(1))
++		{
++			// Succeeded in self-notifying
++			break;
++		}
++
++		if (NtWaitForAlertByThreadId)
++		{
++			if (NtWaitForAlertByThreadId(cond, &instant) == NTSTATUS_ALERTED)
++			{
++				break;
++			}
++
++			continue;
++		}
++
++		if (!NtWaitForKeyedEvent(nullptr, &cond->sync, false, &instant))
++		{
++			// Succeeded in obtaining an event without waiting
++			break;
++		}
++
++		continue;
++#endif
++	}
++
++#ifdef USE_STD
++	if (lock)
++	{
++		lock.unlock();
++	}
++#endif
++
++	// Release resources in reverse order
++	for (u32 i = ext_size - 1; i != umax; i--)
++	{
++		root_info::slot_free(iptr_ext[i], slot_ext[i], i + 1);
++	}
++
++	root_info::slot_free(iptr, slot, 0);
++
++	s_tls_wait_cb(data, -1, stamp0);
++	s_tls_one_time_wait_cb = nullptr;
++}
++
++template <bool NoAlert = false>
++static u32 alert_sema(u32 cond_id, u32 size)
++{
++	ensure(cond_id);
++
++	const auto cond = s_cond_list + cond_id;
++
++	u32 ok = 0;
++
++	if (true)
++	{
++		// Redirect if necessary
++		const auto _old = cond;
++		const auto _new = _old->link ? cond_id_lock(_old->link) : _old;
++
++		if (_new && _new->tsc0 == _old->tsc0)
++		{
++			if constexpr (NoAlert)
++			{
++				if (_new != _old)
++				{
++					// Keep base cond for actual alert attempt, free only secondary cond
++					ok = ~_old->link;
++					cond_free(cond_id);
++					return ok;
++				}
++				else
++				{
++					ok = ~cond_id;
++					return ok;
++				}
++			}
++			else if (_new->wakeup(size ? 1 : 2))
++			{
++				ok = cond_id;
++				{
++					_new->alert_native();
++				}
++			}
++		}
++
++		if (_new && _new != _old)
++		{
++			cond_free(_old->link);
++		}
++	}
++
++	// Remove lock, possibly deallocate cond
++	cond_free(cond_id);
++	return ok;
++}
++
++void atomic_wait_engine::set_wait_callback(bool(*cb)(const void*, u64, u64))
++{
++	if (cb)
++	{
++		s_tls_wait_cb = cb;
++	}
++	else
++	{
++		s_tls_wait_cb = s_null_wait_cb;
++	}
++}
++
++void atomic_wait_engine::set_one_time_use_wait_callback(bool(*cb)(u64 progress))
++{
++	s_tls_one_time_wait_cb = cb;
++}
++
++void atomic_wait_engine::notify_one(const void* data)
++{
++#ifdef __linux__
++	if (has_waitv())
++	{
++		futex(const_cast<void*>(data), FUTEX_WAKE_PRIVATE, 1);
++		return;
++	}
++#endif
++	const uptr iptr = reinterpret_cast<uptr>(data);
++
++	root_info::slot_search(iptr, [&](u32 cond_id)
++	{
++		if (alert_sema(cond_id, 4))
++		{
++			return true;
++		}
++
++		return false;
++	});
++}
++
++SAFE_BUFFERS(void)
++atomic_wait_engine::notify_all(const void* data)
++{
++#ifdef __linux__
++	if (has_waitv())
++	{
++		futex(const_cast<void*>(data), FUTEX_WAKE_PRIVATE, INT_MAX);
++		return;
++	}
++#endif
++	const uptr iptr = reinterpret_cast<uptr>(data);
++
++	// Array count for batch notification
++	u32 count = 0;
++
++	// Array itself.
++	u32 cond_ids[128];
++
++	root_info::slot_search(iptr, [&](u32 cond_id)
++	{
++		if (count >= 128)
++		{
++			// Unusual big amount of sema: fallback to notify_one alg
++			alert_sema(cond_id, 4);
++			return false;
++		}
++
++		u32 res = alert_sema<true>(cond_id, 4);
++
++		if (~res <= u16{umax})
++		{
++			// Add to the end of the "stack"
++			*(std::end(cond_ids) - ++count) = ~res;
++		}
++
++		return false;
++	});
++
++	// Try alert
++	for (u32 i = 0; i < count; i++)
++	{
++		const u32 cond_id = *(std::end(cond_ids) - i - 1);
++
++		if (!s_cond_list[cond_id].wakeup(1))
++		{
++			*(std::end(cond_ids) - i - 1) = ~cond_id;
++		}
++	}
++
++	// Second stage (non-blocking alert attempts)
++	if (count > 1)
++	{
++		for (u32 i = 0; i < count; i++)
++		{
++			const u32 cond_id = *(std::end(cond_ids) - i - 1);
++
++			if (cond_id <= u16{umax})
++			{
++				if (s_cond_list[cond_id].try_alert_native())
++				{
++					*(std::end(cond_ids) - i - 1) = ~cond_id;
++				}
++			}
++		}
++	}
++
++	// Final stage and cleanup
++	for (u32 i = 0; i < count; i++)
++	{
++		const u32 cond_id = *(std::end(cond_ids) - i - 1);
++
++		if (cond_id <= u16{umax})
++		{
++			s_cond_list[cond_id].alert_native();
++			*(std::end(cond_ids) - i - 1) = ~cond_id;
++		}
++	}
++
++	for (u32 i = 0; i < count; i++)
++	{
++		cond_free(~*(std::end(cond_ids) - i - 1));
++	}
++}
++
++namespace atomic_wait
++{
++	extern void parse_hashtable(bool(*cb)(u64 id, u32 refs, u64 ptr, u32 max_coll))
++	{
++		for (u64 i = 0; i < s_hashtable_size; i++)
++		{
++			const auto root = &s_hashtable[i];
++			const auto slot = root->bits.load();
++
++			if (cb(i, static_cast<u32>(slot.ref), slot.iptr, static_cast<u32>(slot.maxc)))
++			{
++				break;
++			}
++		}
++	}
++}
 diff --git a/rpcs3/util/types.hpp b/rpcs3/util/types.hpp
 index f893142..768d636 100644
 --- a/rpcs3/util/types.hpp

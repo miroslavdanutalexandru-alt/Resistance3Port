@@ -238,6 +238,15 @@ elseif(PORT_ENABLE_SPU)
     endif()
 endif()
 
+# Resistance port: native ADS depth-of-field job kernels (igjob 419). Built with
+# the lifted SPU flags: it calls the same SPU float/int helpers.
+if(SPU_SOURCES)
+    list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/r3_native_dof.c")
+    foreach(_dof_img 618 619 620 621 622 623)
+        list(APPEND SPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/r3_native_dof_gen_${_dof_img}.c")
+    endforeach()
+endif()
+
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp

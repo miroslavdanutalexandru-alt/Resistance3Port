@@ -4136,14 +4136,21 @@ static int spu_ibfast_init(void)
     { const char* v = getenv("SPU_LOOP_IB"); g_spu_ib_inline = (on && !(v && *v == '0')) ? 1 : 0; }
     return on;
 }
+/* Resistance port: native job-kernel override (project/r3_native_dof.c sets it
+ * only under R3_NATIVE_DOF / R3_DOF_TRACE / R3_DOF_CAPTURE). Returns 1 when it
+ * performed the call itself and left ctx->pc at the return address. */
+int (*volatile g_spu_native_ib_hook)(spu_context*) = 0;
 void spu_indirect_branch(spu_context* ctx)
 {
     SPU_PROF_ADD(ctx, ib, 1);
+    if (__builtin_expect(g_spu_native_ib_hook != 0, 0) && g_spu_native_ib_hook(ctx)) return;
     {   /* [spu-jobs] job entry (spu_drain.c) */
         extern uint32_t g_sjt_link_a, g_sjt_link_b;
         extern void spu_jobtime_begin(spu_context*, uint32_t);
         const uint32_t lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+        const uint32_t tpc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
         if (__builtin_expect(lr == g_sjt_link_a || lr == g_sjt_link_b, 0)) spu_jobtime_begin(ctx, lr);
+        else if (__builtin_expect(tpc == g_sjt_link_a || tpc == g_sjt_link_b, 0)) spu_jobtime_begin(ctx, tpc);
     }
     int on = s_ibfast;
     if (__builtin_expect(on < 0, 0)) on = spu_ibfast_init();

@@ -176,6 +176,53 @@ static void fx_init(void)
             s_fx_dof ? "on" : "off", s_fx_mb ? "on" : "off");
 }
 static void fx_zero(uint32_t ea) { if (ea && vm_base) memset(vm_base + ea, 0, 4); }   /* 0.0f, any endianness */
+/* Depth-of-field parameter block (func_008557A8 r5; big-endian floats): +0 flags, +0x10/+0x14,
+ * +0x20/+0x24, +0x30/+0x34 three distance ramps, +0x28 / +0x38 near / far max blur (the effect runs
+ * when either is >= 0.01; it then queues the SPU DOF job, igjob 419).
+ *   R3_DOF_PLOG=1   log the block whenever it changes (first 400 changes).
+ *   R3_FORCE_DOF=1  TEST ONLY (default off): when the block is present but both strengths are below
+ *                   0.01, write the aim-down-sights values (R3_FORCE_DOF_P="off=val,..." overrides them)
+ *                   so the DOF job runs without a weapon (QA captures / perf A/B). */
+static float fx_getf(uint32_t ea) { uint32_t u; memcpy(&u, vm_base + ea, 4); u = _byteswap_ulong(u); float f; memcpy(&f, &u, 4); return f; }
+static void fx_setf(uint32_t ea, float f) { uint32_t u; memcpy(&u, &f, 4); u = _byteswap_ulong(u); memcpy(vm_base + ea, &u, 4); }
+static void fx_dof_debug(uint32_t p)
+{
+    static int plog = -1, force = -1, nlog = 0;
+    static uint8_t last[0x40];
+    static float fv[16]; static int fset[16];
+    if (plog < 0) {
+        plog = envi("DOF_PLOG", 0); force = envi("FORCE_DOF", 0);
+        if (force) {
+            /* defaults: plausible near/far ramps chosen by hand (NOT measured from a real ADS
+             * frame -- no weapon at the test save); they exercise the same job / kernels / modes
+             * (see scratch\overnight_native_dof.md). */
+            static const struct { int off; float v; } def[] = {
+                { 0x10, 0.0f }, { 0x14, 1.5f }, { 0x20, 3.0f }, { 0x24, 6.0f }, { 0x28, 1.0f },
+                { 0x30, 30.0f }, { 0x34, 60.0f }, { 0x38, 1.0f } };
+            for (auto& d : def) { fv[d.off / 4] = d.v; fset[d.off / 4] = 1; }
+            std::string s = envs("FORCE_DOF_P", "");
+            for (size_t i = 0; i < s.size();) {
+                size_t c = s.find(',', i); if (c == std::string::npos) c = s.size();
+                std::string kv = s.substr(i, c - i); size_t eq = kv.find('=');
+                if (eq != std::string::npos) {
+                    int off = (int)strtol(kv.substr(0, eq).c_str(), NULL, 16);
+                    if (off >= 0 && off < 0x40 && !(off & 3)) { fv[off / 4] = (float)atof(kv.substr(eq + 1).c_str()); fset[off / 4] = 1; }
+                }
+                i = c + 1;
+            }
+            LOG("R3_FORCE_DOF: forcing depth of field (test only)");
+        }
+    }
+    if (!p || !vm_base) return;
+    if (force && fx_getf(p + 0x28) < 0.01f && fx_getf(p + 0x38) < 0.01f)
+        for (int i = 1; i < 16; i++) if (fset[i]) fx_setf(p + 4 * i, fv[i]);
+    if (plog && nlog < 400 && memcmp(last, vm_base + p, 0x40)) {
+        memcpy(last, vm_base + p, 0x40); nlog++;
+        char b[512]; int n = snprintf(b, sizeof b, "dof params @%08X flags=%08X", p, _byteswap_ulong(*(uint32_t*)(vm_base + p)));
+        for (int i = 1; i < 16 && n < (int)sizeof b - 24; i++) n += snprintf(b + n, sizeof b - n, " %02X=%g", 4 * i, fx_getf(p + 4 * i));
+        LOG("%s", b);
+    }
+}
 extern "C" void r3_fx_pass(int kind, uint32_t p)   /* r3.json hooks, game thread */
 {
     if (!s_fx_init) fx_init();
@@ -183,7 +230,7 @@ extern "C" void r3_fx_pass(int kind, uint32_t p)   /* r3.json hooks, game thread
     case 0: if (!s_fx_grain) fx_zero(p + 0x8); break;
     case 1: if (!s_fx_mb) fx_zero(p + 0x14); break;
     case 2: if (!s_fx_mb) fx_zero(p + 0xC); break;
-    case 3: if (!s_fx_dof) { fx_zero(p + 0x28); fx_zero(p + 0x38); } break;
+    case 3: fx_dof_debug(p); if (!s_fx_dof) { fx_zero(p + 0x28); fx_zero(p + 0x38); } break;
     }
 }
 static void fx_apply(void) { if (!s_fx_init) fx_init(); }

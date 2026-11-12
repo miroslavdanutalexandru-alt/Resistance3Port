@@ -241,7 +241,7 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Graphics › View | Field of view (experimental) | **Original**, Wider (0.85), Widest (0.7) | `R2_PATCH_FOV_VALUE` |
 | Graphics › Quality | Shadow resolution | **Original**, 2x, 4x | `RSX_SHADOW_SCALE` (`2` / `4`) |
 | Graphics › Quality | Effects resolution | **Original**, Full, Full (all) | `RSX_FX_FULLRES` (`1` / `2`) |
-| Graphics › Quality | Ambient occlusion | **Off**, On (experimental) | `RSX_SSAO`. Ambient occlusion is disabled with DLSS in this beta (`RSX_SSAO_DLSS=1` forces it on). |
+| Graphics › Quality | Ambient occlusion | **Off**, On (experimental) | `RSX_SSAO`. Works with DLSS, FSR, XeSS or no upscaler (`RSX_SSAO_DLSS=0` turns it off under DLSS only). |
 | Graphics › Effects and accessibility | Film grain | **On**, Off | `R3_FX_FILMGRAIN` (`0` = off) |
 | Graphics › Effects and accessibility | Depth of field | **On**, Off | `R3_FX_DOF` (`0` = off) |
 | Graphics › Effects and accessibility | Motion blur | **On**, Off | `R3_FX_MOTIONBLUR` (`0` = off) |
@@ -307,7 +307,7 @@ With `R2_PRESET`, any setting you set yourself (in `settings.bat` or the environ
 
 - **Shadow resolution** (`RSX_SHADOW_SCALE=2|4`): the game's shadow maps (square, depth-only render targets from 256 to 2048 pixels) are rendered at 2x or 4x resolution and sampled at that resolution; the slope-scaled depth bias is scaled to match so no new shadow acne appears. The log says `[r2gx] shadow map target ...` for each one found. Costs GPU time and video memory (4x on a 2048 map is an 8192 map).
 - **Effects resolution** (`RSX_FX_FULLRES=1|2`): render targets at half (`1`) or also quarter (`2`) the scene size (particles, smoke, glow / bloom, blur and depth-of-field buffers) are drawn at the scene's resolution; the game's own upsample and composite passes read them through the renderer's scaling, so they stay aligned.
-- **Ambient occlusion** (`RSX_SSAO=1`, experimental): a screen-space AO pass computed from the scene depth when the scene pass ends, before the game's post-processing. Needs anti-aliasing off or FSR (not `R2_MSAA`); in this beta it is also off whenever NVIDIA DLSS is selected (`RSX_SSAO_DLSS=1` forces it on). `RSX_SSAO_STRENGTH=0..1` (0.6), `RSX_SSAO_RADIUS=0.1..8` (1.0); `RSX_SSAO_DEBUG=1` shows only the AO term.
+- **Ambient occlusion** (`RSX_SSAO=1`, experimental): a screen-space AO pass computed from the scene depth when the scene pass ends, before the game's post-processing. Not available with `R2_MSAA`. With DLSS, FSR or XeSS it runs on the upscaler's input (internal resolution, same frame and jitter as the scene the upscaler gets), just before the upscale; `RSX_SSAO_DLSS=0` turns it off under DLSS only, `RSX_SSAO_UPSCALER=0` restores the old post-upscale trigger (diagnostics only). `RSX_SSAO_STRENGTH=0..1` (0.6), `RSX_SSAO_RADIUS=0.1..8` (1.0); `RSX_SSAO_DEBUG=1` shows only the AO term.
 - **Texture packs** (`RSX_TEXDUMP=1`, `RSX_TEXPACK=1`): dump writes each texture once to `texdump\` as `<key>_<w>x<h>_<format>_m<mips>.dds` (DXT1/3/5, with mips) or `.png` (A8R8G8B8), listed in `texdump\manifest.tsv`; the key is a content hash of all mip levels plus size, format and mip count (stable across runs, not a memory address); copy edited files into `mods\textures\` (sub-folders allowed; the leading 16-digit hash is what matters) and turn on the pack. Replacements must keep the original size (and DXT format for `.dds`). A `<folder>` value uses another folder. With both off the upload path costs one `bool` test.
 - Not done for Resistance 3: a shadow-safe FOV mode and longer LOD / draw distance (the camera and LOD setters are not identified in the current recompilation; Resistance 2 has both), the ultrawide HUD fix (`RSX_HUD_FIX` is built in but Resistance 3 has no Hor+ aspect option yet, so it has no effect), and higher-quality motion blur / depth of field beyond what *Effects resolution* gives (they can be turned off: *Post-effect toggles* above).
 
@@ -505,7 +505,6 @@ If you hit a problem, let me know how to reproduce it, and if you can, send the 
 ## Known Bugs
 
 - **DLSS is experimental.** Some textures can still shuffle or shimmer, and dark patches can appear on some surfaces. If they bother you, use AMD FSR 3.1.
-- **Ambient occlusion is off whenever NVIDIA DLSS is selected** in this beta (also when DLSS falls back to FSR 3.1); it still works with FSR or no upscaler. `RSX_SSAO_DLSS=1` forces it on.
 - **Aiming down sights and some heavy fights can slow down** (the game is CPU-bound there). Please send `logs\run.log` if you see it.
 - **Frame Generation is experimental and barely tested** (DLSS on RTX 40/50, FSR 3 elsewhere; off by default). Expect ghosting and HUD or menu artifacts; reports are welcome.
 - **Changing Frame Generation in-game** can double the sound and then leave constant static. Change it in the launcher, or restart the game after changing it.

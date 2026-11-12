@@ -184,8 +184,8 @@ static void register_options()
                "resolution effects at full resolution; Full (all) also the quarter-resolution ones. Costs GPU time.",
                "RSX_FX_FULLRES", { {"Original", ""}, {"Full", "1"}, {"Full (all)", "2"} }, 0, {}, "rpcs3");
     add_option(SEC_RENDER_QUALITY, "ssao", "Ambient occlusion",
-               "Adds soft contact shadows in corners and creases (SSAO). Needs Anti-aliasing off or FSR. "
-               "Ambient occlusion is disabled with DLSS in this beta. "
+               "Adds soft contact shadows in corners and creases (SSAO). Works with every Anti-aliasing setting; "
+               "with DLSS, FSR or XeSS it is computed at the internal resolution, before upscaling. "
                "Experimental.",
                "RSX_SSAO", { {"Off", ""}, {"On  (experimental)", "1"} }, 0, {}, "rpcs3");
     add_option(SEC_RENDER_QUALITY, "texpack", "Texture pack",

@@ -2624,8 +2624,14 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
         spu_lockline_lock();
         vm_base[slot->ea + SPURS_WKL_CURCONT + wid] = si->active[wid];
         ef_line_end(slot->ea);
-        if (polls) si->idle[wid] = 0;
-        else if (si->idle[wid] < 4) si->idle[wid]++;
+        /* SPURS_IDLE_BACKOFF_MAX: an idle-polled workload (no ready count or
+         * signal, e.g. a job list the PPU fills by plain stores) is re-polled
+         * every 2^n kernel passes; 4 (default) = up to ~16 ms late. */
+        { static int bmax = -1;
+          if (bmax < 0) { const char* e = getenv("SPURS_IDLE_BACKOFF_MAX"); bmax = e && *e ? atoi(e) : 4;
+                          if (bmax < 0) bmax = 0; if (bmax > 4) bmax = 4; }
+          if (polls) si->idle[wid] = 0;
+          else if (si->idle[wid] < bmax) si->idle[wid]++; }
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_jobs;
         const unsigned jobs_run = g_spurs_pm_jobs;
         si->hot[wid] = jobs_run ? 1 : 0;

@@ -72,12 +72,27 @@ int ps3_perf_on(const char* name, int def)
 volatile long g_guest_mem_seq = 0;
 volatile long g_ps3_stall_seq = 0;
 static volatile long s_mem_waiters = 0;   /* threads in a notify-aware short usleep */
+#ifdef _WIN32
+/* PS3_USLEEP_BLOCK: short usleeps block on a per-thread event (woken by the
+ * notify below) plus a high-resolution timer instead of spinning, so a poll
+ * loop no longer holds a core the SPU worker it waits for needs. */
+#define USLEEP_BLOCK_SLOTS 64
+static HANDLE s_blk_ev[USLEEP_BLOCK_SLOTS];
+static volatile long s_blk_armed[USLEEP_BLOCK_SLOTS];
+static volatile long s_blk_used = 0;
+static volatile long s_blk_waiters = 0;
+#endif
 void ps3_guest_mem_notify(uint32_t ea)
 {
     (void)ea;
     if (s_mem_waiters) {
 #ifdef _WIN32
         InterlockedIncrement(&g_guest_mem_seq);
+        if (s_blk_waiters) {
+            const long n = s_blk_used;
+            for (long i = 0; i < n; i++)
+                if (s_blk_armed[i] && InterlockedExchange(&s_blk_armed[i], 0)) SetEvent(s_blk_ev[i]);
+        }
 #else
         __atomic_add_fetch(&g_guest_mem_seq, 1, __ATOMIC_SEQ_CST);
 #endif
@@ -421,6 +436,39 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             InterlockedIncrement(&s_mem_waiters);
             const long seq0 = g_guest_mem_seq;
             int early = 0;
+            static volatile int s_block = -1, s_block_min = 0;
+            if (s_block < 0) {
+                const char* m = getenv("PS3_USLEEP_BLOCK_MIN");
+                s_block_min = m && *m ? atoi(m) : 10;
+                s_block = ps3_perf_on("PS3_USLEEP_BLOCK", 0);
+                fprintf(stderr, "[usleep] PS3_USLEEP_BLOCK=%d (min %d us)\n", s_block, s_block_min);
+            }
+            static PS3_TLS long t_slot = -1;
+            static PS3_TLS HANDLE t_btimer;
+            if (s_block && t_slot == -1 && usec >= (uint64_t)s_block_min) {
+                t_slot = -2;
+                const long i = InterlockedIncrement(&s_blk_used) - 1;
+                if (i < USLEEP_BLOCK_SLOTS) {
+                    HANDLE ev = CreateEventW(NULL, FALSE, FALSE, NULL);
+                    t_btimer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_MANUAL_RESET |
+                                                      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                    if (ev && t_btimer) { s_blk_ev[i] = ev; MemoryBarrier(); t_slot = i; }
+                }
+            }
+            if (s_block && t_slot >= 0 && usec >= (uint64_t)s_block_min) {
+                InterlockedExchange(&s_blk_armed[t_slot], 1);
+                InterlockedIncrement(&s_blk_waiters);
+                if (g_guest_mem_seq == seq0) {
+                    LARGE_INTEGER due; due.QuadPart = -((LONGLONG)usec * 10);
+                    SetWaitableTimer(t_btimer, &due, 0, NULL, NULL, FALSE);
+                    HANDLE hs[2] = { s_blk_ev[t_slot], t_btimer };
+                    if (WaitForMultipleObjects(2, hs, FALSE, 20) == WAIT_OBJECT_0) early = 1;
+                } else early = 1;
+                InterlockedDecrement(&s_blk_waiters);
+                /* a notifier that already disarmed the slot may still set the
+                 * event: drop that so the next sleep is not cut short */
+                if (!InterlockedExchange(&s_blk_armed[t_slot], 0)) WaitForSingleObject(s_blk_ev[t_slot], 0);
+            } else
             do {
                 if (g_guest_mem_seq != seq0) { early = 1; break; }
                 SwitchToThread();

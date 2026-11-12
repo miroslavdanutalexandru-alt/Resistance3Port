@@ -10,6 +10,7 @@ param(
     [string[]]$Units = @('ps3recomp_sdk\CMakeFiles\ps3recomp_runtime.dir\runtime\spu\spu_channels.c.obj')
 )
 $ErrorActionPreference = 'Stop'
+$Units = @($Units | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim("' ") } | Where-Object { $_ })
 Set-Location $Root
 $build = Join-Path $Root 'build'
 $outDir = Join-Path $Root $Out
