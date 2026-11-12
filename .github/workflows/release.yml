@@ -1,0 +1,154 @@
+name: release
+
+# Builds the four release assets with this repository's own scripts\package_beta.ps1 on a Windows runner:
+#   Resistance3Port-Setup-<VERSION>.exe, Resistance3Port-<VERSION>-Windows-x64.zip, Resistance3Port-<VERSION>-source.zip and SHA256SUMS.txt.
+# Nothing from the game is used or needed: the assets hold the port's source plus Launcher.exe and Setup.exe, which are
+# compiled here from project\launcher.cpp and tools\installer\setup_exe\setup.cpp.
+#
+# Run it by hand (Actions tab, "Run workflow") to get the files as a workflow artifact, or push a tag vX.Y.Z-beta
+# that matches the VERSION file: the files are then also attached to a DRAFT pre-release that you publish by hand.
+# Tags pushed with GITHUB_TOKEN start no other workflow, so the build and the draft are one workflow, not two.
+#
+# Pattern adapted from Tsamiuy/jsp-vs-ex (MIT): Inno Setup pinned by SHA-256, pinned actions, draft via the gh CLI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build (must equal the VERSION file; leave empty to use it)
+        type: string
+        default: ''
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Build-time only, never shipped. Pinned so every run uses the same compiler for the installer.
+  INNO_VERSION: '6.7.3'
+  INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe
+  INNO_SHA256: 9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Version agrees with the VERSION file
+        id: version
+        shell: pwsh
+        env:
+          WANT: ${{ inputs.version }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ver = (Get-Content -LiteralPath VERSION -TotalCount 1).Trim()
+          if ($env:WANT -and $env:WANT.TrimStart('v') -ne $ver) { Write-Output "Asked for '$env:WANT' but VERSION is '$ver'"; exit 1 }
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -ne "v$ver") { Write-Output "Tag '$env:REF_NAME' but VERSION is '$ver'"; exit 1 }
+          "version=$ver" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+
+      - name: Inno Setup (pinned)
+        # build_installer.ps1 looks in %LOCALAPPDATA%\Programs and Program Files for "Inno Setup 6". The image has its own
+        # version, so install the pinned one when it differs. ISCC.exe has no version resource; unins000.exe next to it does.
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          $unins = Join-Path (Split-Path $iscc) 'unins000.exe'
+          $have = if ((Test-Path $iscc) -and (Test-Path $unins)) { (Get-Item $unins).VersionInfo.ProductVersion.Trim() } else { '' }
+          Write-Output "Inno Setup on the image: '$have'"
+          if ("$have" -ne $env:INNO_VERSION) {
+            $exe = Join-Path $env:RUNNER_TEMP "innosetup-$env:INNO_VERSION.exe"
+            Invoke-WebRequest -Uri $env:INNO_URL -OutFile $exe
+            $got = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLower()
+            if ($got -ne $env:INNO_SHA256) { Write-Output "Inno Setup: SHA-256 $got, expected $env:INNO_SHA256"; exit 1 }
+            $p = Start-Process $exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CURRENTUSER' -Wait -PassThru
+            if ($p.ExitCode) { Write-Output "Inno Setup install exit $($p.ExitCode)"; exit 1 }
+            # /CURRENTUSER installs under %LOCALAPPDATA%\Programs, which build_installer.ps1 searches first
+            $unins = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\unins000.exe'
+            if (-not (Test-Path $unins)) { Write-Output 'Inno Setup was not installed where expected'; exit 1 }
+            $have = (Get-Item $unins).VersionInfo.ProductVersion.Trim()
+            if ("$have" -ne $env:INNO_VERSION) { Write-Output "Inno Setup is '$have', not $env:INNO_VERSION"; exit 1 }
+          }
+          Write-Output "Inno Setup $have"
+
+      - name: Launcher.exe
+        # The same commands as the launcher step of build.bat (clang-cl from the runner's LLVM, MSVC libraries from Visual Studio).
+        shell: cmd
+        run: |
+          set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+          for /f "usebackq delims=" %%I in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%I"
+          if not defined VSDIR (echo Visual Studio C++ build tools not found & exit /b 1)
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+          where clang-cl || exit /b 1
+          if not exist build mkdir build
+          rc /nologo /i project /fo build\launcher.res project\launcher.rc || exit /b 1
+          clang-cl /nologo /O2 /EHsc /W0 project\launcher.cpp /Fo:build\launcher.obj /Fe:Launcher.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED build\launcher.res user32.lib gdi32.lib shell32.lib gdiplus.lib dwmapi.lib || exit /b 1
+          if not exist Launcher.exe exit /b 1
+
+      - name: Setup.exe
+        shell: cmd
+        run: |
+          call tools\installer\setup_exe\build_setup.bat || exit /b 1
+          if not exist Setup.exe exit /b 1
+
+      - name: Package (installer, zips, checksums)
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # No -DryRun: a real build. The script fails on game files in the file set, a wrong VERSION or a dirty tree.
+          powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package_beta.ps1 -SourceZip
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $v = $env:VERSION
+          foreach ($f in "Resistance3Port-Setup-$v.exe", "Resistance3Port-$v-Windows-x64.zip", "Resistance3Port-$v-source.zip", 'SHA256SUMS.txt') {
+            if (-not (Test-Path (Join-Path dist $f))) { Write-Output "missing dist\$f"; exit 1 }
+          }
+          Get-Content dist\SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: Resistance3Port-${{ github.sha }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          retention-days: 30
+          if-no-files-found: error
+
+  draft:
+    # Tag pushes only; a manual run just leaves the artifact above.
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # create the draft release
+      actions: read     # download this run's artifact
+    steps:
+      - name: Create the draft pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The gh CLI downloads this run's artifact, so no extra action is needed (and no checkout).
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "Resistance3Port-$GITHUB_SHA" --dir files
+          # package_beta.ps1 writes SHA256SUMS.txt on Windows; drop any CR before checking
+          (cd files && tr -d '\r' < SHA256SUMS.txt | sha256sum -c -)
+          ls -l files
+          # --verify-tag: refuses to run unless the tag already exists. Publishing the draft is done by hand.
+          gh release create "$GITHUB_REF_NAME" files/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --prerelease \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Draft built by the release workflow. Edit these notes (see docs/RELEASE_NOTES_BETA.md) and publish by hand."
