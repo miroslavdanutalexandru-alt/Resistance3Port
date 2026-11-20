@@ -1,0 +1,42 @@
+Upstream base of this ps3recomp/ copy
+=====================================
+
+Upstream: https://github.com/sp00nznet/ps3recomp (MIT, see LICENSE in this folder)
+
+Base: not a single commit. The copy matches upstream commits in this window
+(commit-date order, oldest to newest):
+
+  oldest  c3cad3941e08650187f30b468d8441419cf6321d  2026-10-21 02:05 UTC
+          "test_mmapper_hle_heap: include log_first.h for the copied heap code"
+  newest  255efabb0ba5167d6ca00f2b36f8b609f7a6d3da  2026-10-26 04:46 UTC
+          "Add .github/CODEOWNERS for the paths that execute"
+
+Inside the window, upstream's history changed only files that this copy has
+modified or does not carry, so file contents cannot narrow it further. If a
+single commit is wanted, a6d76c895f77eb30b90a806c830544e61821b77f ("Merge pull
+request #413: unify the open PRs for v0.17.0", 2026-10-21 02:24 UTC) is the
+first merge inside the window; that is a convenient reference point, not a
+finding.
+
+How it was found (read-only GitHub API calls, 2026-11-16):
+  - git blob SHA-1 of each of the 1105 files under ps3recomp/ (as in this
+    repository at cdef3452) compared with the blob SHA of the same path in
+    upstream's tree (git/trees?recursive=1) at about 320 upstream commits (every commit from the 340th to the 624th
+    newest in the API listing, plus a coarse sample of the rest, down to the
+    1200th).
+  - 723 of the 1105 files are byte-identical to upstream at every commit
+    from c3cad39 to 255efab that was checked; no commit outside that window
+    matches all 723. Older than c3cad39 the file tests/test_mmapper_hle_heap.c
+    (and several others) did not exist yet or differed; newer than 255efab,
+    CHANGELOG.md, CONTRIBUTORS.md and README.md differ.
+  - The other 382 files are this port's changes (about 271 files that
+    upstream does not have, about 111 that differ from every checked upstream
+    commit).
+
+Confidence: high that the copy was taken inside the window above (the 723
+identical files leave no other fit); no confidence about which commit in it.
+Limits: upstream commits were walked in the date order of the API listing, not
+graph order, and only the part of the history described above was compared.
+Some merge-commit states inside the window match fewer files because of branch
+order. A byte comparison cannot show whether files this copy changed were
+changed before or after the copy was made. Nothing here was built or run.
