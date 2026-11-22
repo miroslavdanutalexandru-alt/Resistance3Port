@@ -585,6 +585,12 @@ static uint32_t s_geo_serial, s_geo_pe, s_geo_cin, s_geo_zin;   /* + where 618 r
 static fast_copy s_ccopy, s_zcopy;
 static fast_out s_outs[FAST_NOUT];
 static volatile long s_nout;
+/* the current probe job's own ops, in call order (s_outs is every distinct op of the session: kernel 618
+ * copies depth from another source per image geometry, so once two geometries were seen an op of the
+ * other one always "overlapped" the depth copy and every probe was inconclusive -> GAVE UP) */
+#define FAST_NPOP 1024   /* a job 419 makes ~450 kernel calls (colour / depth copies in strips, blur passes) */
+static fast_out s_pops[FAST_NPOP];
+static volatile long s_npop, s_pop_on;
 static int s_gser_ok, s_gser_bad;
 
 static volatile uint32_t s_sw_ea;   /* sync line watched for the current probe (R3_DOF_GPU_APPROX_ROBUST), 0 = none */
@@ -1403,6 +1409,7 @@ static int fast_armed_geom(uint32_t serial, r3dof_fast_geom* g, uint32_t* bs)
  * entry; it is detiled once the job's kernel 618 calls gave the geometry */
 static void fast_probe_begin(uint32_t serial, uint32_t ea)
 {
+    s_npop = 0; MemoryBarrier(); s_pop_on = 1;   /* this job's ops from here on (fast_kernel_note) */
     const uint8_t* reg = hj_mem(R3DOF_FAST_EA, R3DOF_FAST_REGION);
     s_preg_ok = reg != NULL;
     if (reg) memcpy(s_preg, reg, R3DOF_FAST_REGION);
@@ -1423,16 +1430,36 @@ static void fast_probe_begin(uint32_t serial, uint32_t ea)
 }
 
 /* job's linear copy vs the entry-time image: 1 exact, 2 differs, 0 not checkable
- * (copy not learned, unreadable, or another op of the job writes into it) */
+ * (copy not learned, unreadable, this job did not make it, or the job wrote into it again afterwards).
+ * Only this probe job's ops count (s_pops, in call order): an op before the copy is overwritten by it,
+ * and ops of other jobs / geometries (s_outs) say nothing about this job. R3_DOF_COPY_PERJOB=0: the old
+ * session-wide rule. */
 static int fast_copy_cmp(const fast_copy* c, const r3dof_fast_geom* g, const uint8_t* lin)
 {
+    static int perjob = -1;
+    if (perjob < 0) { const char* e = getenv("R3_DOF_COPY_PERJOB"); perjob = !(e && *e == '0'); }
     const uint32_t lp = g->w * 4u;
     const uint64_t size64 = (uint64_t)(g->h - 1u) * c->pitch + lp;
     if (!c->ea || c->pitch < lp || c->pitch > R3DOF_FAST_PITCH || size64 > 0x10000000u) return 0;
     const uint32_t size = (uint32_t)size64;
-    const long n = s_nout;
-    for (long i = 0; i < n; i++)
-        if (!(s_outs[i].out == c->ea && s_outs[i].in == c->in) && s_outs[i].out >= c->ea && s_outs[i].out - c->ea < size) return 0;
+    if (perjob) {
+        /* the copy is the first run of its op (one call per strip); anything that writes into it after that
+         * run -- another op, or the same op again: without an upscaler the job copies the light buffer to the
+         * colour copy a second and third time after writing the light buffer itself (ping-pong) -- means the
+         * copy no longer holds the job's input at job end: not checkable. (Comparing that later copy with the
+         * entry-time image gave "colour DIFF" -> input DIFF -> GAVE UP.) */
+        const long n = s_npop < FAST_NPOP ? s_npop : FAST_NPOP;
+        long i = 0;
+        while (i < n && !(s_pops[i].out == c->ea && s_pops[i].in == c->in)) i++;
+        if (i == n) return 0;
+        while (i < n && s_pops[i].out == c->ea && s_pops[i].in == c->in) i++;
+        for (; i < n; i++)
+            if (s_pops[i].out >= c->ea && s_pops[i].out - c->ea < size) return 0;
+    } else {
+        const long n = s_nout;
+        for (long i = 0; i < n; i++)
+            if (!(s_outs[i].out == c->ea && s_outs[i].in == c->in) && s_outs[i].out >= c->ea && s_outs[i].out - c->ea < size) return 0;
+    }
     const uint8_t* m = hj_mem(c->ea, size);
     if (!m) return 0;
     for (uint32_t y = 0; y < g->h; y++)
@@ -1702,6 +1729,7 @@ static void fast_semfix_hook(uint32_t word, uint32_t val)
     if (!s_probe_serial || s_fast_state < 0 || t.QuadPart - s_probe_t > s_qf / 2) { s_probe_serial = 0; ReleaseSRWLockExclusive(&s_flock); return; }
     const uint32_t serial = s_probe_serial;
     s_probe_serial = 0;
+    s_pop_on = 0;   /* the probe job is done: its op list is complete */
     if (s_robust) {
         AcquireSRWLockExclusive(&s_swlock);
         if (s_sw_ea && s_sw_serial == serial) s_sw_labeled = 1;
@@ -1774,6 +1802,30 @@ static void fast_semfix_hook(uint32_t word, uint32_t val)
     const int verdict = checked ? r3dof_fast_probe_verdict(amatch, blur, npx, psnr, s_fast_minpsnr) : 0;
     const int good = checked && verdict == 1;
     const int inconc = !gok || zst == 0;   /* the job's depth copy could not be compared */
+    if (inconc && gok && s_zcopy.ea) {   /* R3_DOF_COPY_DIAG: why the learned depth copy was not checkable */
+        static volatile long s_zdiag;
+        if (InterlockedIncrement(&s_zdiag) <= 3) {
+            const uint32_t zsize = (g.h - 1u) * s_zcopy.pitch + g.w * 4u;
+            fprintf(stderr, "[dof-copy] probe serial 0x%X: depth copy 0x%08X (in 0x%08X, pitch %u, %u bytes) not checkable; readable %d; %ld kernel outputs:%c",
+                    serial, s_zcopy.ea, s_zcopy.in, s_zcopy.pitch, zsize, hj_mem(s_zcopy.ea, zsize) != NULL, (long)s_nout, 10);
+            for (long i = 0; i < s_nout && i < FAST_NOUT; i++)
+                fprintf(stderr, "[dof-copy]   out 0x%08X in 0x%08X%s%c", s_outs[i].out, s_outs[i].in,
+                        s_outs[i].out >= s_zcopy.ea && s_outs[i].out - s_zcopy.ea < zsize &&
+                        !(s_outs[i].out == s_zcopy.ea && s_outs[i].in == s_zcopy.in) ? "  <- overlaps the depth copy" : "", 10);
+        }
+    }
+    if ((inconc || cst == 2) && gok) {   /* R3_DOF_COPY_DIAG: this probe job's own ops, in call order */
+        static volatile long s_jdiag;
+        if (InterlockedIncrement(&s_jdiag) <= 4) {
+            const long n = s_npop < FAST_NPOP ? s_npop : FAST_NPOP;
+            fprintf(stderr, "[dof-copy] probe serial 0x%X: depth %s, colour %s (colour copy 0x%08X in 0x%08X, depth copy 0x%08X in 0x%08X); this job's %ld ops in order:%c",
+                    serial, fast_cmp_name(zst), fast_cmp_name(cst), s_ccopy.ea, s_ccopy.in, s_zcopy.ea, s_zcopy.in, s_npop, 10);
+            for (long i = 0; i < n; i++)
+                fprintf(stderr, "[dof-copy]   #%ld out 0x%08X in 0x%08X%s%s%c", i, s_pops[i].out, s_pops[i].in,
+                        s_pops[i].out == s_ccopy.ea && s_pops[i].in == s_ccopy.in ? "  <- colour copy" : "",
+                        s_pops[i].out == s_zcopy.ea && s_pops[i].in == s_zcopy.in ? "  <- depth copy" : "", 10);
+        }
+    }
     const int indiff = zst == 2 || cst == 2;
     /* a zoom-ramp / CoC-settling probe is not counted below: its label says so instead of FAIL */
     const int ramp_nc = !good && !inconc && !indiff && checked &&
@@ -1845,6 +1897,7 @@ static void fast_kernel_note(spu_context* ctx, uint32_t owner)
     const uint32_t p = dof_be32(ls + r3) & 0x3FFF0u;
     if (p > SPU_LS_SIZE - 0x60u) return;
     const fast_out o = { dof_be32(ls + p + 0x40), dof_be32(ls + p + 0x50) };
+    if (s_pop_on) { const long k = InterlockedIncrement(&s_npop) - 1; if (k < FAST_NPOP) s_pops[k] = o; }
     long n = s_nout, i = 0;
     for (; i < n; i++) if (s_outs[i].out == o.out && s_outs[i].in == o.in) break;
     if (i == n && n < FAST_NOUT) {
