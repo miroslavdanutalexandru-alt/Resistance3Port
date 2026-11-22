@@ -610,6 +610,12 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
     if (stack_addr == 0) {
         table_unlock();
+        static int s_stack_said;
+        if (s_stack_said++ < 4)
+            fprintf(stderr, "[SYS] sys_ppu_thread_create FAILED: out of guest stack space "
+                            "(asked 0x%X, used 0x%X of 0x%X; stacks are never freed) (CELL_ENOMEM)\n",
+                    (unsigned)stack_size, (unsigned)(g_vm_stack_alloc.next_addr - VM_STACK_BASE),
+                    (unsigned)VM_STACK_REGION);
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 

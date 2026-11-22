@@ -10,6 +10,9 @@ This is a **beta**. Only the intro and the opening Haven level have been played 
 
 ## 0.3.1-beta (unreleased)
 
+### Diagnostics
+- **Black screen at the end of Haven Outskirts (issue #27): more in `logs\run.log`.** When one of the runtime's fixed tables is full (event queues, event ports, event flags, semaphores, rwlocks, timers) or guest stack space runs out, the create call now logs a `[SYS] ... FAILED: ...` line (first 4 times each) instead of failing silently. A game that ignores such a failure can wait forever, which is how the R1 movie black screen fixed in 0.3.0 happened. This changes logging only, not behaviour. If the freeze happens, wait 2 minutes so the hang watchdog writes `logs\crash\R3_*_hang.txt`, then send the launcher's *Report a problem* zip.
+
 ### Project
 - **CI and release tooling**, contributed by @undecuple: a release build workflow that builds Setup, the zips and checksums with `scripts\package_beta.ps1` on a Windows runner and only ever creates a *draft* release from a version tag (PR #2); a check that no game files and no unexpected large files are committed, using the same patterns as `package_beta.ps1` (PR #19); a gitleaks secrets scan (PR #20); Dependabot updates for the pinned GitHub Actions (PR #21); and `ps3recomp/UPSTREAM_BASE`, which records the upstream ps3recomp commit range the original import came from (PR #22).
 

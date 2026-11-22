@@ -5,6 +5,7 @@
 #include "sys_rwlock.h"
 #include "../memory/vm.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -52,8 +53,12 @@ int64_t sys_rwlock_create(ppu_context* ctx)
     for (int i = 0; i < SYS_RWLOCK_MAX; i++) {
         if (!g_sys_rwlocks[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        static int s_full_said;
+        if (s_full_said++ < 4)
+            fprintf(stderr, "[SYS] sys_rwlock_create FAILED: all %d rwlocks in use (CELL_EAGAIN)\n", SYS_RWLOCK_MAX);
         return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 
     sys_rwlock_info* r = &g_sys_rwlocks[slot];
     memset(r, 0, sizeof(*r));

@@ -246,6 +246,10 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     }
     if (slot < 0) {
         sem_table_unlock();
+        static int s_full_said;
+        if (s_full_said++ < 4)
+            fprintf(stderr, "[SYS] sys_semaphore_create FAILED: all %d semaphores in use (CELL_EAGAIN)\n",
+                    SYS_SEMAPHORE_MAX);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 

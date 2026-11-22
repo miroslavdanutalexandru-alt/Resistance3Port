@@ -161,6 +161,10 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     }
     if (slot < 0) {
         evt_table_unlock();
+        static int s_full_said;
+        if (s_full_said++ < 4)
+            fprintf(stderr, "[SYS] sys_event_queue_create FAILED: all %d event queues in use (CELL_EAGAIN)\n",
+                    SYS_EVENT_QUEUE_MAX);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
@@ -828,6 +832,10 @@ int64_t sys_event_port_create(ppu_context* ctx)
     }
     if (slot < 0) {
         evt_table_unlock();
+        static int s_full_said;
+        if (s_full_said++ < 4)
+            fprintf(stderr, "[SYS] sys_event_port_create FAILED: all %d event ports in use (CELL_EAGAIN)\n",
+                    SYS_EVENT_PORT_MAX);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 
@@ -1087,6 +1095,10 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     }
     if (slot < 0) {
         evt_table_unlock();
+        static int s_full_said;
+        if (s_full_said++ < 4)
+            fprintf(stderr, "[SYS] sys_event_flag_create FAILED: all %d event flags in use (CELL_EAGAIN)\n",
+                    SYS_EVENT_FLAG_MAX);
         return (int64_t)(int32_t)CELL_EAGAIN;
     }
 

@@ -1045,8 +1045,12 @@ int64_t sys_timer_create(ppu_context* ctx)
     for (int i = 0; i < SYS_TIMER_MAX; i++) {
         if (!g_sys_timers[i].active) { slot = i; break; }
     }
-    if (slot < 0)
+    if (slot < 0) {
+        static int s_full_said;
+        if (s_full_said++ < 4)
+            fprintf(stderr, "[SYS] sys_timer_create FAILED: all %d timers in use (CELL_EAGAIN)\n", SYS_TIMER_MAX);
         return (int64_t)(int32_t)CELL_EAGAIN;
+    }
 
     sys_timer_info* t = &g_sys_timers[slot];
     memset(t, 0, sizeof(*t));
