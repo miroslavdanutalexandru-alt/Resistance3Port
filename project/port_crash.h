@@ -1092,6 +1092,18 @@ static DWORD WINAPI watchdog(LPVOID)
             snprintf(d, sizeof d, "no game-loop progress for %d s (counter stuck at %llu)", s_hang_s, (unsigned long long)m);
             hang(d);
         }
+        /* logs\hang.now: a hang report on request while the game still runs
+         * (a stalled script / objective is not a hang). PORT_CRASH_EXTRA=0: off. */
+        if (!s_noextra) {
+            char hn[MAX_PATH]; snprintf(hn, sizeof hn, "%s\\logs\\hang.now", s_root);
+            if (GetFileAttributesA(hn) != INVALID_FILE_ATTRIBUTES) {
+                DeleteFileA(hn);
+                char d[200];
+                snprintf(d, sizeof d, "requested via logs\\hang.now (game loop at %llu, %s)",
+                         (unsigned long long)m, paused ? "paused" : "running");
+                hang(d);
+            }
+        }
         if (s_hang_mode != 2 || !s_cfg.rsx_progress) continue;
         const uint64_t r = s_cfg.rsx_progress();
         if (r != lr || !r || paused || !started) { lr = r; tr = now; mr = m; rep_r = 0; }

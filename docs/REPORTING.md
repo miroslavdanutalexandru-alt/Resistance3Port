@@ -15,6 +15,8 @@ Thanks for testing! A good report has two parts: **what happened** (in your word
 
 **After a crash or freeze:** the game saves crash information by itself. The next time you start the launcher, it asks *"The game crashed last time. Create a report?"*. Click **Create report** to get the same zip. **Not now** asks again at the next start, for up to a week.
 
+**Stuck, but the game has not frozen** (black screen or a scene that never ends, while music or sound may still play): the automatic freeze report only comes when the game stops completely for 90 s. To record what the game is waiting for, create an empty file named `hang.now` in the game's `logs` folder while it is stuck. In a Command Prompt in the game folder, run `type nul > logs\hang.now`. Within a second the game writes `logs\crash\R3_<time>_hang.txt`, deletes `hang.now` and keeps running. Then close the game and create the report zip.
+
 If the launcher will not start, zip the `logs` folder of the game by hand (right-click, *Send to*, *Compressed (zipped) folder*) and attach that instead.
 
 ## What's in the zip
