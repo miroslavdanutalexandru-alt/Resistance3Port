@@ -556,7 +556,7 @@ static volatile long s_fast_state;   /* 0 learning, 1 armed, -1 off */
 static SRWLOCK s_flock = SRWLOCK_INIT, s_fwork = SRWLOCK_INIT;
 static uint8_t *s_pc, *s_pz, *s_ps, *s_po, *s_wc, *s_wz, *s_wo, *s_preg;
 static float *s_pscr, *s_wscr;
-typedef struct { uint32_t serial, ea, mode; uint8_t start[128]; int ended; } fast_rec;
+typedef struct { uint32_t serial, ea, mode; uint8_t start[128]; int ended; int dof_off; } fast_rec;   /* dof_off: zero DOF params at entry */
 #define FAST_NREC 8
 static fast_rec s_frec[FAST_NREC];
 static unsigned s_frec_next;
@@ -1637,7 +1637,8 @@ static int s_fuse = 1;
 static volatile uint32_t s_fuse_serial;      /* PS3-path job whose output is checked before its label-77 store */
 static volatile uint32_t s_fuse_bad_serial;  /* neutralised: its probe is not counted */
 static volatile long s_fuse_checks, s_fuse_n;
-static const char* const s_fuse_why[4] = { "ok", "input FP16 lighting texels (purple comb)", "input black", "CoC saturated on every pixel" };
+static const char* const s_fuse_why[5] = { "ok", "input FP16 lighting texels (purple comb)", "input black", "CoC saturated on every pixel",
+                                            "DOF parameters zero (blur off: the SPU's CoC is 0, IEEE floats here give inf/NaN)" };
 
 static void fuse_log(uint32_t serial, const char* path, int why, int dark, int sat)
 {
@@ -1659,6 +1660,8 @@ static void fuse_ps3_check(uint32_t serial)
     AcquireSRWLockExclusive(&s_flock);
     r3dof_fast_geom g = s_geo;
     const int probe = s_probe_serial == serial && s_preg_ok;
+    int dof_off = 0;
+    for (int i = 0; i < FAST_NREC; i++) if (s_frec[i].serial == serial) { dof_off = s_frec[i].dof_off; break; }
     ReleaseSRWLockExclusive(&s_flock);
     if (!g.w || !r3dof_fast_geom_ok(&g)) return;
     const uint8_t* rd = (vm_sudo_base ? vm_sudo_base : vm_base) + R3DOF_FAST_EA;
@@ -1673,7 +1676,10 @@ static void fuse_ps3_check(uint32_t serial)
     }
     r3dof_fast_detile(&g, rd, 0, s_wo);
     const int sat = r3dof_fast_coc_sat_permille(s_wo, npx, 7);
-    const int why = r3dof_fast_bad_frame(probe, dark, fp16, sat);
+    /* Zero parameters: on the SPU the CoC is sat(x*0 + 0) * 0 = 0 everywhere (no inf/NaN in SPU floats), so the
+     * PS3 shows the sharp scene; the recompiled job's IEEE maths turns the zero depth terms into inf/NaN and a
+     * partly garbled output that the saturation test lets through (purple hip-fire frames). Neutral = the PS3's output. */
+    const int why = dof_off ? 4 : r3dof_fast_bad_frame(probe, dark, fp16, sat);
     if (why) {
         memset(s_wo, 0, (size_t)npx * 4u);
         r3dof_fast_encode(&g, vm_base + R3DOF_FAST_EA, s_wo);
@@ -1733,6 +1739,20 @@ static void fast_semfix_hook(uint32_t word, uint32_t val)
     const int pchg = s_probe_pblk_ok && pbn && memcmp(pbn, s_probe_pblk, 0xC0u) != 0;
     r3dof_fast_params par;
     const int pok = s_probe_pblk_ok && r3dof_fast_params_from_block(s_probe_pblk, &par);
+    /* DOF off on this frame (hip fire): the parameter block is zero (zn, zf, near/far max), the job only
+     * copies the colour (no kernel 618 depth copy) and there is no blur to compare. Counting it as
+     * "inconclusive" gave the fast path up after 6 hip-fire probes for the whole session, before the first
+     * real ADS frame; that put every later job 419 on the PS3 path. Not counted: probe again next frame. */
+    if (s_probe_pblk_ok && !dof_be32(s_probe_pblk + 0x10) && !dof_be32(s_probe_pblk + 0x14) &&
+        !dof_be32(s_probe_pblk + 0x58) && !dof_be32(s_probe_pblk + 0x78)) {
+        static volatile long s_offn;
+        if (InterlockedIncrement(&s_offn) <= 8)
+            fprintf(stderr, "[dof-fast] probe serial=0x%X frame=%ld: DOF parameters are zero (blur off, e.g. hip fire) -> not counted, probing again%c",
+                    serial, (long)g_port_frame_no, 10);
+        if (s_fast_state == 1) s_since_check = s_fast_recheck;
+        ReleaseSRWLockExclusive(&s_flock);
+        return;
+    }
     const int inok = zst == 1 && cst != 2;
     long amatch = 0, blur = 0, dasum = 0;
     double se = 0;
@@ -2126,6 +2146,10 @@ static int fast_entry(spu_context* ctx)
         r = &s_frec[s_frec_next++ % FAST_NREC];
         r->serial = serial; r->ea = ea; r->ended = 0; r->mode = 1;
         memcpy(r->start, vm_base + ea, 128);
+        {   /* zero zn / zf / near max / far max: the blur is off this frame (hip fire), see fuse_ps3_check */
+            const uint8_t* pb0 = hj_mem(ea + 0x90u, 0xC0u);
+            r->dof_off = pb0 && !dof_be32(pb0 + 0x10) && !dof_be32(pb0 + 0x14) && !dof_be32(pb0 + 0x58) && !dof_be32(pb0 + 0x78);
+        }
         LARGE_INTEGER t; QueryPerformanceCounter(&t);
         if (s_probe_serial && t.QuadPart - s_probe_t > s_qf / 2) s_probe_serial = 0;   /* job never stored the label */
         if (!s_ads_t0) { s_ads_t0 = t.QuadPart; s_ads_f0 = (long)g_port_frame_no; }
