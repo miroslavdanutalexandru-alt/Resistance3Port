@@ -279,7 +279,8 @@ function Test-NativeCmake { $c = Get-Command cmake -CommandType Application -Err
 function Test-CmakeOk { if (-not (Have 'cmake')) { return $false }; return ((Test-NativeCmake) -or (Test-Path -LiteralPath "$env:ProgramFiles\CMake\bin\cmake.exe")) }
 # the build tools still missing (buildtools.ps1 keys); the portable ones in tools_cache\ count (Refresh-Path adds them)
 # LLVM 22+ ($BtMinClang, buildtools.ps1): an older clang-cl cannot read the committed PGO profile and counts as missing
-function Test-ClangOk { return ((Have 'clang-cl') -and (Get-BtClangMajor) -ge $script:BtMinClang) }
+# (Get-BtClangMajor checks the clang-cl the build uses: tools_cache\llvm, then Program Files\LLVM, then PATH)
+function Test-ClangOk { return ((Get-BtClangMajor) -ge $script:BtMinClang) }
 function Get-MissingToolKeys {
     $k = @()
     if (-not (Find-Python)) { $k += 'python' }
@@ -597,7 +598,7 @@ elseif (-not (Test-CmakeOk)) {
 }
 if (-not (Have 'ninja')) { Winget-Install 'Ninja-build.Ninja' 'Ninja' }
 if (-not (Test-ClangOk)) { Winget-Install 'LLVM.LLVM' "LLVM (clang) $script:BtMinClang or newer" }
-if ((Have 'clang-cl') -and -not (Test-ClangOk)) { Fail "The LLVM (clang-cl) on this PC is version $(Get-BtClangMajor); the port needs LLVM $script:BtMinClang or newer (the included PGO profile uses LLVM's profile format 13). Update it (winget upgrade LLVM.LLVM, or https://github.com/llvm/llvm-project/releases) and run Setup.bat again, or answer P for the portable tools." }
+if ((Find-BtClangCl) -and -not (Test-ClangOk)) { Fail "The LLVM (clang-cl) on this PC ($(Find-BtClangCl)) is version $(Get-BtClangMajor); the port needs LLVM $script:BtMinClang or newer (the included PGO profile uses LLVM's profile format 13). Update it (winget upgrade LLVM.LLVM, or https://github.com/llvm/llvm-project/releases) and run Setup.bat again, or answer P for the portable tools." }
 if (-not (Have 'git')) { Winget-Install 'Git.Git' 'Git' }
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = $null
