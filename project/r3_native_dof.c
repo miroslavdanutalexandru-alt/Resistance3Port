@@ -2103,7 +2103,12 @@ static int fast_entry(spu_context* ctx)
     extern uint8_t* vm_base;
     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
     if (pc == FAST_LINK) { t_in_job = 0; return 0; }   /* the job (or a skipped lane) returns */
-    if (s_fast_state < 0) return 0;
+    /* No early return once the fast path gave up (s_fast_state < 0): every later job 419 runs on the PS3
+     * path, and that path still needs guard_begin (R3_DOF_GUEST_GUARD waits for its label-77 store) and
+     * s_fuse_serial (R3_DOF_FIRST_USE_GUARD). Returning here skipped both for the rest of the session, so
+     * each hip-fire / ADS frame composited the light buffer before the job wrote it (black frame) or with
+     * FP16 lighting read as ARGB8 (purple ground, black sky, no weapon). The fast-path steps below only run
+     * at state 0 / 1, and fast_sync_finish / fast_learn_end / fast_try_arm do nothing once it is off. */
     uint32_t owner, off;
     dof_owner(ctx, pc, &owner, &off);
     if (owner != DOF_JOB_IMG) return 0;
