@@ -1561,10 +1561,38 @@ static void r3ml_load(void)
 }
 static void r3ml_check(int fed, float rate, int* sign, int* bad, const char* what)
 {
-    if (!(fed >= 16 || fed <= -16) || !(rate > 1e-5f || rate < -1e-5f)) return;
+    /* Same fix as r2ml_check: the game's rate can lag the fed stick by a frame or two (much more during an SPU
+     * stall in combat), so a fast reversal or a mouse flick looked like the other direction, and 4 (15 once saved)
+     * such frames flipped the learned sign until it flipped back ("pitch direction now 1" in the middle of a
+     * fight: the look briefly inverted). Only a clear deflection held in one direction for >= 250 ms counts, and it
+     * takes 8 (15 once saved) such frames in a row. R3_ML_LEARN=0: never re-learn (mouselook_r3.cfg / defaults);
+     * R3_ML_LEARN=legacy: the old rule. */
+    static int learn = -1;
+    if (learn < 0) {
+        const char* e = getenv("R3_ML_LEARN");
+        learn = (e && *e == '0') ? 0 : (e && (*e == 'l' || *e == 'L')) ? 2 : 1;
+    }
+    if (!learn) return;
+    if (learn == 2) {
+        if (!(fed >= 16 || fed <= -16) || !(rate > 1e-5f || rate < -1e-5f)) return;
+        const int s = ((fed > 0) == (rate > 0)) ? 1 : -1;
+        if (s == *sign) { *bad = 0; return; }
+        if (++*bad >= (s_r3ml_saved ? 15 : 4)) {
+            *sign = s; *bad = 0; r3ml_save();
+            fprintf(stderr, "[mouselook] %s direction now %d (following the game's setting)%c", what, s, 10);
+        }
+        return;
+    }
+    static int last_s[2]; static ULONGLONG since[2];
+    const int ax = bad == &s_r3ml_bad_y;
+    const ULONGLONG now = GetTickCount64();
+    const int fs = fed >= 16 ? 1 : fed <= -16 ? -1 : 0;
+    if (fs != last_s[ax]) { last_s[ax] = fs; since[ax] = now; }
+    if (!(fed >= 40 || fed <= -40) || !(rate > 1e-5f || rate < -1e-5f)) return;
+    if (now - since[ax] < 250) return;
     const int s = ((fed > 0) == (rate > 0)) ? 1 : -1;
     if (s == *sign) { *bad = 0; return; }
-    if (++*bad >= (s_r3ml_saved ? 15 : 4)) {
+    if (++*bad >= (s_r3ml_saved ? 15 : 8)) {
         *sign = s; *bad = 0; r3ml_save();
         fprintf(stderr, "[mouselook] %s direction now %d (following the game's setting)%c", what, s, 10);
     }
