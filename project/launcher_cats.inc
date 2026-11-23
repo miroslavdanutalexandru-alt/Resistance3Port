@@ -8,7 +8,7 @@
 struct CatGroup { int page; const char* head; const char* keys; };
 static const CatGroup g_cat[] = {
     { P_DISPLAY,  "SCREEN",                        "display window monitor winremember resizable altenter aspect hudfix" },
-    { P_DISPLAY,  "FRAME RATE",                    "fps vsync menufps present refreshswitch" },
+    { P_DISPLAY,  "FRAME RATE",                    "fps vsync menufps present dsync refreshswitch" },
     { P_DISPLAY,  "HDR",                           "hdr hdr_paper hdr_peak hdr_sat" },
     { P_GRAPHICS, "RESOLUTION",                    "res filter" },
     { P_GRAPHICS, "QUALITY",                       "aniso shadowscale fxfullres ssao fullres lodscale noloadshed" },

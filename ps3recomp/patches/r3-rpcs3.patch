@@ -14783,7 +14783,7 @@ index c9bed75..be01c7f 100644
  }
  
 diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
-index 4afff84..ce5deb8 100644
+index 4afff84..f4f28f9 100644
 --- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
 @@ -1,10 +1,12 @@
@@ -14799,7 +14799,7 @@ index 4afff84..ce5deb8 100644
  #include "Emu/Cell/Modules/cellVideoOut.h"
  
  #include "upscalers/bilinear_pass.hpp"
-@@ -12,7 +14,11 @@
+@@ -12,10 +14,112 @@
  #include "upscalers/nearest_pass.hpp"
  #include "util/asm.hpp"
  #include "util/video_provider.h"
@@ -14811,7 +14811,108 @@ index 4afff84..ce5deb8 100644
  #include "Emu/RSX/NV47/HW/context_accessors.define.h"
  
  extern atomic_t<bool> g_user_asked_for_screenshot;
-@@ -55,6 +61,7 @@ bool VKGSRender::reinitialize_swapchain()
++
++// R2PORT: <GAME>_DISPLAY_SYNC=auto|vrr|fixed|off (project/port_display_sync.h, shared with the other ports): a
++// background thread measures whether VRR (G-Sync / FreeSync) follows the presents and logs
++// "[display] VRR effective: yes/no". On a fixed refresh (auto: VRR measured not working; fixed: always) the
++// present mode becomes FIFO and the frame limit refresh / k (/ the frame-generation multiplier), phase-locked
++// to the vblanks when k >= 2, so every frame stays on screen for k refreshes. vrr = the old behaviour (still
++// measured and logged); off = no measurement. Restored when VRR is seen working again.
++#include "../../../../../../../project/port_display_sync.h"
++extern "C" double r2_fps_target(void);           // project/stubs.cpp: the frame-rate setting (30 = the game's own)
++extern "C" void r2_fps_pacing_set(double fps);   // project/stubs.cpp: frame limit override, 0 = the setting
++extern "C" double r2pds_fps_target_default(void) { return 60.0; }
++extern "C" void r2pds_fps_pacing_set_default(double) {}
++#pragma comment(linker, "/alternatename:r2_fps_target=r2pds_fps_target_default")
++#pragma comment(linker, "/alternatename:r2_fps_pacing_set=r2pds_fps_pacing_set_default")
++extern "C" volatile int g_r2fg_active; // VKR2FrameGen.cpp: frames shown per present (0 = frame generation off)
++#ifndef PORT_DISPLAY_SYNC_ENV
++#define PORT_DISPLAY_SYNC_ENV "R3_DISPLAY_SYNC"
++#endif
++
++namespace
++{
++	HWND s_pds_hwnd = nullptr;
++	volatile int s_pds_pll = 0; // limiter follows the vblank phase lock (k >= 2: FIFO alone does not hold k refreshes)
++	HWND pds_game_hwnd() { return s_pds_hwnd; }
++	int pds_out_mult() { const int m = g_r2fg_active; return m > 1 ? m : 1; }
++
++	// Once a flip, before the swapchain checks: start the measurement, switch the pacing on / off.
++	void pds_frame(HWND hwnd)
++	{
++		static bool started = false;
++		static vsync_mode orig = vsync_mode::off;
++		static int cur = 0, cmult = 0, nlog = 0;
++		static LONG cgen = -1;
++		static pds_plan cp{};
++		if (hwnd) s_pds_hwnd = hwnd;
++		if (!started)
++		{
++			started = true;
++			orig = g_cfg.video.vsync;
++			pds_start(PORT_DISPLAY_SYNC_ENV, pds_game_hwnd);
++		}
++		if (!pds_fixed())
++		{
++			if (cur)
++			{
++				cur = 0;
++				s_pds_pll = 0;
++				r2_fps_pacing_set(0.0);
++				if (g_cfg.video.vsync != orig) g_cfg.video.vsync.set(orig);
++				std::fprintf(stderr, "[display] fixed-refresh pacing off: frame limit and present mode back to the settings%c", 10);
++			}
++			return;
++		}
++		const int mult = pds_out_mult();
++		const double hz = pds_hz();
++		if (!(hz > 1.0)) return;
++		if (!cur || mult != cmult || pds_gen() != cgen)
++		{
++			pds_plan p;
++			pds_make_plan(hz, mult, pds_max_real(r2_fps_target()), 30.0, &p);
++			cgen = pds_gen();
++			cmult = mult;
++			if (!cur || !pds_plan_same(&p, &cp))
++			{
++				// Vulkan has no sync interval: FIFO shows each frame at least one refresh, the limiter holds it k
++				// (exactly refresh / k, phase-locked); at k = 1 a hair faster so FIFO sets the pace
++				r2_fps_pacing_set(p.k >= 2 ? p.real : p.limiter);
++				if (nlog < 16)
++				{
++					char b[192];
++					pds_plan_str(&p, b, sizeof b);
++					nlog++;
++					std::fprintf(stderr, "[display] fixed-refresh pacing: %s -- Vulkan FIFO%s%c", b, p.k >= 2 ? ", frame limit phase-locked to the refresh" : "", 10);
++				}
++			}
++			cp = p;
++			cur = 1;
++			s_pds_pll = p.k >= 2;
++		}
++		if (g_cfg.video.vsync != vsync_mode::full) g_cfg.video.vsync.set(vsync_mode::full);
++	}
++}
++
++// project/stubs.cpp r2_frame_period, once a game frame: move the next deadline by this (ms)
++extern "C" double r2_pacing_correction_ms(void)
++{
++	const double c = pds_pace_correction_ms();
++	return s_pds_pll ? c : 0.0;
++}
++// VKR2FrameGen.cpp: the Reflex cap under the refresh rate is for VRR; fixed-refresh pacing sets the rate itself
++extern "C" int port_pds_fixed(void) { return pds_fixed(); }
++// vkutils/swapchain.cpp swapchain_WSI::present: every present (frames it shows, phase of the real frame)
++extern "C" void port_pds_note_present(void)
++{
++	pds_note_presents(pds_out_mult());
++	if (s_pds_pll) pds_note_phase();
++}
++
+ extern atomic_t<recording_mode> g_recording_mode;
+ 
+ namespace
+@@ -55,6 +159,7 @@ bool VKGSRender::reinitialize_swapchain()
  	close_and_submit_command_buffer();
  	m_current_command_buffer->reset();
  	m_current_command_buffer->begin();
@@ -14819,7 +14920,7 @@ index 4afff84..ce5deb8 100644
  
  	for (auto &ctx : m_frame_context_storage)
  	{
-@@ -142,6 +149,7 @@ bool VKGSRender::reinitialize_swapchain()
+@@ -142,6 +247,7 @@ bool VKGSRender::reinitialize_swapchain()
  
  	m_current_command_buffer->reset();
  	m_current_command_buffer->begin();
@@ -14827,7 +14928,7 @@ index 4afff84..ce5deb8 100644
  
  	swapchain_unavailable = false;
  	should_reinitialize_swapchain = false;
-@@ -158,7 +166,10 @@ void VKGSRender::present(vk::frame_context_t *ctx)
+@@ -158,7 +264,10 @@ void VKGSRender::present(vk::frame_context_t *ctx)
  
  	if (!swapchain_unavailable)
  	{
@@ -14839,7 +14940,7 @@ index 4afff84..ce5deb8 100644
  		{
  		case VK_SUCCESS:
  			break;
-@@ -185,6 +196,7 @@ void VKGSRender::present(vk::frame_context_t *ctx)
+@@ -185,6 +294,7 @@ void VKGSRender::present(vk::frame_context_t *ctx)
  
  void VKGSRender::advance_queued_frames()
  {
@@ -14847,7 +14948,7 @@ index 4afff84..ce5deb8 100644
  	// Check all other frames for completion and clear resources
  	check_present_status();
  
-@@ -209,6 +221,8 @@ void VKGSRender::advance_queued_frames()
+@@ -209,6 +319,8 @@ void VKGSRender::advance_queued_frames()
  		resources->vertex_cache->purge();
  	}
  	m_current_frame->tag_frame_end();
@@ -14856,7 +14957,7 @@ index 4afff84..ce5deb8 100644
  
  	m_queued_frames.push_back(m_current_frame);
  	ensure(m_queued_frames.size() <= m_max_async_frames);
-@@ -245,6 +259,8 @@ void VKGSRender::queue_swap_request()
+@@ -245,6 +357,8 @@ void VKGSRender::queue_swap_request()
  	m_current_command_buffer = m_primary_cb_list.next();
  	m_current_command_buffer->reset();
  	m_current_command_buffer->begin();
@@ -14865,7 +14966,7 @@ index 4afff84..ce5deb8 100644
  
  	// Set up new pointers for the next frame
  	advance_queued_frames();
-@@ -255,11 +271,13 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
+@@ -255,11 +369,13 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
  	ensure(ctx->swap_command_buffer);
  
  	// Perform hard swap here
@@ -14879,7 +14980,7 @@ index 4afff84..ce5deb8 100644
  
  	// Resource cleanup.
  	{
-@@ -398,6 +416,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+@@ -398,6 +514,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  			flush_command_queue();
  		}
  
@@ -14887,7 +14988,7 @@ index 4afff84..ce5deb8 100644
  		res()->texture_cache.invalidate_range(*m_current_command_buffer, range, rsx::invalidation_cause::read);
  		image_to_flip = res()->texture_cache.upload_image_simple(*m_current_command_buffer, expected_format, info->address, info->width, info->height, info->pitch);
  	}
-@@ -434,12 +453,26 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+@@ -434,12 +551,26 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  
  bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  {
@@ -14914,7 +15015,16 @@ index 4afff84..ce5deb8 100644
  	if (!info.emu_flip)
  	{
  		// Native UI flips are requested from the local task. Submit outstanding work first.
-@@ -484,9 +517,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -456,6 +587,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+ 		}
+ 	}
+ 
++	pds_frame(m_frame->handle()); // R2PORT: display sync (may switch g_cfg.video.vsync to full)
++
+ 	if (m_vsync_mode != g_cfg.video.vsync)
+ 	{
+ 		swapchain_unavailable = true;
+@@ -484,9 +617,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		}
  	}
  
@@ -14932,7 +15042,7 @@ index 4afff84..ce5deb8 100644
  
  	if (m_current_frame == &m_aux_frame_context)
  	{
-@@ -605,14 +644,17 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -605,14 +744,17 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  
  	if (info.emu_flip)
  	{
@@ -14950,7 +15060,7 @@ index 4afff84..ce5deb8 100644
  	while (VkResult status = m_swapchain->acquire_next_swapchain_image(m_current_frame->acquire_signal_semaphore, timeout, &m_current_frame->present_image))
  	{
  		switch (status)
-@@ -655,6 +697,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -655,6 +797,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  
  	// Confirm that the driver did not silently fail
  	ensure(m_current_frame->present_image != umax);
@@ -14958,7 +15068,7 @@ index 4afff84..ce5deb8 100644
  
  	// Calculate output dimensions. Done after swapchain acquisition in case it was recreated.
  	areai aspect_ratio;
-@@ -847,9 +890,14 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -847,9 +990,14 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  	{
  		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
  
@@ -14975,7 +15085,7 @@ index 4afff84..ce5deb8 100644
  			if (image_to_flip2) calibration_src.push_back(image_to_flip2);
  
  			if (m_output_scaling == output_scaling_mode::fsr && !avconfig.stereo_enabled) // 3D will be implemented later
-@@ -890,11 +938,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -890,11 +1038,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		else
  		{
  			// Do raw transfer here as there is no image object associated with textures owned by the driver (TODO)
@@ -14992,7 +15102,7 @@ index 4afff84..ce5deb8 100644
  			rgn.dstOffsets[0] = { aspect_ratio.x1, aspect_ratio.y1, 0 };
  			rgn.dstOffsets[1] = { aspect_ratio.x2, aspect_ratio.y2, 1 };
  
-@@ -904,10 +956,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -904,10 +1056,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  				target_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
  			}
  
@@ -15006,7 +15116,7 @@ index 4afff84..ce5deb8 100644
  	if (g_cfg.video.debug_overlay || has_overlay)
  	{
  		if (target_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-@@ -997,6 +1051,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -997,6 +1151,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		direct_fbo->release();
  	}
  
@@ -18520,10 +18630,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..1257900
+index 0000000..9d4aa00
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2641 @@
+@@ -0,0 +1,2650 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -18573,6 +18683,7 @@ index 0000000..1257900
 +extern "C"
 +{
 +	volatile int g_r2fg_active = 0;
++	int port_pds_fixed(void); // VKPresent.cpp: display sync's fixed-refresh pacing is on
 +
 +	// game side (project/stubs.cpp, r?_pcport.cpp); builds without them link the defaults below
 +	extern volatile unsigned long long g_r2_look_ms;
@@ -20374,8 +20485,16 @@ index 0000000..1257900
 +		// Streamline applies frameLimitUs to presented frames, so it already scales the rendered rate by 1/N.
 +		// The game's own cap still applies on top.
 +		u32 limit = 0;
-+		if (fgcfg().cap)
++		// R2PORT: not with display sync's fixed-refresh pacing (VKPresent.cpp): it sets the rate to refresh / k itself
++		// and a cap at 95% of the refresh would break k = 1 (72 -> 144 at 144 Hz)
++		const bool pds_fixed_now = port_pds_fixed() != 0;
++		if (fgcfg().cap && !pds_fixed_now)
 +			limit = pfg_reflex_limit_us(1, f.refresh_hz, on, f.sc_immediate);
++		if (pds_fixed_now && on && f.sc_immediate)
++		{
++			static bool said = false;
++			if (!said) { said = true; fglog("fixed-refresh pacing: DLSS-G can't present with vsync on this system -- generated frames may tear / judder"); }
++		}
 +		if (on && fgcfg().limit_fps > 0)
 +			limit = std::max(limit, static_cast<u32>(1000000 / fgcfg().limit_fps));
 +		if (limit == f.reflex_limit) return;
@@ -50314,18 +50433,22 @@ index e59c249..dacc6e1 100644
  		return new swapchain_WSI(dev, present_queue_idx, graphics_queue_idx, transfer_queue_idx, format, m_surface, color_space, !surface_config.supports_automatic_wm_reports);
  	}
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
-index 2fd2dc0..b0cf53b 100644
+index 2fd2dc0..0def34b 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
 +++ b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
-@@ -1,5 +1,7 @@
+@@ -1,7 +1,11 @@
  #include "stdafx.h"
  #include "swapchain.h"
 +#include "../VKR2PcExtras.h" // R2PORT PC extras
 +#include "../VKR2FrameGen.h" // R2PORT frame generation
  #include "Emu/system_config.h"
  
++extern "C" void port_pds_note_present(void); // R2PORT: display sync (VKPresent.cpp, project/port_display_sync.h)
++
  namespace vk
-@@ -111,6 +113,7 @@ namespace vk
+ {
+ 	// Swapchain image RPCS3
+@@ -111,6 +115,7 @@ namespace vk
  		_vkGetSwapchainImagesKHR = reinterpret_cast<PFN_vkGetSwapchainImagesKHR>(vkGetDeviceProcAddr(dev, "vkGetSwapchainImagesKHR"));
  		_vkAcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(vkGetDeviceProcAddr(dev, "vkAcquireNextImageKHR"));
  		_vkQueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(vkGetDeviceProcAddr(dev, "vkQueuePresentKHR"));
@@ -50333,7 +50456,7 @@ index 2fd2dc0..b0cf53b 100644
  
  		m_surface = surface;
  		m_color_space = color_space;
-@@ -140,6 +143,7 @@ namespace vk
+@@ -140,6 +145,7 @@ namespace vk
  		{
  			if (m_vk_swapchain)
  			{
@@ -50341,7 +50464,7 @@ index 2fd2dc0..b0cf53b 100644
  				_vkDestroySwapchainKHR(pdev, m_vk_swapchain, nullptr);
  			}
  
-@@ -241,8 +245,15 @@ namespace vk
+@@ -241,8 +247,15 @@ namespace vk
  			preferred_modes = { VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_FIFO_RELAXED_KHR };
  			break;
  		case vsync_mode::adaptive:
@@ -50358,7 +50481,7 @@ index 2fd2dc0..b0cf53b 100644
  		case vsync_mode::full:
  		default:
  			// FIFO is guaranteed to be supported, no need to go through a preference chain
-@@ -269,6 +280,17 @@ namespace vk
+@@ -269,6 +282,17 @@ namespace vk
  		}
  
  		rsx_log.notice("Swapchain: present mode %d in use.", static_cast<int>(swapchain_present_mode));
@@ -50376,7 +50499,7 @@ index 2fd2dc0..b0cf53b 100644
  
  		u32 nb_swap_images = surface_descriptors.minImageCount + 1;
  		if (surface_descriptors.maxImageCount > 0)
-@@ -324,7 +346,9 @@ namespace vk
+@@ -324,7 +348,9 @@ namespace vk
  		rsx_log.notice("Swapchain: requesting full screen exclusive mode %d.", static_cast<int>(full_screen_exclusive_info.fullScreenExclusive));
  #endif
  
@@ -50386,6 +50509,16 @@ index 2fd2dc0..b0cf53b 100644
  
  		if (old_swapchain)
  		{
+@@ -355,6 +381,8 @@ namespace vk
+ 			present.pWaitSemaphores = &semaphore;
+ 		}
+ 
+-		return _vkQueuePresentKHR(dev.get_present_queue(), &present);
++		const VkResult r = _vkQueuePresentKHR(dev.get_present_queue(), &present);
++		port_pds_note_present(); // R2PORT: display sync (VKPresent.cpp)
++		return r;
+ 	}
+ }
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain_core.h b/rpcs3/Emu/RSX/VK/vkutils/swapchain_core.h
 index aaf8426..b77e73d 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/swapchain_core.h

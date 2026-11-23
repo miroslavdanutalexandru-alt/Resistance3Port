@@ -383,6 +383,14 @@ static void register_pc_options()
                "Compatible renderer only.",
                "R2_PRESENT", { {"Default  (follow VSync)", ""}, {"Immediate  (VRR / tearing)", "immediate"},
                                {"Mailbox  (no tearing, no VRR)", "mailbox"}, {"FIFO  (VSync)", "fifo"} }, 0, {}, "rpcs3");
+    add_option(SEC_PC, "dsync", "Display sync",
+               "Auto measures whether G-Sync / FreeSync really follows the game's frames (logs\\run.log: "
+               "[display] VRR effective: yes / no). When it does not (VRR off, a laptop panel driven through the "
+               "integrated GPU, G-Sync set to full screen only...), the game switches to VSync and a frame rate that "
+               "divides the refresh rate (165 Hz: 55 fps, or 41.25 -> 82.5 with Frame Generation; 144 Hz: 72), so every "
+               "frame stays on screen equally long - no judder or doubled frames. VRR keeps your frame rate and VSync "
+               "settings as they are. Fixed refresh always paces that way. Compatible renderer only.",
+               "R3_DISPLAY_SYNC", { {"Auto", ""}, {"VRR  (G-Sync / FreeSync)", "vrr"}, {"Fixed refresh", "fixed"} }, 0, {}, "rpcs3");
     add_option(SEC_PC, "refreshswitch", "Refresh rate switch",
                "Exclusive fullscreen only: when the frame rate does not divide your display's refresh rate evenly (60 fps "
                "on 144 Hz shows frames for 2, then 3 refreshes - judder), switch the display to the nearest refresh rate "
