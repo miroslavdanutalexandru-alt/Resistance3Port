@@ -74,6 +74,12 @@ IGJOB_IMG, IGPIC_IMG, WWSPIC_IMG = 400, 600, 900
 # was folded into nothing and the job ran in the interpreter ("[spu] unlifted job
 # code at LS 0x11978", plugin at LS 0x11280, during level/sound-bank loads).
 WWSPIC_EXTRA = {0x00FFB200: [0x6F8]}
+# ig job entries reached only through a function table. E59180+0x360: a leaf
+# (fm/lqr/shufb, no stack or branch) that falls into the 0x3C0 loop; the gap
+# fill rejects it (no anchor instruction) and the job's table {0x468, 0x360}
+# sent it to the interpreter, which wedged: label 71 never stored, black screen
+# in haven_town_defense.
+IGJOB_EXTRA = {0x00E59180: [0x360]}
 
 
 def spu_blobs(d, elfs):
@@ -262,7 +268,8 @@ def spu(port, tk, eboot, work, spudir=None):
         if kind == 'igA':
             nm = 'igjob_%08X' % va
             pe = image(nm, raw, base, e)
-            jobs.append((nm, lift_cmd(tk, pe, out, nm, base, [e], lo=base + 0x20), pe, base, span))
+            ex = [e] + [a for a in IGJOB_EXTRA.get(va, ()) if base + 0x20 <= a < base + span]
+            jobs.append((nm, lift_cmd(tk, pe, out, nm, base, ex, lo=base + 0x20), pe, base, span))
             igjobs.append([nm, va, span, IGJOB_IMG + len(igjobs)])
         elif kind == 'igB':
             nm = 'igpic_%08X' % va
