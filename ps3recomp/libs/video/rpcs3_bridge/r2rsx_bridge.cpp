@@ -32,6 +32,7 @@
 // ---- end R2PORT autoconfig ----
 #include <tlhelp32.h> // R2PORT perf: R2_RSX_PROF thread times
 #include "r2rsx_host_sampler.h" // R3PORT perf r8: RSX_HOST_SAMPLE=1 rsx::thread host sampler
+#include "r2rsx_pipeline_seed.h" // PORT: tools\pipeline_seed.bin -> shader cache
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -1179,6 +1180,8 @@ extern "C" int r2rsx_context_allocate(uint32_t dma_control_ea, uint32_t label_ea
 		std::filesystem::rename(root + "\\cache\\rpcs3", r2port::g_rsx_cache_dir.substr(0, r2port::g_rsx_cache_dir.size() - 1), ec);
 	}
 	std::filesystem::create_directories(r2port::g_rsx_cache_dir, ec);
+	// PORT: pipelines the game links only in play (shipped without shader microcode; r2rsx_pipeline_seed.h)
+	port_pipeline_seed::apply(root, r2port::g_rsx_cache_dir + "shaders_cache");
 
 	load_config();
 

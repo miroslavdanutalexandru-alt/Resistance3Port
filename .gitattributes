@@ -5,3 +5,4 @@
 # applied with git apply to an LF checkout of RPCS3: keep byte-exact
 *.patch -text
 *.profdata binary
+tools/pipeline_seed.bin binary
