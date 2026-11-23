@@ -1545,6 +1545,24 @@ static void r3ml_save(void)
     if (f) { fprintf(f, "yaw_sign = %d\npitch_sign = %d\naxes_swapped = %d\n", s_r3ml_sx, s_r3ml_sy, s_r3ml_swap); fclose(f); }
     s_r3ml_saved = 1;
 }
+/* Which way the mouse turns the view.
+ *  unset / "game" (default): the game's own stick handling, read each frame in
+ *    r3ml_follow_game: the sign the game gave this frame's right stick (its
+ *    Invert options, the shooting range's Invert Y and whatever else it flips
+ *    by), never the resulting turn rate. Learning from the rate could still flip
+ *    the direction mid-fight (R2 showed "yaw direction now 1 / -1" four times in
+ *    10 s): recoil, hit reactions, aim assist and scripted turns move the view on
+ *    their own. mouselook_r3.cfg keeps only axes_swapped then.
+ *  R3_ML_LEARN=1 / motion: the 0.3.0 rule, learnt from the rate (r3ml_check).
+ *  R3_ML_LEARN=legacy: the older rate rule.
+ *  R3_ML_LEARN=0: fixed, mouselook_r3.cfg or the defaults. */
+static int r3ml_learn_mode(void)
+{
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("R3_ML_LEARN");
+                 m = (!e || !*e || !_stricmp(e, "game")) ? 3 : *e == '0' ? 0 : (*e == 'l' || *e == 'L') ? 2 : 1; }
+    return m;
+}
 static void r3ml_load(void)
 {
     if (s_r3ml_sx) return;
@@ -1552,12 +1570,14 @@ static void r3ml_load(void)
     FILE* f = fopen("mouselook_r3.cfg", "r");
     if (f) { char l[128]; int v;
         while (fgets(l, sizeof l, f)) {
-            if (sscanf(l, " yaw_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r3ml_sx = v;
-            if (sscanf(l, " pitch_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r3ml_sy = v;
+            /* default mode: the directions come from the game each frame (r3ml_follow_game), not the file */
+            if (r3ml_learn_mode() != 3 && sscanf(l, " yaw_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r3ml_sx = v;
+            if (r3ml_learn_mode() != 3 && sscanf(l, " pitch_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r3ml_sy = v;
             if (sscanf(l, " axes_swapped = %d", &v) == 1 && (v == 0 || v == 1)) s_r3ml_swap = v;
         }
         fclose(f); s_r3ml_saved = 1; }
-    fprintf(stderr, "[mouselook] R3 direct mouse look: yaw %d, pitch %d, swapped %d%c", s_r3ml_sx, s_r3ml_sy, s_r3ml_swap, 10);
+    fprintf(stderr, "[mouselook] R3 direct mouse look: yaw %d, pitch %d, swapped %d (%s)%c", s_r3ml_sx, s_r3ml_sy, s_r3ml_swap,
+            r3ml_learn_mode() == 3 ? "following the game's stick handling" : r3ml_learn_mode() ? "learnt from the turn rate" : "fixed", 10);
 }
 static void r3ml_check(int fed, float rate, int* sign, int* bad, const char* what)
 {
@@ -1565,14 +1585,9 @@ static void r3ml_check(int fed, float rate, int* sign, int* bad, const char* wha
      * stall in combat), so a fast reversal or a mouse flick looked like the other direction, and 4 (15 once saved)
      * such frames flipped the learned sign until it flipped back ("pitch direction now 1" in the middle of a
      * fight: the look briefly inverted). Only a clear deflection held in one direction for >= 250 ms counts, and it
-     * takes 8 (15 once saved) such frames in a row. R3_ML_LEARN=0: never re-learn (mouselook_r3.cfg / defaults);
-     * R3_ML_LEARN=legacy: the old rule. */
-    static int learn = -1;
-    if (learn < 0) {
-        const char* e = getenv("R3_ML_LEARN");
-        learn = (e && *e == '0') ? 0 : (e && (*e == 'l' || *e == 'L')) ? 2 : 1;
-    }
-    if (!learn) return;
+     * takes 8 (15 once saved) such frames in a row. Only with R3_ML_LEARN=1 / legacy now (r3ml_learn_mode). */
+    const int learn = r3ml_learn_mode();
+    if (learn != 1 && learn != 2) return;
     if (learn == 2) {
         if (!(fed >= 16 || fed <= -16) || !(rate > 1e-5f || rate < -1e-5f)) return;
         const int s = ((fed > 0) == (rate > 0)) ? 1 : -1;
@@ -1715,13 +1730,19 @@ extern "C" void r3_aim_assist_set(const char* v)
  * func_0019B890 / func_0019B8E8 fill). func_0019C1C4 stores the user's pad
  * (user+0xBC) at input+0x1AB8. The input objects are the 8 of 0x1AC4 bytes from
  * [0x01069F00] (func_0019D478); anything else is not trusted. */
-static int aim_assist_hero_pad(uint32_t hero)
+static uint32_t r3_hero_input(uint32_t hero)
 {
     const uint32_t mgr = vm_read32(0x00F0A458u), idx = vm_read32(hero + 0x1680);
     const uint32_t base = vm_read32(0x01069F00u);
-    if (mgr < 0x10000u || mgr >= 0xF0000000u || idx >= 0x46u || base < 0x10000u || base >= 0xF0000000u) return -1;
+    if (mgr < 0x10000u || mgr >= 0xF0000000u || idx >= 0x46u || base < 0x10000u || base >= 0xF0000000u) return 0;
     const uint32_t in = vm_read32(mgr + 8u + idx * 0x28u + 0x20u);
-    if (in < base || (in - base) % 0x1AC4u || (in - base) / 0x1AC4u >= 8u) return -1;
+    if (in < base || (in - base) % 0x1AC4u || (in - base) / 0x1AC4u >= 8u) return 0;
+    return in;
+}
+static int aim_assist_hero_pad(uint32_t hero)
+{
+    const uint32_t in = r3_hero_input(hero);
+    if (!in) return -1;
     const uint32_t pad = vm_read32(in + 0x1AB8);
     return pad < 8u ? (int)pad : -1;
 }
@@ -1752,6 +1773,38 @@ static void aim_assist_apply(uint32_t hero, uint32_t sp)
     if (n++ < 20) fprintf(stderr, "[aimassist] off: hero 0x%08X rates %+.4f %+.4f -> stick %+.4f %+.4f%c",
                           hero, (double)r52c, (double)r530, (double)s52c, (double)s530, 10);
 }
+/* One axis of the game's own stick handling: raw = this frame's stick in the pad
+ * slot, proc = what the hero update made of it. Only a pure sign change of the
+ * same value counts (any other input path or scaling is skipped), 3 frames in a row. */
+static void ml_follow_axis(float raw, float proc, int* sign, int* cand, int* run, const char* what)
+{
+    const float ar = fabsf(raw), ap = fabsf(proc);
+    if (!(ar >= 0.2f && ar <= 4.0f) || fabsf(ap - ar) > 0.01f * ar + 1e-4f) return;
+    const int s = ((raw > 0.0f) == (proc > 0.0f)) ? 1 : -1;
+    if (s == *sign) { *run = 0; return; }
+    if (s != *cand) { *cand = s; *run = 0; }
+    if (++*run < 3) return;
+    *sign = s; *run = 0;
+    fprintf(stderr, "[mouselook] %s direction now %d (the game's invert setting)%c", what, s, 10);
+}
+/* func_0017BCE8: the stick in the hero's pad slot (func_00B78A94: input +
+ * [input+0x1AA4] * 0x60; +0x1C across, +0x18 up/down) is negated into sp+0x220 /
+ * sp+0x224 (loc_0017CC38), negated again when hero+0x600 is set (loc_0017CD34),
+ * then func_0017BA98 applies the Invert options ([input+0x1AC0] words +4
+ * left/right, +0 up/down) and a game setting (pitch, func_001B517C(6)). The
+ * stick is turned into rates from those two slots, which are left alone until
+ * the pre hook at 0x0017C670. */
+static void r3ml_follow_game(uint32_t hero, uint32_t sp)
+{
+    static int cand[2], run[2];
+    const uint32_t in = r3_hero_input(hero);
+    if (!in) return;
+    const uint32_t h = vm_read32(in + 0x1AA4);
+    if (h >= 0x46u) return;
+    const uint32_t slot = in + h * 0x60u;
+    ml_follow_axis(ml_rdf(slot + 0x1C), ml_rdf(sp + 0x220), &s_r3ml_sx, &cand[0], &run[0], "yaw");
+    ml_follow_axis(ml_rdf(slot + 0x18), ml_rdf(sp + 0x224), &s_r3ml_sy, &cand[1], &run[1], "pitch");
+}
 extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
 {
     (void)ctx;
@@ -1761,6 +1814,7 @@ extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
                 aim_assist_apply(hero, sp); }
     if (!g_ml_mode || !hero) return;
     r3ml_load();
+    if (r3ml_learn_mode() == 3) r3ml_follow_game(hero, sp);
     const int dbg = r3ml_dbg();
     const int mouse = ml_stick_is_mouse();
     /* a controller with gyro aiming (one local player): the stick still turns
