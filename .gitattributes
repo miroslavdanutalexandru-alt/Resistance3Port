@@ -6,3 +6,4 @@
 *.patch -text
 *.profdata binary
 tools/pipeline_seed.bin binary
+*.sh text eol=lf
