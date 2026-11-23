@@ -269,6 +269,24 @@ elseif(PORT_ENABLE_SPU)
         # page a few thousand iterations in.
         list(APPEND SPU_SOURCES ${SPU_LIFTED}
              "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
+        # PIC plugins (igpic_*: position-independent code that jobs 403/406 load at a different LS address
+        # each run, run through ctx->ls_bias) are built without direct block hops (SPU_NO_DIRECT_HOP, see
+        # spu_context.h SPU_HOP). With them, a job 403 callback into plugin DB0400 sometimes ended at LS 0
+        # ("pic content-match FAILED ... pc=0x00000", then "[spu] img=2 exit: synthesised stop 0x1EAD at
+        # LS 0x00000" and "[pm-end] lane 1 ... lr=0x0F8F4 r3=0x00014C60"): the lane stopped and the game
+        # froze. Seen once the DOF fast path armed without an upscaler (job 419 skipped changes the job
+        # timing); never with SPU_DIRECT_HOP=0. The plugins are small, so the hops cost little there.
+        # PORT_PIC_DIRECT_HOP=ON keeps the hops in the plugins too.
+        option(PORT_PIC_DIRECT_HOP "Direct block hops in the PIC plugin images (igpic_*)" OFF)
+        if(NOT PORT_PIC_DIRECT_HOP)
+            set(_pic_srcs ${SPU_LIFTED})
+            list(FILTER _pic_srcs INCLUDE REGEX "/igpic_[^/]*/spu_recomp\\.c$")
+            if(_pic_srcs)
+                # The define is added after the SPU_SOURCES COMPILE_DEFINITIONS below, which would replace it.
+                list(LENGTH _pic_srcs _pic_n)
+                message(STATUS "PIC plugins:     ${_pic_n} image(s) without direct block hops (PORT_PIC_DIRECT_HOP=OFF)")
+            endif()
+        endif()
         # Generated beside the lift; each is present only once its generator
         # has been run, so each is included only if it is actually here.
         foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
@@ -458,6 +476,9 @@ if(SPU_SOURCES)
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
         COMPILE_DEFINITIONS "${_spu_defs}")
+    if(_pic_srcs)
+        set_property(SOURCE ${_pic_srcs} APPEND PROPERTY COMPILE_DEFINITIONS SPU_NO_DIRECT_HOP=1)
+    endif()
     if(NOT MSVC OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         # Resistance port: the SPU helpers have SSE4.1/AVX2 paths (pshufb shufb,
         # vector float ops) that the default x86-64 baseline compiled out --
