@@ -21,6 +21,7 @@
 #include "ps3emu/log_first.h"
 #include "ps3emu/port_pc_extras.h"   /* rumble / stick / hold-toggle / background-input logic */
 #include "kbm_stick.h"                 /* mouse -> stick: deadzone-aware, sub-step carry */
+#include "kbm_layout.h"                /* keys follow the game's controller layout (presets, Customize) */
 #include "pad_squircle.h"              /* PAD_SQUIRCLE: round gate -> DS3-like square range */
 #include "ps3emu/port_hitch.h"
 #include "../../runtime/ps3_log.h"   /* ps3_diag_enabled (R2_DIAG) */
@@ -729,6 +730,49 @@ static u32 kbm_unswap(u32 hsb)
     return (u32)(((out >> 8) & 0xFF) | ((u32)NSW(out & 0xFF) << 8));
 #undef NSW
 }
+/* The game's active controller layout (project/stubs.cpp r3_note_layout, kbm_layout.h):
+ * the EA of its 18 action words, and 0x100 | preset (0 = not found). Keys are translated
+ * through it; when it can't be read they keep the default layout. The v152 table above
+ * was written for Resistance 1/2 (their options block and default layout); nothing sets
+ * g_port_opts_ea in R3, so it only runs with PORT_KBM_LAYOUT=old, where it changes nothing.
+ * PORT_KBM_LAYOUT=old: that table only; =off: no translation. */
+volatile u32 g_port_layout_ea = 0, g_port_layout_info = 0;
+static u16 kbm_translate(u16 btns)
+{
+    extern uint8_t* vm_base;
+    static int mode = -1;
+    if (mode < 0) { const char* e = getenv("PORT_KBM_LAYOUT");
+                    mode = !e || !*e ? 0 : !_stricmp(e, "old") ? 1 : !_stricmp(e, "off") ? 2 : 0;
+                    if (mode) printf("[controls] PORT_KBM_LAYOUT=%s: keys %s\n", e,
+                                     mode == 1 ? "use the old R1/R2 swap table" : "are not translated"); }
+    if (mode == 2 || !btns) return btns;
+    if (mode == 1) return (u16)kbm_unswap(btns);
+    const u32 ea = g_port_layout_ea, info = g_port_layout_info;
+    if (!ea || !vm_base) {
+        static int said = 0;
+        if (!said) { said = 1; printf("[controls] game controller layout not found yet: keys use the default layout\n"); }
+        return btns;
+    }
+    u32 cur[KBM_LAYOUT_SLOTS];
+    for (int i = 0; i < KBM_LAYOUT_SLOTS; i++) {
+        const uint8_t* p = vm_base + ea + 4u * (u32)i;
+        cur[i] = ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+    }
+    const int ok = kbm_layout_valid(cur);
+    { static u32 last[KBM_LAYOUT_SLOTS], last_info = 0xFFFFFFFFu;
+      if (info != last_info || memcmp(last, cur, sizeof cur)) {
+          last_info = info; memcpy(last, cur, sizeof cur);
+          char b[600]; int n = snprintf(b, sizeof b, "[controls] keys follow the game's controller layout: %s %u%s:",
+                                        (info & 0xFF) < 4 ? "preset" : "custom", info & 0xFF,
+                                        ok ? "" : " (unreadable, default layout used)");
+          int moved = 0;
+          for (int i = 0; i < KBM_LAYOUT_SLOTS && n < (int)sizeof b - 32; i++)
+              if (cur[i] != kbm_def_layout[i]) { moved++; n += snprintf(b + n, sizeof b - n, " slot%d 0x%04X->0x%04X", i, kbm_def_layout[i], cur[i]); }
+          if (!moved) snprintf(b + n, sizeof b - n, " as shipped");
+          printf("%s\n", b);
+      } }
+    return ok ? kbm_layout_translate(btns, cur) : btns;
+}
 static int s_kbm_loaded = 0;
 /* PC port extras: re-read controls.txt (the in-game key binding page) */
 void cellpad_reload_controls(void) { s_kbm_loaded = 0; }
@@ -1012,7 +1056,8 @@ static void pad_poll_keyboard(void)
       if (fe3 && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }
     btns = pad_aim_toggle(0, btns, menu_raw);
     btns = pad_hold_toggle(0, btns, menu_raw);
-    hs->buttons   = menu_raw ? btns : kbm_unswap(btns);   /* v152: undo the in-game button swaps for the keyboard */
+    if (!menu_raw) btns = kbm_translate(btns);   /* keys follow the game's controller layout (triggers, pressure too) */
+    hs->buttons   = btns;
     g_port_use_kbm = interact;
     hs->connected = 1;
     hs->analog_lx = padk_axis(lx < 0, lx > 0);   /* full deflection at once, no ramp */
