@@ -531,23 +531,25 @@ static void register_input_options()
                "PAD_NINTENDO_SWAP", { {"By position", ""}, {"Nintendo style (A confirms)", "1"} }, 0);
     // Local co-op (split-screen): which controller is which player (ps3recomp/libs/input/cellPad.c)
     add_option(SEC_INPUT, "coop", "Local co-op  (split-screen)",
-               "A second controller is player 2: press START on it to join (see the README, \"Local co-op\"). "
-               "Off keeps every extra controller away from the game.",
-               "PAD_COOP", { {"On", ""}, {"Off", "0"} }, 0);
+               "On: a second controller can be player 2: press START on it to join (see the README, \"Local "
+               "co-op\"). Off: one player, however many controllers are connected (also when DSX, DS4Windows or "
+               "Steam Input adds a virtual copy of your controller); player 1 is the controller you used last.",
+               "PAD_COOP", { {"Off", "0"}, {"On", "1"} }, 0);
     add_option(SEC_INPUT, "p1pad", "Player 1 controller",
-               "Which controller is player 1 (with the keyboard and mouse). Automatic takes the first one found; "
-               "controllers are numbered in the order they were connected (SDL3), or in Windows' XInput order.",
+               "Which controller is player 1 (with the keyboard and mouse). Automatic: the controller you used "
+               "last (in local co-op: the first one found). Controllers are numbered in the order they were "
+               "connected (SDL3), or in Windows' XInput order.",
                "PAD_P1_CONTROLLER", { {"Automatic", ""}, {"Controller 1", "1"}, {"Controller 2", "2"},
                                       {"Controller 3", "3"}, {"Controller 4", "4"}, {"Controller 5", "5"},
                                       {"Controller 6", "6"}, {"Controller 7", "7"}, {"Controller 8", "8"} }, 0);
     add_option(SEC_INPUT, "p2pad", "Player 2 controller",
-               "Which controller is player 2 in local co-op. Automatic takes the next one found.",
+               "Which controller is player 2 when Local co-op is On. Automatic takes the next one found.",
                "PAD_P2_CONTROLLER", { {"Automatic", ""}, {"Controller 1", "1"}, {"Controller 2", "2"},
                                       {"Controller 3", "3"}, {"Controller 4", "4"}, {"Controller 5", "5"},
                                       {"Controller 6", "6"}, {"Controller 7", "7"}, {"Controller 8", "8"} }, 0);
     add_option(SEC_INPUT, "p2kb", "Player 2 uses keyboard and mouse",
                "Local co-op with one controller: player 1 plays on the controller, player 2 on the keyboard and "
-               "mouse (the mouse moves player 2's view like a right stick).",
+               "mouse (the mouse moves player 2's view like a right stick). Needs Local co-op On.",
                "PAD_P2_KEYBOARD", { {"Off", ""}, {"On", "1"} }, 0);
     // Online (ps3recomp/libs/network/port_online.c): RPCN sign-in and DNS override from online.ini
     add_option(SEC_INPUT, "online", "Online  (experimental)",

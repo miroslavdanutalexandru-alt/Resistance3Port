@@ -122,32 +122,41 @@ static int s_data_fresh[PAD_MAX_HOST_PORTS];
  * XInput / SDL3 slot feeding internal port p (-1 = none). Internal port 0 is the
  * keyboard & mouse plus player 1's controller. A port keeps its controller
  * while it stays plugged in; a new controller takes the lowest free port.
- *   PAD_COOP=0            only port 0 (player 1); no second player
+ * Local co-op is off unless asked for: with it off the game sees one player,
+ * however many controllers (or a tool's virtual copies of one) are plugged in,
+ * and player 1 is whichever controller was used last.
+ *   PAD_COOP=1            local co-op: a second controller can join as player 2
+ *                         (also on when PAD_P2_CONTROLLER / PAD_P2_KEYBOARD is set
+ *                         and PAD_COOP isn't set at all); PAD_COOP=0 (the launcher's
+ *                         Off) or empty: always off
  *   PAD_P1_CONTROLLER=n   player 1 uses controller n (1-8, in connection order), not the first found
  *   PAD_P2_CONTROLLER=n   player 2 uses controller n (1-8)
  *   PAD_P2_KEYBOARD=1     player 2 = keyboard & mouse, player 1 = the first controller
  *                         (guest ports 0 and 1 swap: see pad_host_port) */
 static int s_port_slot[PAD_MAX_HOST_PORTS] = { -1, -1, -1, -1 };
-static int s_coop_init = 0, s_coop_on = 1, s_coop_p2kb = 0, s_coop_want[2] = { -1, -1 };
+static int s_coop_init = 0, s_coop_on = 0, s_coop_p2kb = 0, s_coop_want[2] = { -1, -1 };
 static u32 s_status_seen[CELL_PAD_MAX_PORT_NUM];   /* last port_status reported, for ASSIGN_CHANGES */
 static void pad_coop_init(void)
 {
     if (s_coop_init) return;
     s_coop_init = 1;
     const char* e;
-    if ((e = getenv("PAD_COOP")) && *e == '0') s_coop_on = 0;
+    const char* coop = getenv("PAD_COOP");
     if ((e = getenv("PAD_P2_KEYBOARD")) && *e && *e != '0') s_coop_p2kb = 1;
-    if (!s_coop_on) s_coop_p2kb = 0;
     if ((e = getenv("PAD_P1_CONTROLLER")) && *e >= '1' && *e <= '0' + PAD_MAX_SLOTS) s_coop_want[0] = *e - '1';
     if ((e = getenv("PAD_P2_CONTROLLER")) && *e >= '1' && *e <= '0' + PAD_MAX_SLOTS) s_coop_want[1] = *e - '1';
+    if (coop) s_coop_on = *coop && *coop != '0';   /* the launcher writes 0 / 1 */
+    else s_coop_on = s_coop_p2kb || s_coop_want[1] >= 0;
+    if (!s_coop_on) s_coop_p2kb = 0;
     if (s_coop_p2kb || s_coop_want[1] == s_coop_want[0]) s_coop_want[1] = -1;
     char w0[24] = "first controller", w1[40] = "next controller";
+    if (!s_coop_on) snprintf(w0, sizeof w0, "last used controller");
     if (s_coop_want[0] >= 0) snprintf(w0, sizeof w0, "controller %d", s_coop_want[0] + 1);
     if (!s_coop_on) snprintf(w1, sizeof w1, "none");
     else if (s_coop_p2kb) snprintf(w1, sizeof w1, "keyboard & mouse (PAD_P2_KEYBOARD)");
     else if (s_coop_want[1] >= 0) snprintf(w1, sizeof w1, "controller %d", s_coop_want[1] + 1);
     printf("[cellPad] local co-op: %s; player 1 = %s%s, player 2 = %s\n",
-           s_coop_on ? "on" : "off (PAD_COOP=0)", s_coop_p2kb ? "" : "keyboard & mouse + ", w0, w1);
+           s_coop_on ? "on" : "off (PAD_COOP=1 turns it on)", s_coop_p2kb ? "" : "keyboard & mouse + ", w0, w1);
 }
 /* Guest port -> internal port: identity, except that player 2 on the keyboard
  * swaps ports 0 and 1 (internal port 0 is always the keyboard's). */
@@ -1221,6 +1230,16 @@ static void pad_stick_radial(short rx, short ry, u8* ox, u8* oy)
     vx = vx < 0 ? 0 : vx > 255 ? 255 : vx; vy = vy < 0 ? 0 : vy > 255 ? 255 : vy;
     *ox = (u8)vx; *oy = (u8)(256 - vy);
 }
+/* Is this controller being used right now? A button, a trigger, or a stick
+ * pushed past half way (resting stick drift doesn't count). */
+static int pad_slot_in_use(const PadHostState* s)
+{
+    if (!s->connected) return 0;
+    if (s->buttons || s->trigger_l2 > 64 || s->trigger_r2 > 64) return 1;
+    const int a[4] = { s->analog_lx, s->analog_ly, s->analog_rx, s->analog_ry };
+    for (int k = 0; k < 4; k++) if (a[k] < 64 || a[k] > 192) return 1;
+    return 0;
+}
 /* Local co-op: put the controllers (per XInput slot) on the PS3 ports. */
 static void pad_map_slots(const PadHostState* xs, int nslots)
 {
@@ -1252,6 +1271,17 @@ static void pad_map_slots(const PadHostState* xs, int nslots)
         for (int q = 0; q < PAD_MAX_HOST_PORTS; q++) if (s_port_slot[q] == sl) s_port_slot[q] = -1;
         s_port_slot[p] = sl; used[sl] = 1;
         printf("[cellPad] player %d <- controller %d\n", (int)pad_host_port((u32)p) + 1, sl + 1);
+    }
+    if (!s_coop_on && s_coop_want[0] < 0) {              /* one player: the controller used last */
+        const int cur = s_port_slot[0];
+        if (cur < 0 || !pad_slot_in_use(&xs[cur]))
+            for (int sl = 0; sl < nslots; sl++) {
+                if (sl == cur || !pad_slot_in_use(&xs[sl])) continue;
+                s_port_slot[0] = sl; used[sl] = 1;
+                if (cur >= 0) used[cur] = 0;
+                printf("[cellPad] player 1 <- controller %d (used last)\n", sl + 1);
+                break;
+            }
     }
     for (int sl = 0; sl < nslots; sl++) {                /* new controllers: lowest free port */
         if (!xs[sl].connected || used[sl] || reserved[sl]) continue;
@@ -1495,6 +1525,8 @@ static void pad_backend_choose(void)
         }
 #else
         if (e && *e && _stricmp(e, "xinput")) printf("[cellPad] PAD_BACKEND=%s: not in this build; using XInput\n", e);
+        printf("[cellPad] controllers: XInput only (this build has no SDL3: DualShock 4 / DualSense need "
+               "DS4Windows, DSX or Steam Input; ps3recomp/third_party/SDL3 was missing when it was built)\n");
 #endif
         fflush(stdout);
         s_backend = b;
