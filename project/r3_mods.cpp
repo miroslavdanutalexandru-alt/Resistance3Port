@@ -7,7 +7,10 @@
 //     mods\MyMod\USRDIR\<the game file to replace>
 //
 // A file there is opened in place of the game's own copy, by every file layer of the runtime
-// (cellFs, sys_fs: the g_vfs_override_hook in runtime/syscalls/sys_fs.c). Mods are applied in
+// (cellFs, sys_fs: the g_vfs_override_hook in runtime/syscalls/sys_fs.c), for reading only: an
+// open that writes, creates or truncates, and mkdir / rename / unlink, always get the game's own
+// path (a game's data install copies archives to /dev_hdd0 and must not write over the mod copy
+// it reads from). Mods are applied in
 // alphabetical order of their folder names; when two replace the same file the later one wins.
 // A folder whose name starts with '_' or '-' is skipped (disabled). The overrides are listed in
 // the log at start-up.
@@ -38,7 +41,7 @@
 #include "mods_psarc.h"
 #include "ps3emu/port_pc_extras.h"
 
-extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap);   // runtime/syscalls/sys_fs.c
+extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap, int writing);   // runtime/syscalls/sys_fs.c
 
 namespace {
 
@@ -152,7 +155,7 @@ const char* game_rel(const char* p)
 }
 
 // The patched copy of archive `key` (base: the resolved game path, or a whole-file override).
-const std::string* archive_copy(const std::string& key, const std::string& base)
+const std::string* archive_copy(const std::string& key, const std::string& base_in)
 {
     const auto it = s_archives.find(key);
     if (it == s_archives.end()) return nullptr;
@@ -160,16 +163,33 @@ const std::string* archive_copy(const std::string& key, const std::string& base)
     ArchivePlan& ap = it->second;
     if (!ap.tried) {
         ap.tried = true;
+        // A /dev_hdd0 copy the game installed from the disc is a copy of our patched archive:
+        // build from the original it names, never patch a patched copy again.
+        std::string base = base_in;
+        const std::string from = modpsarc::patched_from(base_in);
+        if (!from.empty()) {
+            if (GetFileAttributesA(from.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                fprintf(stderr, "[mods] %s: %s is already a patched copy (of %s, which is gone), used as it is\n",
+                        key.c_str(), base_in.c_str(), from.c_str());
+                return nullptr;
+            }
+            fprintf(stderr, "[mods] %s: %s is a patched copy, building from %s\n", key.c_str(), base_in.c_str(), from.c_str());
+            base = from;
+        }
         std::string name = key;
         for (auto& c : name) if (c == '/' || c == ':') c = '_';
         const std::string dir = s_root + "\\.cache";
         char hex[24];
         snprintf(hex, sizeof hex, "%016llx", (unsigned long long)modpsarc::plan_key(base, ap.plan));
         const std::string out = dir + "\\" + name + "." + hex + ".psarc";
-        if (GetFileAttributesA(out.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::string bad;
+        if (GetFileAttributesA(out.c_str()) != INVALID_FILE_ATTRIBUTES && !modpsarc::verify(out, &bad))
+            fprintf(stderr, "[mods] %s: the patched copy %s is damaged (%s), building it again\n", key.c_str(), out.c_str(), bad.c_str());
+        else if (GetFileAttributesA(out.c_str()) != INVALID_FILE_ATTRIBUTES) {
             fprintf(stderr, "[mods] %s: using the patched copy %s\n", key.c_str(), out.c_str());
             ap.built = out;
-        } else {
+        }
+        if (ap.built.empty()) {
             CreateDirectoryA(dir.c_str(), nullptr);
             // older copies of this archive
             WIN32_FIND_DATAA fd;
@@ -192,8 +212,9 @@ const std::string* archive_copy(const std::string& key, const std::string& base)
     return ap.built.empty() ? nullptr : &ap.built;
 }
 
-void override_hook(char* path, size_t cap)
+void override_hook(char* path, size_t cap, int writing)
 {
+    if (writing) return;   // writes, creates, truncates, renames, deletes: the game's own file
     if (s_index.empty() && s_archives.empty()) return;
     const char* rel = game_rel(path);
     if (!rel) return;

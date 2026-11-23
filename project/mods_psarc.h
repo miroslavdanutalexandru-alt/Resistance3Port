@@ -37,7 +37,16 @@ bool plan_add(Plan& plan, const std::string& rel, const std::string& host_file, 
 uint64_t plan_key(const std::string& base, const Plan& plan);
 
 // Writes `base` with `plan` applied to `out` (through out + ".tmp"). Appends log lines to *log.
+// The copy ends with a trailer naming the archive it was built from (patched_from).
 bool build(const std::string& base, const Plan& plan, const std::string& out, std::string* log);
+
+// Whether `archive` is a whole PSARC: its table of contents parses and every member's blocks
+// lie inside the file (a truncated copy fails). false and *why otherwise.
+bool verify(const std::string& archive, std::string* why);
+
+// The archive a build() output (or a byte copy of one, like the game's /dev_hdd0 data install)
+// was built from; empty for any other file.
+std::string patched_from(const std::string& archive);
 
 // Archive helpers (also used by the tests).
 bool list_members(const std::string& archive, std::vector<std::string>& names);
