@@ -1627,11 +1627,42 @@ static void r3ml_update_zoom(void)
                                                  if (ads < 0.1) ads = 0.1; if (ads > 3.0) ads = 3.0; }
       if (z < 0.99) s_r3ml_zoom = (float)(s_r3ml_zoom * ads); }
 }
+/* The controller layout the game uses (func_0019CE5C -> func_003C8074), read
+ * the same way: the controller's options block is [user+0x9C] + 0x20 (func_0019C1C4
+ * binds it; users: 2 slots of 0xE0 at 0x011E09D0, active byte 0x011E0B90+i, pad
+ * index +0xBC, func_003EB188 / func_003EB768). Byte +0x64 (+0x65 when the mode word 0x00F1D5A0 is
+ * even) picks preset 0-3 from the table func_003C7F38 builds at 0x01197CA0 (0xA8
+ * bytes each), or 4+ = a custom layout at opts + 0x68 + (n - 4) * 0xA8. The
+ * keyboard is pad 0. cellPad.c translates the keys through it (kbm_layout.h). */
+extern "C" volatile uint32_t g_port_layout_ea, g_port_layout_info;
+static void r3_note_layout(void)
+{
+    uint32_t user = 0, n = 0;
+    for (uint32_t i = 0; i < 2; i++) {
+        if (!vm_read8(0x011E0B90u + i)) continue;
+        const uint32_t u = 0x011E09D0u + i * 0xE0u;
+        if (!user || vm_read32(u + 0xBC) == 0) user = u;
+        n++;
+    }
+    if (user && n > 1 && vm_read32(user + 0xBC) != 0) user = 0;   /* two players, neither on pad 0 */
+    uint32_t ea = 0, info = 0;
+    const uint32_t prof = user ? vm_read32(user + 0x9C) : 0;
+    if (prof >= 0x10000u && prof < 0xF0000000u) {
+        const uint32_t opts = prof + 0x20u;
+        const uint32_t idx = vm_read8(opts + ((vm_read32(0x00F1D5A0u) & 1) ? 0x64u : 0x65u));
+        if (idx < 4) ea = 0x01197CA0u + idx * 0xA8u;
+        else if (idx < 12) ea = opts + 0x68u + (idx - 4) * 0xA8u;
+        info = 0x100u | idx;
+    }
+    g_port_layout_info = info;
+    g_port_layout_ea = ea;
+}
 extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
 {
     (void)ctx;
     s_r3ml_hero = 0;
-    if (hero) g_r2_look_ms = GetTickCount64();   /* gameplay is running (PORT_MENU_FPS) */
+    if (hero) { g_r2_look_ms = GetTickCount64();   /* gameplay is running (PORT_MENU_FPS) */
+                r3_note_layout(); }
     if (!g_ml_mode || !hero) return;
     r3ml_load();
     const int dbg = r3ml_dbg();
