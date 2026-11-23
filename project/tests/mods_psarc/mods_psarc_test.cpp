@@ -4,6 +4,8 @@
 //   mods_psarc_test setup <dir>     writes a fake game + mods folder for the hook tests
 //   mods_psarc_test hook <dir>      R2_MODS=<dir>/mods: the file hook redirects to a patched copy
 //   mods_psarc_test rebuild <dir>   a changed mod file rebuilds the copy and drops the old one
+//   mods_psarc_test damaged <dir>   a truncated copy is rebuilt; the game's /dev_hdd0 copy of the
+//                                   patched archive resolves to the same copy (runs after rebuild)
 //   mods_psarc_test nohook          R2_MODS unset: no hook installed (game files untouched)
 //   mods_psarc_test real <archive>  real level_cached.psarc: tuid override round trip (77 = skipped)
 #include "mods_psarc.h"
@@ -16,7 +18,7 @@
 #include <string>
 #include <vector>
 
-extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap) = nullptr;   // sys_fs.c in the game
+extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap, int writing) = nullptr;   // sys_fs.c in the game
 
 namespace fs = std::filesystem;
 using Bytes = std::vector<uint8_t>;
@@ -257,6 +259,29 @@ static int unit()
     // the original archive is read only
     CHECK(member(base, "/built/levels/t/shaders.dat") == shaders);
 
+    // whole archives verify; a truncated copy does not
+    std::string vwhy;
+    CHECK(modpsarc::verify(base.string(), &vwhy));
+    CHECK(modpsarc::verify(out.string(), &vwhy));
+    const Bytes whole = read_file(out);
+    write_file(dir / "cut.psarc", Bytes(whole.begin(), whole.begin() + whole.size() / 2));
+    CHECK(!modpsarc::verify((dir / "cut.psarc").string(), &vwhy) && !vwhy.empty());
+    write_file(dir / "cut.psarc", Bytes(whole.begin(), whole.begin() + 20));
+    CHECK(!modpsarc::verify((dir / "cut.psarc").string(), &vwhy));
+    CHECK(!modpsarc::verify((dir / "missing.psarc").string(), &vwhy));
+
+    // the copy names its source, and a copy of it (the game's data install) does too
+    CHECK(modpsarc::patched_from(out.string()) == base.string());
+    CHECK(modpsarc::patched_from(base.string()).empty());
+    write_file(dir / "installed.psarc", whole);
+    CHECK(modpsarc::patched_from((dir / "installed.psarc").string()) == base.string());
+    // rebuilding from such a copy keeps the first source and drops the old trailer
+    log.clear();
+    CHECK(modpsarc::build((dir / "installed.psarc").string(), plan, (dir / "again.psarc").string(), &log));
+    CHECK(modpsarc::patched_from((dir / "again.psarc").string()) == base.string());
+    CHECK(modpsarc::verify((dir / "again.psarc").string(), &vwhy));
+    CHECK(member(dir / "again.psarc", "big/raw.bin") == pattern(200000, 3, false));
+
     // a plan that changes nothing writes nothing
     modpsarc::Plan none;
     CHECK(modpsarc::plan_add(none, "built/levels/t/shaders.dat.tuid/00000000000000aa.bin", (dir / "m" / "a.bin").string(), &why));
@@ -290,11 +315,11 @@ static int setup(const fs::path& dir)
     return 0;
 }
 
-static std::string hook(const fs::path& p)
+static std::string hook(const fs::path& p, int writing = 0)
 {
     char buf[1024];
     snprintf(buf, sizeof buf, "%s", p.string().c_str());
-    if (g_vfs_override_hook) g_vfs_override_hook(buf, sizeof buf);
+    if (g_vfs_override_hook) g_vfs_override_hook(buf, sizeof buf, writing);
     return buf;
 }
 
@@ -304,6 +329,10 @@ static int hook_test(const fs::path& dir)
     if (!g_vfs_override_hook) return 1;
     const fs::path game = dir / "game" / "PS3_GAME" / "USRDIR";
     const fs::path arc = game / "packed" / "levels" / "t" / "level_cached.psarc";
+    // a write (open for writing, create, truncate, rename, delete) always gets the game's own path
+    CHECK(hook(arc, 1) == arc.string());
+    CHECK(hook(game / "packed" / "plain.bin", 1) == (game / "packed" / "plain.bin").string());
+    CHECK(!fs::exists(dir / "mods" / ".cache"));   // and builds nothing
     CHECK(fs::equivalent(hook(game / "packed" / "plain.bin"), dir / "mods" / "MyMod" / "USRDIR" / "packed" / "plain.bin"));
     CHECK(hook(game / "packed" / "keep.bin") == (game / "packed" / "keep.bin").string());
     const std::string to = hook(arc);
@@ -321,6 +350,8 @@ static int hook_test(const fs::path& dir)
         if (off + len <= s.size()) CHECK(Bytes(s.begin() + off, s.begin() + off + len) == pattern(0x500, 12, false));
     }
     CHECK(read_file(arc) == level_archive());   // the game's own file is never written
+    // the copy is being read: a write to the same game file still goes to the game's file
+    CHECK(hook(arc, 1) == arc.string());
     return 0;
 }
 
@@ -344,6 +375,44 @@ static int rebuild_test(const fs::path& dir)
         CHECK(len == 0x600 && off + len <= s.size());
         if (off + len <= s.size()) CHECK(Bytes(s.begin() + off, s.begin() + off + len) == pattern(0x600, 13, false));
     }
+    return 0;
+}
+
+static fs::path only_copy(const fs::path& dir)
+{
+    fs::path c;
+    int copies = 0;
+    for (const auto& e : fs::directory_iterator(dir / "mods" / ".cache"))
+        if (e.path().extension() == ".psarc") { c = e.path(); copies++; }
+    CHECK(copies == 1);
+    return c;
+}
+
+// The first-start data install of the game copies the archive to /dev_hdd0 (through the patched
+// copy it reads), and an older build of the hook wrote that copy over the cached one, truncating
+// it. A new process: the damaged copy is rebuilt, and the /dev_hdd0 copy resolves to the same
+// cached copy, built from the disc archive (runs after "rebuild").
+static int damaged_test(const fs::path& dir)
+{
+    CHECK(g_vfs_override_hook != nullptr);
+    if (!g_vfs_override_hook) return 1;
+    const fs::path arc = dir / "game" / "PS3_GAME" / "USRDIR" / "packed" / "levels" / "t" / "level_cached.psarc";
+    const fs::path hdd0 = dir / "hdd0" / "game" / "BCES00000" / "USRDIR" / "packed" / "levels" / "t" / "level_cached.psarc";
+    const fs::path copy = only_copy(dir);
+    const Bytes good = read_file(copy);
+    CHECK(good.size() > 4096);
+    write_file(hdd0, good);
+    write_file(copy, Bytes(good.begin(), good.begin() + good.size() / 2));
+    std::string bad;
+    CHECK(!modpsarc::verify(copy.string(), &bad));
+
+    const std::string to = hook(hdd0);
+    CHECK(fs::exists(to) && fs::equivalent(to, copy));
+    CHECK(modpsarc::verify(to, &bad));
+    CHECK(read_file(to) == good);
+    CHECK(only_copy(dir) == copy);
+    CHECK(hook(hdd0, 1) == hdd0.string());
+    CHECK(read_file(arc) == level_archive());
     return 0;
 }
 
@@ -425,9 +494,10 @@ int main(int argc, char** argv)
     else if (mode == "setup" && argc > 2) r = setup(fs::absolute(argv[2]));
     else if (mode == "hook" && argc > 2) r = hook_test(fs::absolute(argv[2]));
     else if (mode == "rebuild" && argc > 2) r = rebuild_test(fs::absolute(argv[2]));
+    else if (mode == "damaged" && argc > 2) r = damaged_test(fs::absolute(argv[2]));
     else if (mode == "nohook") CHECK(g_vfs_override_hook == nullptr);
     else if (mode == "real" && argc > 2) r = real(argv[2]);
-    else { fprintf(stderr, "usage: mods_psarc_test unit|setup <dir>|hook <dir>|nohook|real <archive>\n"); return 2; }
+    else { fprintf(stderr, "usage: mods_psarc_test unit|setup <dir>|hook <dir>|rebuild <dir>|damaged <dir>|nohook|real <archive>\n"); return 2; }
     if (r == 77) return 77;
     printf("%s: %s (%d failure(s))\n", mode.c_str(), g_fail || r ? "FAILED" : "ok", g_fail);
     return g_fail || r ? 1 : 0;

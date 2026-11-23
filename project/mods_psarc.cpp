@@ -8,7 +8,8 @@
 //
 // Rebuilt archive: same header and entries, the block table grows by the appended blocks,
 // the old data region is copied as is (its offsets shift by the table growth), and changed
-// members get new blocks after it.
+// members get new blocks after it. Then a trailer naming the archive it was built from:
+// {path bytes, u32 path length, "MODPSRC1"} (PSARC readers never look past the data).
 #include "mods_psarc.h"
 #include "miniz.h"
 #include <algorithm>
@@ -24,7 +25,9 @@ namespace fs = std::filesystem;
 namespace modpsarc {
 namespace {
 
-constexpr uint32_t kFormat = 1;   // bump when the rebuilt archive layout changes (renames cached archives)
+constexpr uint32_t kFormat = 2;   // bump when the rebuilt archive layout changes (renames cached archives)
+constexpr char kTrailerMagic[8] = { 'M', 'O', 'D', 'P', 'S', 'R', 'C', '1' };
+constexpr uint32_t kTrailerMaxPath = 4096;
 
 uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 uint64_t be40(const uint8_t* p) { return (uint64_t)p[0] << 32 | be32(p + 1); }
@@ -178,6 +181,19 @@ struct Archive {
 // IGHW section table: {id, offset, total bytes}.
 struct Section { uint32_t id, offset, bytes; };
 
+// The source trailer build() appends: its length (0 = none) and the path it names.
+uint64_t read_trailer(File& f, uint64_t file_size, std::string& from)
+{
+    uint8_t tail[12];
+    if (!f.f || file_size < 32 + sizeof tail || !f.seek(file_size - sizeof tail) || !f.read(tail, sizeof tail)) return 0;
+    if (memcmp(tail + 4, kTrailerMagic, sizeof kTrailerMagic)) return 0;
+    const uint32_t n = be32(tail);
+    if (!n || n > kTrailerMaxPath || n + sizeof tail + 32 > file_size) return 0;
+    from.resize(n);
+    if (!f.seek(file_size - sizeof tail - n) || !f.read(&from[0], n)) { from.clear(); return 0; }
+    return n + sizeof tail;
+}
+
 bool ighw_sections(const std::vector<uint8_t>& b, std::vector<Section>& out)
 {
     if (b.size() < 0x20 || memcmp(b.data(), "IGHW", 4) || (b[4] == 0 && b[5] == 0)) return false;   // version 0 (R1) has another layout
@@ -303,6 +319,38 @@ bool read_member(const std::string& archive, const std::string& member, std::vec
     return i > 0 && a.read_entry(i, data);
 }
 
+bool verify(const std::string& archive, std::string* why)
+{
+    Archive a(archive);
+    if (!a.open()) { if (why) *why = a.error; return false; }
+    for (size_t i = 0; i < a.entries.size(); i++) {
+        const Entry& e = a.entries[i];
+        uint64_t stored = 0, done = 0;
+        for (uint64_t b = e.block; done < e.size; b++) {
+            if (b >= a.blocks.size()) { if (why) *why = "entry " + std::to_string(i) + ": block index out of range"; return false; }
+            stored += a.blocks[(size_t)b] ? a.blocks[(size_t)b] : a.block_size;
+            done += a.block_size;
+        }
+        if (e.size && (e.offset < a.toc_len || e.offset + stored > a.file_size)) {
+            if (why) *why = "entry " + std::to_string(i) + " ends at byte " + std::to_string(e.offset + stored) +
+                            ", past the end of the file (" + std::to_string(a.file_size) + " bytes): truncated";
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string patched_from(const std::string& archive)
+{
+    File f(archive, "r");
+    if (!f.f) return std::string();
+    _fseeki64(f.f, 0, SEEK_END);
+    const long long n = _ftelli64(f.f);
+    std::string from;
+    if (n <= 0 || !read_trailer(f, (uint64_t)n, from)) return std::string();
+    return from;
+}
+
 bool build(const std::string& base, const Plan& plan, const std::string& out, std::string* log)
 {
     Archive a(base);
@@ -345,8 +393,8 @@ bool build(const std::string& base, const Plan& plan, const std::string& out, st
         const uint32_t off = be32(&(*al)[(size_t)at + 8]), len = be32(&(*al)[(size_t)at + 12]);
         if ((uint64_t)off + len > dat->size()) { say(log, "  " + what + ": lookup entry points outside the file, skipped"); continue; }
         if (blob.size() <= len) {
-            memcpy(&(*dat)[off], blob.data(), blob.size());
-            memset(&(*dat)[off + blob.size()], 0, len - blob.size());
+            memcpy(dat->data() + off, blob.data(), blob.size());
+            memset(dat->data() + off + blob.size(), 0, len - blob.size());   // may end at dat->size()
             put32(&(*al)[(size_t)at + 12], (uint32_t)blob.size());
             say(log, "  " + what + " <- " + t.file + " (in place)");
         } else {
@@ -408,10 +456,15 @@ bool build(const std::string& base, const Plan& plan, const std::string& out, st
     }
 
     const uint64_t old_toc = a.toc_len;
+    // a base that is itself a rebuilt copy: its trailer is dropped and its source carried over
+    std::string source;
+    const uint64_t old_trailer = read_trailer(a.file, a.file_size, source);
+    if (!old_trailer) source = base;
+    const uint64_t old_end = a.file_size - old_trailer;
     const uint64_t new_toc = 32 + a.entry_bytes.size() + (a.blocks.size() + new_sizes.size()) * (uint64_t)a.width;
     const uint64_t delta = new_toc - (32 + a.entry_bytes.size() + a.blocks.size() * (uint64_t)a.width);
     const uint64_t new_toc_len = old_toc + delta;
-    const uint64_t data_end = a.file_size + delta;
+    const uint64_t data_end = old_end + delta;
     if (data_end + new_data.size() > 0xFFFFFFFFFFull) { say(log, "  archive too large"); return false; }
 
     std::vector<uint8_t> head(a.header, a.header + 32);
@@ -440,12 +493,17 @@ bool build(const std::string& base, const Plan& plan, const std::string& out, st
         bool ok = o.f && o.write(head.data(), head.size()) && o.write(ents.data(), ents.size()) &&
                   o.write(table.data(), table.size()) && o.write(gap.data(), gap.size()) && a.file.seek(old_toc);
         std::vector<uint8_t> buf(1 << 20);
-        for (uint64_t left = a.file_size - old_toc; ok && left;) {
+        for (uint64_t left = old_end - old_toc; ok && left;) {
             const size_t n = (size_t)std::min<uint64_t>(buf.size(), left);
             ok = a.file.read(buf.data(), n) && o.write(buf.data(), n);
             left -= n;
         }
         ok = ok && o.write(new_data.data(), new_data.size());
+        if (source.size() <= kTrailerMaxPath) {
+            uint8_t len[4];
+            put32(len, (uint32_t)source.size());
+            ok = ok && o.write(source.data(), source.size()) && o.write(len, 4) && o.write(kTrailerMagic, sizeof kTrailerMagic);
+        }
         if (o.f && fclose(o.f)) ok = false;
         o.f = nullptr;
         if (!ok) { fs::remove(fs::path(tmp), ec); say(log, "  cannot write " + tmp); return false; }
