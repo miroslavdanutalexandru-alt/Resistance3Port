@@ -608,7 +608,27 @@ if ($CheckOnly) {
     try { Stop-Transcript | Out-Null } catch {}
     exit $(if ($script:Chk.Errors) { 1 } else { 0 })
 }
+# What step 4 will generate (tools\build_doctor.ps1 keeps hashes of the generator's inputs in recompiled\.generator_inputs,
+# one for the PPU code (recompiled\, 10-25 minutes) and one for the SPU code (project\spu\, about a minute)): Ppu / Spu,
+# Why, Legacy (see Get-GenPlan), Stages = the generator's progress stages that will run. R3_REGEN=1 forces both, =spu / =ppu one.
+$GenScript = 'r3_regen.py'; $GenSpuScript = 'r3_spu.py'
+function Get-R3GenWork {
+    $genNew = (-not (Test-Path (Join-Path $Port 'recompiled\ppu_recomp.h'))) -or (-not (Test-Path (Join-Path $Port 'project\spu\jobmods_register.c')))
+    $p = Get-GenPlan $Port $GenScript $GenSpuScript
+    if ($genNew) { $p.Ppu = $p.Spu = $true; $p.Why = 'new' }
+    elseif ($env:R3_REGEN) {
+        $p.Why = 'forced'
+        $p.Ppu = $p.Ppu -or ($env:R3_REGEN -ne 'spu'); $p.Spu = $p.Spu -or ($env:R3_REGEN -ne 'ppu')
+    }
+    $stages = @()
+    if ($p.Ppu) { $stages += 'ppu_analyze', 'ppu_lift', 'ppu_emit', 'ppu_post', 'ppu_hooks', 'ppu_copy' }
+    if ($p.Spu) { $stages += 'spu_lift', 'spu_jobmods', 'spu_post', 'spu_copy' }
+    $p | Add-Member -NotePropertyName Stages -NotePropertyValue $stages -Force
+    $p
+}
 Initialize-SpProgress $Port -Unattended:$Unattended
+$genWork = Get-R3GenWork
+Set-SpGenPlan $genWork.Stages -Full:($genWork.Ppu -and $genWork.Spu)
 if ($GetSdks) {
     # The optional SDKs after the install: download what is missing, then build again. build.bat configures RPCS3's
     # renderer every time, which is when it looks for the SDKs, so only the files that use them are compiled again.
@@ -776,17 +796,10 @@ Info "EBOOT.elf: OK (BCUS98176 v1.00)"
 # ---------------------------------------------------------------- 4. game code
 Step "4/5  Generating the game code from your copy"
 # Generated again when it is missing, when forced, or when the code generator (its scripts, hooks and the lifter)
-# changed since it was generated: tools\build_doctor.ps1 keeps hashes of those files in recompiled\.generator_inputs,
-# one for the PPU code (recompiled\, 10-25 minutes) and one for the SPU code (project\spu\, about a minute), so an
-# update that only changes the SPU half regenerates (and rebuilds) only that. R3_REGEN=1 forces both, =spu / =ppu one.
-$GenScript = 'r3_regen.py'; $GenSpuScript = 'r3_spu.py'
-$genNew = (-not (Test-Path (Join-Path $Port 'recompiled\ppu_recomp.h'))) -or (-not (Test-Path (Join-Path $Port 'project\spu\jobmods_register.c')))
-$genPlan = Get-GenPlan $Port $GenScript $GenSpuScript
-if ($genNew) { $genPlan.Ppu = $genPlan.Spu = $true; $genPlan.Why = 'new' }
-elseif ($env:R3_REGEN) {
-    $genPlan.Why = 'forced'
-    $genPlan.Ppu = $genPlan.Ppu -or ($env:R3_REGEN -ne 'spu'); $genPlan.Spu = $genPlan.Spu -or ($env:R3_REGEN -ne 'ppu')
-}
+# changed since it was generated; an update that only changes the SPU half regenerates (and rebuilds) only that
+# (Get-R3GenWork, again now: steps 1-3 may have just extracted the game).
+$genPlan = Get-R3GenWork
+Set-SpGenPlan $genPlan.Stages -Full:($genPlan.Ppu -and $genPlan.Spu)
 if ($genPlan.Ppu -or $genPlan.Spu) {
     $genOnly = if (-not $genPlan.Ppu) { 'spu' } elseif (-not $genPlan.Spu) { 'ppu' } else { '' }
     switch ($genPlan.Why) {
@@ -803,15 +816,12 @@ if ($genPlan.Ppu -or $genPlan.Spu) {
     # the halves being generated are marked unfinished first: a run that stops half way generates them again next time
     Save-GenStamp $Port $GenScript -SpuScript $GenSpuScript -PpuPending:$genPlan.Ppu -SpuPending:$genPlan.Spu
     $genArgs = 'tools\r3_regen.py --eboot game\EBOOT.elf' + $(if ($genOnly) { " --only $genOnly" })
-    $genStages = @()
-    if ($genPlan.Ppu) { $genStages += 'ppu_analyze', 'ppu_lift', 'ppu_emit', 'ppu_post', 'ppu_hooks', 'ppu_copy' }
-    if ($genPlan.Spu) { $genStages += 'spu_lift', 'spu_jobmods', 'spu_post', 'spu_copy' }
-    $code = Invoke-SpRegen $py $genArgs $genStages
+    $code = Invoke-SpRegen $py $genArgs $genPlan.Stages
     if ($code -ne 0) { Fail "Generating the game code failed (see the messages above)." }
     if ($genSnap.Count) { $g = Restore-GenTimes $Port $GenDirs $genSnap; Info ("Generated files: {0} changed, {1} unchanged." -f $g.Changed, $g.Kept) }
     Save-GenStamp $Port $GenScript -SpuScript $GenSpuScript
 } else {
-    Set-SpEstimate 'gen' 1; Info "Already generated (set R3_REGEN=1 to force)."
+    Info "Already generated (set R3_REGEN=1 to force)."
     if ($genPlan.Legacy) { Save-GenStamp $Port $GenScript -SpuScript $GenSpuScript }   # the earlier version's record, in this version's format
 }
 
