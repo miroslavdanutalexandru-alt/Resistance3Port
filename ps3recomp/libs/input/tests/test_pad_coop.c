@@ -46,7 +46,7 @@ static void plug(int slot, int on, u16 buttons)
 
 static void test_two_controllers_and_hotplug(void)
 {
-    reset("", "", "", "");
+    reset("1", "", "", "");
     plug(0, 1, CELL_PAD_CTRL_CROSS);
     plug(1, 1, CELL_PAD_CTRL_START);
     pad_map_slots(s_xs, 4);
@@ -104,6 +104,39 @@ static void test_coop_off(void)
     assert(pad_host_port(0) == 0 && pad_port_on(0) && !pad_port_on(1));
 }
 
+/* Default (PAD_COOP unset): one player, whatever is plugged in. A second
+ * controller -- or a tool's virtual copy of the first one, pressing the same
+ * START -- never connects port 1, so the game can't start split screen. */
+static void test_default_single_player(void)
+{
+    reset("", "", "", "");
+    plug(0, 1, 0); plug(1, 1, 0);
+    pad_map_slots(s_xs, 4);
+    assert(s_port_slot[0] == 0 && s_port_slot[1] == -1 && !pad_port_on(1));
+    plug(0, 1, CELL_PAD_CTRL_START); plug(1, 1, CELL_PAD_CTRL_START);   /* mirrored pads */
+    pad_map_slots(s_xs, 4);
+    assert(s_port_slot[0] == 0 && !pad_port_on(1) && pad_port_status(1, pad_port_on(1)) == CELL_PAD_STATUS_DISCONNECTED);
+    /* Player 1 follows the controller that is used while the current one is idle ... */
+    plug(0, 1, 0); plug(1, 1, CELL_PAD_CTRL_CROSS);
+    pad_map_slots(s_xs, 4);
+    assert(s_port_slot[0] == 1 && s_host_state[0].buttons == CELL_PAD_CTRL_CROSS);
+    /* ... resting stick drift doesn't count, a stick pushed far does ... */
+    plug(1, 1, 0); s_xs[0].analog_lx = 150;
+    pad_map_slots(s_xs, 4);
+    assert(s_port_slot[0] == 1);
+    s_xs[0].analog_lx = 250;
+    pad_map_slots(s_xs, 4);
+    assert(s_port_slot[0] == 0);
+    /* ... and both pads busy at once (a mirror) doesn't make it flip. */
+    plug(0, 1, CELL_PAD_CTRL_UP); plug(1, 1, CELL_PAD_CTRL_UP);
+    pad_map_slots(s_xs, 4);
+    assert(s_port_slot[0] == 0);
+    /* The controller is unplugged: the other one takes over. */
+    plug(0, 0, 0); plug(1, 1, 0);
+    pad_map_slots(s_xs, 4);
+    assert(s_port_slot[0] == 1 && pad_port_on(0) && !pad_port_on(1));
+}
+
 static void test_p2_keyboard(void)
 {
     reset("", "", "", "1");
@@ -124,9 +157,11 @@ static void test_p2_keyboard(void)
 
 int main(void)
 {
+    _putenv_s("PAD_BACKGROUND_INPUT", "1");   /* no game window here: keep the pads live */
     test_two_controllers_and_hotplug();
     test_chosen_controllers();
     test_coop_off();
+    test_default_single_player();
     test_p2_keyboard();
     printf("test_pad_coop: all passed\n");
     return 0;

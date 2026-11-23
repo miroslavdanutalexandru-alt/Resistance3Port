@@ -173,6 +173,8 @@ static inline void padg_rate_to_stick(double yaw_dps, double pitch_dps, double f
  * PlayStation or Nintendo pad is connected) is held back and compared with
  * the real pad: if it keeps mirroring the real pad's input it is a ghost and
  * ignored; once it does something the real pad did not, it is a controller.
+ * The same check runs for any pad that connects while another one is already
+ * playing (DSX's virtual DualShock 4, Steam Input), against every playing pad.
  * -------------------------------------------------------------------------*/
 #define PADD_HIST 48   /* the other pad's last ~50-90 ms of states (one per input-thread pass) */
 
