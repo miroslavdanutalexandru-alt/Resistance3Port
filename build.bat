@@ -84,7 +84,7 @@ rem The exe already needs AVX2 (lifted code); set PORT_RSX_ARCH=generic / PORT_R
 if not defined PORT_RSX_ARCH set "PORT_RSX_ARCH=AVX2"
 set "RSXLTO=ON"
 if "%PORT_RSX_LTO%"=="0" set "RSXLTO=OFF"
-cmake -S ps3recomp\third_party\rpcs3 -B build_rpcs3 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRPCS3_RSX_BUILD_LINKTEST=OFF -DENABLE_HLSL=ON -DRPCS3_RSX_ARCH=%PORT_RSX_ARCH% -DRPCS3_RSX_LTO=%RSXLTO% -DRPCS3_RSX_GS_OFF=ON -DRPCS3_RSX_PGO=%PGOMODE% "-DRPCS3_RSX_PGO_PROFILE=%PGOPROF%" > logs\configure_rpcs3.log 2>&1
+cmake -S ps3recomp\third_party\rpcs3 -B build_rpcs3 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRPCS3_RSX_BUILD_LINKTEST=OFF -DENABLE_HLSL=ON -DRPCS3_RSX_ARCH=%PORT_RSX_ARCH% -DRPCS3_RSX_LTO=%RSXLTO% -DRPCS3_RSX_GS_OFF=ON -DRPCS3_RSX_PGO=%PGOMODE% "-DRPCS3_RSX_PGO_PROFILE=%PGOPROF%" "-DCMAKE_PROJECT_INCLUDE=%~dp0tools\rpcs3_sdk_deps.cmake" > logs\configure_rpcs3.log 2>&1
 if errorlevel 1 (echo RPCS3 RSX configure FAILED - see logs\configure_rpcs3.log & goto fail)
 cmake --build build_rpcs3 -j %RPCS3_JOBS% --target rpcs3_rsx > logs\build_rpcs3.log 2>&1
 if errorlevel 1 (echo RPCS3 RSX build FAILED - see logs\build_rpcs3.log & goto fail)

@@ -1,0 +1,6 @@
+# Generator stamps written by earlier Setup versions (one hash over every generator input) and the split PPU / SPU
+# stamp each one equals, so an update only generates the half that really changed. ppu=- / spu=- = generate that half.
+# 0.3.0-beta.1 (the PPU code it generated is byte-identical to the current generator's; SPU tables changed since):
+592ba8d6569097f82b9346b0bda175d77a13c7e8271253bb0c162b1a308bc9d9 ppu=4556b7d04b9431ce557a49e0889e26984fc76a2d0c18b09ca1262dccf39fe2b2 spu=-
+# 0.3.0-beta.1 plus the IGJOB_EXTRA table (written by an earlier Setup from the main branch):
+422ea480f8044cc864df5f65a40e3e5e8332d35b3047172c85151e7ce569161a ppu=4556b7d04b9431ce557a49e0889e26984fc76a2d0c18b09ca1262dccf39fe2b2 spu=-
