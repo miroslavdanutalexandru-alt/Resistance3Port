@@ -277,15 +277,37 @@ static DWORD s_place_walker_tid = 0;
 /* PORT_RSX_PRIO=1 (the low profile's default below 8 logical CPUs; 0 = off): rsx::thread at ABOVE_NORMAL
  * (never lowered). On a 4-core / 4-thread CPU (R3 #33, i5-7300HQ) it ran only 55-77% of the time it was
  * busy: the SPURS lanes, the RSX Offloader and the guest threads at the same priority took its core
- * while the main thread waited for it. */
+ * while the main thread waited for it. rsx::thread::on_task sets its own priority after the Vulkan start-up
+ * (scoped_priority(ps3_host_prio_boost() ? +1 : 0) = NORMAL with PS3_PRIO_BOOST=0), so the keeper checks it
+ * again on every pass (port_rsx_prio_keep) and raises it back. */
+static DWORD s_rsx_tid = 0;
 static void port_rsx_prio_raise(HANDLE h, DWORD tid)
 {
+    static long s_raises = 0;
     if (!s_rsx_prio) return;
     const int cur = GetThreadPriority(h);
     if (cur == THREAD_PRIORITY_ERROR_RETURN || cur >= THREAD_PRIORITY_ABOVE_NORMAL) return;
     const BOOL ok = SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
-    fprintf(stderr, "[cpu] rsx::thread (thread %lu): priority above normal %s (PORT_RSX_PRIO; 0 = off)\n",
-            (unsigned long)tid, ok ? "ok" : "FAILED");
+    const long n = ++s_raises;
+    if (n <= 4 || !(n & (n - 1)))
+        fprintf(stderr, "[cpu] rsx::thread (thread %lu): priority above normal %s%s (raise %ld; PORT_RSX_PRIO; 0 = off)\n",
+                (unsigned long)tid, ok ? "ok" : "FAILED", tid == s_rsx_tid ? ", re-raised after reset" : "", n);
+    s_rsx_tid = tid;
+}
+
+/* every keeper pass: the remembered rsx::thread, if it is still that thread (tids are reused) */
+static void port_rsx_prio_keep(void)
+{
+    typedef HRESULT (WINAPI *gtd_t)(HANDLE, PWSTR*);
+    static gtd_t gtd = (gtd_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    if (!s_rsx_prio || !s_rsx_tid || !gtd) return;
+    HANDLE h = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, s_rsx_tid);
+    if (!h) { s_rsx_tid = 0; return; }
+    PWSTR d = NULL;
+    if (SUCCEEDED(gtd(h, &d)) && d && !wcscmp(d, L"rsx::thread")) port_rsx_prio_raise(h, s_rsx_tid);
+    else s_rsx_tid = 0;
+    if (d) LocalFree(d);
+    CloseHandle(h);
 }
 
 /* Applies placement to threads that appear later: the RSX engine thread
@@ -394,7 +416,7 @@ static DWORD WINAPI port_place_keeper(LPVOID)
                                                   PORT_PCORE_FIFO, 0, PORT_PCORE_PRIO);
                         /* RPCS3 RSX mode: rsx::thread is the RSX thread (no engine tid) */
                         if (s_place_audio && !wcscmp(d, L"rsx::thread") && !et) port_place_hot(h, PORT_ROLE_ENGINE);
-                        if (!wcscmp(d, L"rsx::thread")) port_rsx_prio_raise(h, te.th32ThreadID);
+                        if (!wcscmp(d, L"rsx::thread")) { port_rsx_prio_raise(h, te.th32ThreadID); s_rsx_tid = te.th32ThreadID; }
                     }
                     else if (!wcscmp(d, L"cellAudio mixer"))
                         port_pcore_place_role(hp, te.th32ThreadID, "audio mixer", PORT_PCORE_AUDIO, 0, 0);
@@ -406,6 +428,7 @@ static DWORD WINAPI port_place_keeper(LPVOID)
             } while (Thread32Next(snap, &te));
         }
         if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+        port_rsx_prio_keep();
         quiet = fresh ? 0 : quiet + 1;
         Sleep(quiet >= 5 ? idle_ms : 2000);
     }
