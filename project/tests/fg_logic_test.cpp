@@ -221,6 +221,36 @@ static void test_gate()
 }
 
 #ifndef PFG_R1
+// R?_DLSS_FG_GAP: a 1-2 frame scene gap mid-play resumes without the warm-up, longer gaps / short streaks warm up
+static unsigned gap_run(unsigned streak_before, int gap_frames, unsigned max_gap, unsigned* gap)
+{
+	unsigned s = 0;
+	*gap = 0;
+	for (unsigned i = 0; i < streak_before; ++i) s = pfg_streak_gap(s, 1, gap, max_gap);
+	for (int i = 0; i < gap_frames; ++i) s = pfg_streak_gap(s, 0, gap, max_gap);
+	return pfg_streak_gap(s, 1, gap, max_gap);
+}
+
+static void test_gap()
+{
+	unsigned gap = 0;
+	CHECK(gap_run(20, 1, 2, &gap) == PFG_WARMUP_FRAMES && gap == 0);
+	CHECK(gap_run(PFG_GAP_MIN_STREAK, 2, 2, &gap) == PFG_WARMUP_FRAMES);
+	CHECK(gap_run(20, 3, 2, &gap) == 1 && gap == 0);           // loading / movie: warm up
+	CHECK(gap_run(PFG_GAP_MIN_STREAK - 1, 1, 2, &gap) == 1);  // flickering scene: warm up
+	CHECK(gap_run(20, 1, 0, &gap) == 1);                       // R?_DLSS_FG_GAP=0: old behaviour
+	CHECK(gap_run(20, 40, 2, &gap) == 1 && gap == 0);
+	// a second gap right after a bridged one is not bridged (streak restarted at the warm-up length)
+	unsigned s = gap_run(20, 1, 2, &gap);
+	s = pfg_streak_gap(s, 0, &gap, 2);
+	CHECK(s == 0 && gap == 0);
+	CHECK(pfg_streak_gap(s, 1, &gap, 2) == 1);
+	// with max_gap 0 it matches pfg_streak
+	unsigned a = 0, b = 0;
+	gap = 0;
+	for (int i = 0; i < 30; ++i) { const int sc = (i % 7) != 3; a = pfg_streak(a, sc); b = pfg_streak_gap(b, sc, &gap, 0); CHECK(a == b); }
+}
+
 // RSX_DLSS_OBJMV_DEFORM capture policy (VKR2DeformLogic.h, VKR2Upscaler.cpp om2 record path)
 static void test_deform()
 {
@@ -406,6 +436,7 @@ int main()
 	test_hold();
 	test_gate();
 #ifndef PFG_R1
+	test_gap();
 	test_deform();
 	test_vp_pick();
 	test_pair_nearest();

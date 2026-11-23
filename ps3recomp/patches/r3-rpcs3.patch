@@ -18493,10 +18493,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..ef0b244
+index 0000000..1257900
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2631 @@
+@@ -0,0 +1,2641 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -18613,6 +18613,7 @@ index 0000000..ef0b244
 +		bool cam_ident = false; // R2_DLSS_FG_CAM_IDENT=1: identity clipToPrevClip (R1's constants; the vectors carry all motion)
 +		float depth_sep = 40.f; // R2_DLSS_FG_DEPTH_SEP: minRelativeLinearDepthObjectSeparation (Streamline default 40)
 +		int limit_fps = 0; // R2_DLSS_FG_LIMIT_FPS: cap on presented fps with DLSS-G on (0 = refresh-based cap); evens out an uneven base rate
++		unsigned gap = 2; // R?_DLSS_FG_GAP: scene-less frames mid-play that resume without the warm-up (pfg_streak_gap; 0 = old)
 +		int pace = PFG_PACE_VRR; // FSR 3 present pacer (PORT_FG_PACE)
 +	};
 +
@@ -18644,6 +18645,7 @@ index 0000000..ef0b244
 +			r.cap = penv_int("DLSS_FG_CAP", 1) != 0;
 +			r.yflip = penv_int("DLSS_FG_YFLIP", 1) != 0;
 +			r.cut_reset = penv_int("DLSS_FG_CUT_RESET", 1);
++			r.gap = static_cast<unsigned>(std::clamp(penv_int("DLSS_FG_GAP", 2), 0, 8));
 +			r.cam_ident = penv_int("DLSS_FG_CAM_IDENT", 0) != 0;
 +		r.limit_fps = std::clamp(penv_int("DLSS_FG_LIMIT_FPS", 0), 0, 1000);
 +		if (r.limit_fps) std::fprintf(stderr, "[fg-vk] DLSS_FG_LIMIT_FPS=%d (presented frames)\n", r.limit_fps);
@@ -19645,6 +19647,7 @@ index 0000000..ef0b244
 +		double T[16] = {};
 +		image_ptr depth, mv;
 +		u32 streak = 0;            // consecutive frames with a tagged scene
++		unsigned gap = 0;          // scene-less frames after a long streak (pfg_streak_gap)
 +
 +		// HUD classifier (r2fg_on_draw)
 +		bool hud_started = false;
@@ -19902,7 +19905,14 @@ index 0000000..ef0b244
 +	{
 +		auto& f = g_fg;
 +		f.want_on = false;
-+		f.streak = pfg_streak(f.streak, f.scene);
++		const unsigned gap_was = f.gap;
++		f.streak = pfg_streak_gap(f.streak, f.scene, &f.gap, fgcfg().gap);
++		if (f.scene && gap_was && f.streak == PFG_WARMUP_FRAMES && fg_usable())
++		{
++			static u32 bridged = 0;
++			if (++bridged <= 4 || (bridged % 100) == 0)
++				fglog("frame generation: %u-frame scene gap bridged without the warm-up (%u so far; R3_DLSS_FG_GAP=0 restores it)", gap_was, bridged);
++		}
 +		if (f.bad_status_frames) f.bad_status_frames--;
 +		if (!fg_usable()) return;
 +		f.mult = fx_usable() ? 2u : std::min<u32>(fgcfg().want, g_sl.max_mult);
@@ -21208,10 +21218,10 @@ index 0000000..1c8fd36
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
 new file mode 100644
-index 0000000..b3417eb
+index 0000000..fc62095
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,186 @@
 +/* R2PORT: Resistance 1/2/3 port addition (not upstream RPCS3).
 + * Frame generation decisions without any graphics API: the PORT_FG / PORT_FG_HUDLESS / PORT_FG_PACE selectors,
 + * the FSR 3 present pacer, the Reflex frame cap, the FSR 3 enable hold and the per-frame on/off gate.
@@ -21365,6 +21375,23 @@ index 0000000..b3417eb
 +} pfg_gate_in;
 +
 +static inline unsigned pfg_streak(unsigned streak, int scene) { return scene ? streak + 1u : 0u; }
++
++/* R?_DLSS_FG_GAP (default 2): a scene-less gap of at most max_gap frames right after at least PFG_GAP_MIN_STREAK scene
++   frames (the upscaler skipping one frame mid-play) resumes without the warm-up; the resume still resets the history.
++   *gap: scene-less frames since such a streak (0 = none). The bridged streak restarts at PFG_WARMUP_FRAMES, so a
++   second gap soon after warms up as before. max_gap 0 = always warm up (old pfg_streak). */
++#define PFG_GAP_MIN_STREAK 8u
++static inline unsigned pfg_streak_gap(unsigned streak, int scene, unsigned* gap, unsigned max_gap)
++{
++    if (!scene)
++    {
++        *gap = streak >= PFG_GAP_MIN_STREAK ? 1u : (*gap && *gap < max_gap) ? *gap + 1u : 0u;
++        return 0u;
++    }
++    const int bridge = *gap && *gap <= max_gap;
++    *gap = 0u;
++    return bridge ? PFG_WARMUP_FRAMES : streak + 1u;
++}
 +
 +static inline int pfg_gate(const pfg_gate_in* g)
 +{
