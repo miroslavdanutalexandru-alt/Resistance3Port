@@ -1,5 +1,5 @@
 # shaderscan release used by this port: https://github.com/miroslavdanutalexandru-alt/shaderscan (GPL-2.0-only)
 # Read by tools\get_shaderscan.ps1 (run by build.bat and so by Setup). To update: change all three lines.
-version=v1.0.1
-url=https://github.com/miroslavdanutalexandru-alt/shaderscan/releases/download/v1.0.1/shaderscan.exe
-sha256=a42135e71e444dd2dee88739156feca0e2c943f3223ab388330b62c0cc9b326d
+version=v1.0.2
+url=https://github.com/miroslavdanutalexandru-alt/shaderscan/releases/download/v1.0.2/shaderscan.exe
+sha256=75096547c4fc07300b2c2d5d76e7b2bc67d1f3b9a7339f704b63d04f48c56387
