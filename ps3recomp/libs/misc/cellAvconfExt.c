@@ -32,10 +32,34 @@ static float s_gamma = 1.0f;
  * API implementations
  * -----------------------------------------------------------------------*/
 
+/* PC port: the launcher's "Speaker layout" (PORT_SPEAKERS = 2 / 6 / 8, unset = 6).
+ * Resistance 3 picks its mix layout from the highest channel count reported
+ * below for coding types 0 / 1 / 6 (func_008140D4 area: Configure with it; its
+ * sound setup then mixes for that many speakers), so this is what
+ * makes the option take effect -- there is no game hook for it (as R2 #12). */
+static u32 port_speaker_channels(void)
+{
+    static int sp = -1;
+    if (sp < 0) {
+        const char* e = getenv("PORT_SPEAKERS");
+        sp = e ? atoi(e) : 6;
+        if (sp != 2 && sp != 6 && sp != 8) sp = 6;
+        if (sp != 6) printf("[cellAvconfExt] speaker layout: %d channels (PORT_SPEAKERS)\n", sp);
+    }
+    return (u32)sp;
+}
+
 s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
 {
     (void)audioOut;
     (void)option;
+    const u32 sp = port_speaker_channels();
+    if (sp != 6) {
+        if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM && (fs & CELL_AUDIO_OUT_FS_48KHZ)) return sp;
+        if (sp == CELL_AUDIO_OUT_CHNUM_2 && (type == CELL_AUDIO_OUT_CODING_TYPE_AC3 ||
+                                            type == CELL_AUDIO_OUT_CODING_TYPE_DTS))
+            return CELL_AUDIO_OUT_CHNUM_2;
+    }
 
     /* Report the SAME capability set a real PS3/RPCS3 reports, not just stereo.
      * Golden trace (RPCS3.log, real YDKJ boot) shows:
@@ -218,7 +242,12 @@ float cellAvconfExt_display_gamma(void)
  * the title queries availability separately. NID 0x4692AB35. */
 s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
 {
-    (void)config; (void)option; (void)waitForEvent;
-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    (void)option; (void)waitForEvent;
+    const uint32_t cea = (uint32_t)(uintptr_t)config;
+    if (cea)   /* CellAudioOutConfiguration: u8 channel, u8 encoder, ... */
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u, %u ch, encoder %u) -> ok\n",
+               audioOut, (unsigned)vm_read8(cea), (unsigned)vm_read8(cea + 1));
+    else
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
     return 0;
 }

@@ -1272,6 +1272,17 @@ static void audio_mix_one_block(void)
 
     mutex_unlock(&s_audio_mutex);
 
+    /* NaN / Inf from a port (a guest mixer channel the stereo fold pulls in)
+     * would pass the limiter and the clip below and reach the device as
+     * static; zero them and say so (as R2 #12, 5.1 fold). */
+    { static unsigned bad, blocks;
+      for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++)
+          if (!(s_mix_buffer[i] >= -1e4f && s_mix_buffer[i] <= 1e4f)) { s_mix_buffer[i] = 0.0f; bad++; }
+      if (++blocks >= 938u) {   /* ~5 s */
+          if (bad) fprintf(stderr, "[audio] %u non-finite / out-of-range samples zeroed in the last 5 s%c", bad, 10);
+          bad = 0; blocks = 0;
+      } }
+
     /* Resistance port: limiter instead of a bare clip. The 7.1 -> stereo fold
      * above adds centre, LFE and four surrounds into each side (gains summing
      * to ~3), so loud passages -- explosions, a movie's bass line -- went far
