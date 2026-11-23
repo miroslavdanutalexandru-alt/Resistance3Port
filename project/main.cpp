@@ -424,7 +424,7 @@ static long long fc_us(void)
 }
 
 extern "C" void r2pf_toast(const char* title, const char* text, char badge);   /* r3_pcfeat.cpp */
-extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);              /* sys_fs.c: guest path fallbacks */
+extern "C" void ps3_vfs_ps3game_fallback_ex(char* path, size_t cap, int reading);   /* sys_fs.c: guest path fallbacks */
 static DWORD WINAPI frame_clock(LPVOID)
 {
     port_place_walker();
@@ -1034,7 +1034,7 @@ int main(int argc, char** argv)
     /* Game-file preflight: without PARAM.SFO / game.psarc the game sits on a
      * black screen (after the shader preload) instead of saying what is wrong.
      * The paths go through the same translation the game's own opens use
-     * (ps3_vfs_ps3game_fallback: flattened <root>/USRDIR trees, HDD-style
+     * (ps3_vfs_ps3game_fallback_ex: flattened <root>/USRDIR trees, HDD-style
      * game/<id> trees, mods), so only a file the game cannot open either is
      * reported. The dialog offers "start anyway" (the old behaviour).
      * R3_SKIP_FILECHECK=1 skips it. */
@@ -1045,7 +1045,7 @@ int main(int argc, char** argv)
             for (const char* r : k_req) {
                 char p[1200];
                 snprintf(p, sizeof p, "%s/%s", ppu_vfs_root, r);
-                ps3_vfs_ps3game_fallback(p, sizeof p);
+                ps3_vfs_ps3game_fallback_ex(p, sizeof p, 1);   /* a read: mods apply */
                 if (GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES) {
                     char m[1700];
                     snprintf(m, sizeof m, "The game files are incomplete. Missing:\n%s\n\n"
