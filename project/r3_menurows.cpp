@@ -101,6 +101,7 @@ constexpr RowDef k_rows[] = {
     { "fx_filmgrain",  SRC_PCX,     CAT_EFFECTS,  "Film grain" },
     { "colorblind",    SRC_PCX,     CAT_EFFECTS,  "Colour-blind filter" },
     { "mouse_sens",    SRC_PCM,     CAT_CONTROLS, "Mouse sensitivity" },
+    { "aimassist",     SRC_PCX,     CAT_CONTROLS, "Aim assist" },
     { "padglyphs",     SRC_PCM,     CAT_CONTROLS, "Button prompts" },
     { "rumble",        SRC_PCX,     CAT_CONTROLS, "Vibration" },
     { "crosshair",     SRC_PCX,     CAT_CONTROLS, "Crosshair" },

@@ -743,6 +743,9 @@ static void live_trigdz(const std::string& v) { cellpad_set_pad_opt("PAD_TRIGGER
 static void live_turnboost(const std::string& v) { cellpad_set_pad_opt("PAD_TURN_BOOST", v.c_str()); }
 static void live_crouch(const std::string& v) { cellpad_set_pad_opt("PAD_CROUCH_MODE", v.c_str()); }
 static void live_sprint(const std::string& v) { cellpad_set_pad_opt("PAD_SPRINT_MODE", v.c_str()); }
+extern "C" void r3_aim_assist_set(const char* v);   /* stubs.cpp */
+extern "C" void r3_aim_assist_init(void);
+static void live_aimassist(const std::string& v) { r3_aim_assist_set(v.c_str()); }
 extern "C" void cellaudio_set_pc_mix(int volume_pct, int mono);        /* cellAudio.c */
 static void live_volume(const std::string& v) { cellaudio_set_pc_mix(v.empty() ? 100 : pcx_parse_pct(v.c_str(), 100, 0, 100), -1); }
 static void live_mono(const std::string& v) { cellaudio_set_pc_mix(-1, v == "1"); }
@@ -863,6 +866,10 @@ static void opts_init(void)
             "crouchmode", "PAD_CROUCH_MODE", 0, { {L"As the game", ""}, {L"Toggle", "toggle"}, {L"Hold", "hold"} }, "", live_crouch);
     opt_add(L"Sprint button", L"As the game, Toggle or Hold (sprint while held). Experimental.",
             "sprintmode", "PAD_SPRINT_MODE", 0, { {L"As the game", ""}, {L"Toggle", "toggle"}, {L"Hold", "hold"} }, "", live_sprint);
+    r3_aim_assist_init();   /* normalises PORT_AIM_ASSIST (1 / 0 / auto) for the row below */
+    opt_add(L"Aim assist", L"The game's aim assist: your aim slows down over an enemy and is pulled toward it. Auto: off "
+            L"with keyboard & mouse, on with a controller. On: always, as on PS3. Off: never.", "aimassist",
+            "PORT_AIM_ASSIST", 0, { {L"Auto", ""}, {L"On", "on"}, {L"Off", "off"} }, "", live_aimassist);
     opt_add(L"Master volume", L"All game sound, on top of the game's own volume options.", "volume", "PORT_VOLUME", 0,
             { {L"100%", ""}, {L"90%", "90"}, {L"80%", "80"}, {L"70%", "70"}, {L"60%", "60"}, {L"50%", "50"}, {L"40%", "40"},
               {L"30%", "30"}, {L"20%", "20"}, {L"10%", "10"}, {L"Muted", "0"} }, "", live_volume);

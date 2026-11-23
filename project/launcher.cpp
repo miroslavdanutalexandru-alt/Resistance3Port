@@ -452,6 +452,12 @@ static void register_input_options()
                "Hold: aim while the Aim key / left bumper is held (PS3 original). Toggle: press once to aim, again to "
                "stop. Keyboard, mouse and controller.",
                "PAD_AIM_TOGGLE", { {"Hold", ""}, {"Toggle", "1"} }, 0);
+    add_option(SEC_INPUT, "aimassist", "Aim assist",
+               "The game's aim assist: your aim slows down when it passes over an enemy and is pulled toward it. "
+               "Auto turns it off while you play with keyboard & mouse and keeps it with a controller (in split-screen "
+               "only the keyboard & mouse player loses it). On: always, as on PS3. Off: never, also with a controller. "
+               "Also in game: F9 and Options > PC Controls & HUD (changes at once).",
+               "PORT_AIM_ASSIST", { {"Auto (off with mouse, on with controller)", ""}, {"On", "on"}, {"Off", "off"} }, 0);
     add_option(SEC_INPUT, "deadzone", "Stick deadzone",
                "How far a controller stick must move before it counts. Smaller is more responsive; larger hides "
                "stick drift. Default is the XInput standard, applied per axis.",

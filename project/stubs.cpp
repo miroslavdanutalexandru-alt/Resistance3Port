@@ -1657,12 +1657,108 @@ static void r3_note_layout(void)
     g_port_layout_info = info;
     g_port_layout_ea = ea;
 }
+/* Aim assist on/off (PORT_AIM_ASSIST). R3 has no game option for it: the hero
+ * update func_0017BCE8 always applies it to the human players' look rates.
+ *   0x0017C0F8: func_0017A458 turns the right stick into this frame's turn
+ *     rates at sp+0x210 / sp+0x214, stored as they are to hero+0x52C / +0x530.
+ *   0x0017D194..0x0017D880 (entered at 0x0017C214 when the hero has a target): the assist.
+ *     It works out the rates that would track the target (hero+0x640 / +0x660
+ *     against +0x400) and blends the stick rates toward them:
+ *     rate = track + (stick - track) * f, f < 1 over a target (hero.csv
+ *     AimAssistControls, hero+0x10A0..0x10D0: forgiveness, magnetism, less
+ *     while not aiming down the sights (hero+0xA70 == 0), the weapon's
+ *     +0x124 / +0x128), then branches to 0x0017C218 and on to 0x0017C670.
+ * Off: r3_mouselook_pre (hooked at 0x0017C670, before the rates are applied)
+ * puts the stick rates back, for that frame only, so nothing in the game's
+ * memory has to be restored when the assist is turned on again. Rates that are
+ * both 0 are left alone: a scripted look-at (from 0x0017C218) or the multiplayer
+ * sights snap (0x0017C37C) zeroed them and turns the view itself. Only player
+ * heroes run this update; enemies aim with their own code.
+ * PORT_AIM_ASSIST: unset / auto = off for the keyboard & mouse player, on for
+ * a controller; on / 1 = on (as on PS3); off / 0 = off for every player. The
+ * in-game "Aim assist" row changes it live (r3_aim_assist_set, r3_pcextra.cpp). */
+extern "C" int cellpad_kbm_guest_port(void);   /* cellPad.c */
+static volatile int s_aa_mode = -2;   /* -2 not read yet, -1 auto, 0 off, 1 on */
+static int aim_assist_parse(const char* e)
+{
+    if (!e || !*e || !_stricmp(e, "auto")) return -1;
+    if (!_stricmp(e, "on") || !_stricmp(e, "true")) return 1;
+    if (!_stricmp(e, "off") || !_stricmp(e, "false")) return 0;
+    return atoi(e) != 0 ? 1 : 0;
+}
+static void aim_assist_log(int m)
+{
+    fprintf(stderr, "[aimassist] aim assist: %s%c", m < 0 ? "auto (off with keyboard & mouse, on with a controller)"
+                                                : m ? "on (as on PS3)" : "off", 10);
+}
+/* Start-up value, once. PORT_AIM_ASSIST is rewritten to the normalised value ("on" / "off",
+   removed for auto) so the in-game row, which reads it, shows the mode really in use. */
+extern "C" void r3_aim_assist_init(void)
+{
+    static volatile LONG once = 0;
+    if (InterlockedCompareExchange(&once, 1, 0) != 0) return;
+    const int m = aim_assist_parse(getenv("PORT_AIM_ASSIST"));
+    _putenv_s("PORT_AIM_ASSIST", m < 0 ? "" : m ? "on" : "off");
+    if (s_aa_mode == -2) { aim_assist_log(m); s_aa_mode = m; }
+}
+/* live change (in-game row): "" = auto, "on", "off" */
+extern "C" void r3_aim_assist_set(const char* v)
+{
+    r3_aim_assist_init();
+    const int m = aim_assist_parse(v);
+    if (m != s_aa_mode) aim_assist_log(m);
+    s_aa_mode = m;
+}
+/* The guest pad that drives this hero, -1 = unknown. [hero+0x1680] is the player
+ * index; func_00157B3C gets the player's input object as [entry + 0x20], entry =
+ * the player manager ([0x00F0A458], func_00401618) + 8 + index * 0x28 (the table
+ * func_0019B890 / func_0019B8E8 fill). func_0019C1C4 stores the user's pad
+ * (user+0xBC) at input+0x1AB8. The input objects are the 8 of 0x1AC4 bytes from
+ * [0x01069F00] (func_0019D478); anything else is not trusted. */
+static int aim_assist_hero_pad(uint32_t hero)
+{
+    const uint32_t mgr = vm_read32(0x00F0A458u), idx = vm_read32(hero + 0x1680);
+    const uint32_t base = vm_read32(0x01069F00u);
+    if (mgr < 0x10000u || mgr >= 0xF0000000u || idx >= 0x46u || base < 0x10000u || base >= 0xF0000000u) return -1;
+    const uint32_t in = vm_read32(mgr + 8u + idx * 0x28u + 0x20u);
+    if (in < base || (in - base) % 0x1AC4u || (in - base) / 0x1AC4u >= 8u) return -1;
+    const uint32_t pad = vm_read32(in + 0x1AB8);
+    return pad < 8u ? (int)pad : -1;
+}
+static int aim_assist_off(uint32_t hero)
+{
+    if (s_aa_mode == -2) r3_aim_assist_init();
+    const int mode = s_aa_mode;
+    if (mode >= 0) return !mode;
+    const int kp = cellpad_kbm_guest_port();
+    if (kp < 0) return 0;
+    const int pad = aim_assist_hero_pad(hero);
+    { static int last = -2; if (pad != last) { last = pad; static int n = 0;
+        if (n++ < 20) fprintf(stderr, "[aimassist] hero 0x%08X: pad %d (keyboard & mouse: port %d)%c", hero, pad, kp, 10); } }
+    if (pad >= 0) return pad == kp;
+    return kp == 0 && port_local_players() <= 1;   /* not known: the only player on the keyboard's port */
+}
+static void aim_assist_apply(uint32_t hero, uint32_t sp)
+{
+    if (!aim_assist_off(hero)) return;
+    const float s52c = ml_rdf(sp + 0x210), s530 = ml_rdf(sp + 0x214);
+    const float r52c = ml_rdf(hero + 0x52C), r530 = ml_rdf(hero + 0x530);
+    if (!std::isfinite(s52c) || !std::isfinite(s530)) return;
+    if (r52c == s52c && r530 == s530) return;
+    if (r52c == 0.0f && r530 == 0.0f) return;
+    ml_wrf(hero + 0x52C, s52c);
+    ml_wrf(hero + 0x530, s530);
+    static int n = 0;
+    if (n++ < 20) fprintf(stderr, "[aimassist] off: hero 0x%08X rates %+.4f %+.4f -> stick %+.4f %+.4f%c",
+                          hero, (double)r52c, (double)r530, (double)s52c, (double)s530, 10);
+}
 extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
 {
     (void)ctx;
     s_r3ml_hero = 0;
     if (hero) { g_r2_look_ms = GetTickCount64();   /* gameplay is running (PORT_MENU_FPS) */
-                r3_note_layout(); }
+                r3_note_layout();
+                aim_assist_apply(hero, sp); }
     if (!g_ml_mode || !hero) return;
     r3ml_load();
     const int dbg = r3ml_dbg();
