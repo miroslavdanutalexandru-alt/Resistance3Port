@@ -179,7 +179,10 @@ static inline void padg_rate_to_stick(double yaw_dps, double pitch_dps, double f
 #define PADD_HIST 48   /* the other pad's last ~50-90 ms of states (one per input-thread pass) */
 
 typedef struct { unsigned sig[PADD_HIST]; int pos, n; } PadSigHist;
-typedef struct { int match, mismatch; } PadPair;
+/* match / mismatch: samples of the candidate found / not found in the other
+ * pad's recent history; seen: the different non-zero states that matched. */
+#define PADD_SEEN 8
+typedef struct { int match, mismatch; unsigned seen[PADD_SEEN]; int nseen; } PadPair;
 
 /* Quantised state: buttons (Back left out: wrappers map the touchpad / Share
  * differently), each stick axis as -/0/+, triggers half-pressed. */
@@ -209,16 +212,26 @@ static inline int padd_close(unsigned a, unsigned b)
     return (d & 0xFFFFu) == 0 && padd_popc(d & 0x03FF0000u) <= 1;
 }
 /* One sample of the candidate against the real pad's recent history.
+ * min_seen: how many different non-zero states must have matched before it
+ * counts as a mirror (1 for a wrapper's Xbox-id pad; more for any other pad,
+ * so two real pads both held the same way -- sticks forward -- stay separate).
  * Returns +1 = ghost (mirrors it), -1 = a different controller, 0 = not sure yet. */
-static inline int padd_update(PadPair* pp, unsigned sig_c, const PadSigHist* real)
+#define PADD_MIN_SEEN_ANY 4
+#define PADD_RECHECK_MS   3000   /* a ghost is compared afresh this often, so its own input can free it */
+static inline int padd_update(PadPair* pp, unsigned sig_c, const PadSigHist* real, int min_seen)
 {
     if (sig_c) {
         int hit = 0;
         for (int i = 0; i < real->n && !hit; i++) if (real->sig[i] && padd_close(real->sig[i], sig_c)) hit = 1;
-        if (hit) pp->match++; else pp->mismatch++;
+        if (hit) {
+            pp->match++;
+            int known = 0;
+            for (int i = 0; i < pp->nseen && !known; i++) if (pp->seen[i] == sig_c) known = 1;
+            if (!known && pp->nseen < PADD_SEEN) pp->seen[pp->nseen++] = sig_c;
+        } else pp->mismatch++;
         if (pp->match + pp->mismatch > 400) { pp->match /= 2; pp->mismatch /= 2; }
     }
-    if (pp->match >= 12 && pp->mismatch * 5 <= pp->match) return 1;
+    if (pp->match >= 12 && pp->mismatch * 5 <= pp->match && pp->nseen >= min_seen) return 1;
     if (pp->mismatch >= 8 && pp->mismatch > pp->match) return -1;
     return 0;
 }

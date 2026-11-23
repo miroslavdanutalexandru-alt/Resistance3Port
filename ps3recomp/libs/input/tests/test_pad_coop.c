@@ -6,6 +6,7 @@
  *   clang-cl /I include libs\input\tests\test_pad_coop.c   (from ps3recomp\)
  */
 #include "../cellPad.c"
+#include "../pad_logic.h"
 #include <assert.h>
 
 uint8_t* vm_base;
@@ -155,6 +156,38 @@ static void test_p2_keyboard(void)
     assert(s_port_slot[1] == -1 && pad_port_on(0) && pad_port_on(1));
 }
 
+/* Duplicate detection (pad_sdl3.c): a wrapper's copy matches many different
+ * inputs; two real pads that are just held the same way are not a copy. */
+static void test_dedup_needs_distinct_inputs(void)
+{
+    PadSigHist real; PadPair pp;
+    memset(&real, 0, sizeof real); memset(&pp, 0, sizeof pp);
+    const unsigned fwd = padd_sig(0, 0, -30000, 0, -30000, 0, 0);   /* both sticks forward */
+    padd_hist_push(&real, fwd);
+    for (int i = 0; i < 100; i++) assert(padd_update(&pp, fwd, &real, PADD_MIN_SEEN_ANY) == 0);
+    /* The wrapper's Xbox-id pad only needs the one input to match. */
+    memset(&pp, 0, sizeof pp);
+    int v = 0;
+    for (int i = 0; i < 20 && v == 0; i++) v = padd_update(&pp, fwd, &real, 1);
+    assert(v == 1);
+    /* Any pad copying several different inputs is a duplicate. */
+    memset(&pp, 0, sizeof pp); memset(&real, 0, sizeof real);
+    const unsigned in[4] = { fwd, padd_sig(0x1000, 0, 0, 0, 0, 0, 0),
+                             padd_sig(0x2000, 0, 0, 0, 0, 0, 0), padd_sig(0, 0, 0, 0, 0, 255, 0) };
+    v = 0;
+    for (int i = 0; i < 40 && v == 0; i++) {
+        padd_hist_push(&real, in[i % 4]);
+        v = padd_update(&pp, in[i % 4], &real, PADD_MIN_SEEN_ANY);
+    }
+    assert(v == 1);
+    /* Re-checked afresh (pad_sdl3 resets the pair): its own input frees it. */
+    memset(&pp, 0, sizeof pp);
+    const unsigned own = padd_sig(0x4000, 30000, 0, 0, 0, 0, 0);
+    v = 0;
+    for (int i = 0; i < 20 && v == 0; i++) v = padd_update(&pp, own, &real, PADD_MIN_SEEN_ANY);
+    assert(v == -1);
+}
+
 int main(void)
 {
     _putenv_s("PAD_BACKGROUND_INPUT", "1");   /* no game window here: keep the pads live */
@@ -163,6 +196,7 @@ int main(void)
     test_coop_off();
     test_default_single_player();
     test_p2_keyboard();
+    test_dedup_needs_distinct_inputs();
     printf("test_pad_coop: all passed\n");
     return 0;
 }

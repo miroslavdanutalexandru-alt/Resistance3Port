@@ -127,7 +127,8 @@ static int s_data_fresh[PAD_MAX_HOST_PORTS];
  * and player 1 is whichever controller was used last.
  *   PAD_COOP=1            local co-op: a second controller can join as player 2
  *                         (also on when PAD_P2_CONTROLLER / PAD_P2_KEYBOARD is set
- *                         and PAD_COOP isn't); PAD_COOP=0: always off
+ *                         and PAD_COOP isn't set at all); PAD_COOP=0 (the launcher's
+ *                         Off) or empty: always off
  *   PAD_P1_CONTROLLER=n   player 1 uses controller n (1-8, in connection order), not the first found
  *   PAD_P2_CONTROLLER=n   player 2 uses controller n (1-8)
  *   PAD_P2_KEYBOARD=1     player 2 = keyboard & mouse, player 1 = the first controller
@@ -144,7 +145,7 @@ static void pad_coop_init(void)
     if ((e = getenv("PAD_P2_KEYBOARD")) && *e && *e != '0') s_coop_p2kb = 1;
     if ((e = getenv("PAD_P1_CONTROLLER")) && *e >= '1' && *e <= '0' + PAD_MAX_SLOTS) s_coop_want[0] = *e - '1';
     if ((e = getenv("PAD_P2_CONTROLLER")) && *e >= '1' && *e <= '0' + PAD_MAX_SLOTS) s_coop_want[1] = *e - '1';
-    if (coop && *coop) s_coop_on = *coop != '0';
+    if (coop) s_coop_on = *coop && *coop != '0';   /* the launcher writes 0 / 1 */
     else s_coop_on = s_coop_p2kb || s_coop_want[1] >= 0;
     if (!s_coop_on) s_coop_p2kb = 0;
     if (s_coop_p2kb || s_coop_want[1] == s_coop_want[0]) s_coop_want[1] = -1;

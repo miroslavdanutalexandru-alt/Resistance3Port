@@ -140,7 +140,7 @@ All of these are also in game (**F9**, *More PC Options*) and apply at once. The
 | Confirm button | **Cross**, Circle | `PS3_ENTER_BUTTON=circle`: the PS3 system setting the game reads at start (Japanese layout: Circle accepts, Cross goes back). Keyboard Enter / Esc / Backspace keep meaning confirm / back in menus. Restart; a menu that hard-codes its buttons ignores it |
 | Controller in the background | **Auto**, On, Off | `PAD_BACKGROUND_INPUT=1\|0`: Auto = controllers keep working while another window has the focus only with *Keep running* or *Mute only* in the background (SDL's background-events hint is always on; the port decides) |
 | Button prompts: Nintendo | (Controller button prompts) | `R2_PAD_GLYPHS=nintendo`: Switch-style A / B / X / Y prompts (by position: A right, B bottom; with *Nintendo button layout = Nintendo style* the letters follow the swapped buttons). *Auto* picks it for a Switch controller |
-| (no launcher option) | **On** | `PAD_DEDUP=0` keeps virtual duplicates (DSX / Steam Input / DS4Windows / ViGEm) as separate controllers. With it on, a controller that connects while another one is playing joins once it is used on its own |
+| (no launcher option) | **On** | `PAD_DEDUP=0` keeps virtual duplicates (DSX / Steam Input / DS4Windows / ViGEm) as separate controllers. With it on, a controller that connects while another one is playing joins once it is used on its own; one that copies several different inputs of the other controller is ignored, and checked again every few seconds |
 | (no launcher option) | **360** | `PAD_GYRO_STICK_DPS=<deg/s>`: gyro speed that equals a full right stick (co-op / classic mouse aiming, where gyro drives the stick) |
 
 With `PAD_BACKEND=xinput` the old behaviour returns: XInput only (up to four), PlayStation pads through DS4Windows / Steam Input, no gyro or light bar.
@@ -164,7 +164,7 @@ Resistance 3 counts at most two local players, ignores PlayStation Move pads, an
 
 | Option | Values | Variable |
 |---|---|---|
-| Local co-op (split-screen) | **Off**, On | `PAD_COOP=1`: a second controller can join as player 2. Off (`PAD_COOP=0` or unset): the game sees only player 1, and extra controllers (or duplicate virtual pads from DSX / Steam Input / DS4Windows) can't join. Setting *Player 2 controller* or *Player 2 uses keyboard and mouse* also turns it on, unless `PAD_COOP=0` |
+| Local co-op (split-screen) | **Off**, On | `PAD_COOP=1`: a second controller can join as player 2. Off (`PAD_COOP=0` or unset): the game sees only player 1, and extra controllers (or duplicate virtual pads from DSX / Steam Input / DS4Windows) can't join. *Player 2 controller* and *Player 2 uses keyboard and mouse* apply when it is On (outside the launcher, with `PAD_COOP` not set at all, setting `PAD_P2_CONTROLLER` or `PAD_P2_KEYBOARD` turns it on) |
 | Player 1 controller | **Automatic**, Controller 1-8 | `PAD_P1_CONTROLLER=<1..8>`: the controller that is player 1 (SDL3: in the order they were connected; XInput: 1-4, Windows' XInput order). Automatic = the controller used last (co-op off) or the first one found (co-op on) |
 | Player 2 controller | **Automatic**, Controller 1-8 | `PAD_P2_CONTROLLER=<1..8>`: the controller that is player 2 (numbered as above) |
 | Player 2 uses keyboard and mouse | **Off**, On | `PAD_P2_KEYBOARD=1`: player 1 = the first controller only, player 2 = keyboard and mouse |
