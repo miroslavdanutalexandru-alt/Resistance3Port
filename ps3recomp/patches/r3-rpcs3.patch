@@ -17034,10 +17034,10 @@ index 0000000..55d726f
 +#endif /* PORT_DLSS_QUALITY_H */
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FgDiag.h b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
 new file mode 100644
-index 0000000..0f3becc
+index 0000000..6ecc46a
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
-@@ -0,0 +1,924 @@
+@@ -0,0 +1,935 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame-generation diagnostics for the DLSS-G (Streamline) path, R2_FG_DIAG / R3_FG_DIAG (default 0 = off, nothing
 +// is measured beyond the always-on reset counters):
@@ -17049,7 +17049,7 @@ index 0000000..0f3becc
 +//       did not present, a pause, a frame-time spike or pace jump); at most R?_FG_DIAG_AUTO_MAX (default 10) dumps,
 +//       20 s apart.
 +//   3 = as 1, and every real present (the dump's row) is written to logs\fgdiag.txt for the whole session (the previous
-+//       session's file becomes fgdiag_prev.txt). Events (FG resets with the reason, pauses, generated frames not
++//       session's file becomes fgdiag_prev.txt; if it can't be renamed it is kept and fgdiag_<pid>.txt is used). Events (FG resets with the reason, pauses, generated frames not
 +//       presented, DLSS-G status changes, frame-time spikes) are "--- ... ---" lines after the row they happened on,
 +//       plus a "# second" line per second; the hotkey writes a "--- user marker ---" line instead of a dump. The present
 +//       thread only copies the row into a preallocated queue (a short spin lock); one writer thread empties it every
@@ -17483,7 +17483,7 @@ index 0000000..0f3becc
 +			DWORD w = 0;
 +			if (n > 0) WriteFile(q.file, t, static_cast<DWORD>(n), &w, nullptr);
 +			q.bytes += w;
-+			elog("[fg-diag] logs\\fgdiag.txt reached %llu MB: continuous recording stopped (the per-second lines go on)\n", static_cast<unsigned long long>(q.cap >> 20));
++			elog("[fg-diag] %s reached %llu MB: continuous recording stopped (the per-second lines go on)\n", q.path, static_cast<unsigned long long>(q.cap >> 20));
 +		}
 +#else
 +		o.len = 0;
@@ -17528,7 +17528,7 @@ index 0000000..0f3becc
 +			const double t = now_ms();
 +			if (t - q.drop_log_t >= 5000.0)
 +			{
-+				elog("[fg-diag] fgdiag.txt: %llu records dropped so far (the writer fell behind)\n", static_cast<unsigned long long>(d));
++				elog("[fg-diag] %s: %llu records dropped so far (the writer fell behind)\n", q.path, static_cast<unsigned long long>(d));
 +				q.drop_log_t = t;
 +			}
 +			q.drop_seen = d;
@@ -17553,7 +17553,18 @@ index 0000000..0f3becc
 +		CreateDirectoryA(dir.c_str(), nullptr);
 +		std::snprintf(q.path, sizeof(q.path), "%s\\fgdiag.txt", dir.c_str());
 +		const std::string prev = dir + "\\fgdiag_prev.txt";
-+		MoveFileExA(q.path, prev.c_str(), MOVEFILE_REPLACE_EXISTING);
++		if (!MoveFileExA(q.path, prev.c_str(), MOVEFILE_REPLACE_EXISTING))
++		{
++			const DWORD err = GetLastError();
++			if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
++			{
++				// the old file stays as it is (e.g. open in a viewer); this session gets its own name
++				char old[sizeof(q.path)];
++				std::snprintf(old, sizeof(old), "%s", q.path);
++				std::snprintf(q.path, sizeof(q.path), "%s\\fgdiag_%lu.txt", dir.c_str(), GetCurrentProcessId());
++				elog("[fg-diag] cannot rename %s to fgdiag_prev.txt (error %lu): writing %s instead\n", old, err, q.path);
++			}
++		}
 +		const HANDLE f = CreateFileA(q.path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 +		if (f == INVALID_HANDLE_VALUE)
 +		{
@@ -17606,7 +17617,7 @@ index 0000000..0f3becc
 +		stream_trailer(q, o, q.stop ? "exit" : "size limit");
 +		q.file = INVALID_HANDLE_VALUE;
 +		CloseHandle(f);
-+		elog("[fg-diag] fgdiag.txt closed: %llu rows, %llu event lines, %llu dropped, %.1f MB\n", static_cast<unsigned long long>(q.rows),
++		elog("[fg-diag] %s closed: %llu rows, %llu event lines, %llu dropped, %.1f MB\n", q.path, static_cast<unsigned long long>(q.rows),
 +			static_cast<unsigned long long>(q.events), static_cast<unsigned long long>(q.dropped.load()), static_cast<double>(q.bytes) / (1024.0 * 1024.0));
 +		q.busy = 0;
 +		q.done = true;
