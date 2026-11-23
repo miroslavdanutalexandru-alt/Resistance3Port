@@ -5125,9 +5125,44 @@ static void spu_indirect_branch_full(spu_context* ctx)
                 uji_busy = 1;
                 g_spu_interp_norejoin = 1; g_spu_interp_stop_sp = 0xFFFFFFFFu; g_spu_interp_maxsteps = 0;
                 g_spu_interp_nowall = 1; g_spu_interp_jobonly = 1;
+                const uint32_t uji_lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
                 spu_interp_run_until(ctx, jpc, 0);
                 g_spu_interp_norejoin = 0; g_spu_interp_nowall = 0; g_spu_interp_jobonly = 0;
                 uji_busy = 0;
+                /* Resistance 3: job 403 (igjob_00D7A480) calls a callback from
+                 * its table at LS 0x14C2C + 4*state (bisl at 0xF8F0, r3 = 0x14C60)
+                 * and once got a pointer to data (LS 0x32800, words 03FF2800):
+                 * the interpreter halted on the first word, the lane stopped and
+                 * the game froze. When the target is not code at all (halt on
+                 * its first instruction, nothing executed) and a lifted caller
+                 * waits for the link, treat it as a null callback and return to
+                 * the caller, like SPU_RAW_BADCALL_SKIP does for the sound SPU.
+                 * SPU_JOB_BADCALL_SKIP=0 halts as before. */
+                { static int s_bcs = -1;
+                  if (s_bcs < 0) { const char* e = getenv("SPU_JOB_BADCALL_SKIP"); s_bcs = e ? atoi(e) : 1; }
+                  if (s_bcs && (ctx->status & SPU_STATUS_STOPPED_BY_HALT) &&
+                      (ctx->pc & SPU_LS_MASK) == jpc && ctx->host_depth > 0 &&
+                      uji_lr >= 0x100u && uji_lr != jpc) {
+                      static volatile LONG n_bcs = 0;
+                      const LONG k = InterlockedIncrement(&n_bcs);
+                      if (k <= 8 || (k & (k - 1)) == 0) {
+                          const uint32_t r3 = ctx->gpr[3]._u32[0] & SPU_LS_MASK & ~15u;
+                          const uint32_t d0 = r3 >= 0x40u ? r3 - 0x40u : 0u;
+                          fprintf(stderr, "[spu] img=%d bad job call #%ld: LS 0x%05X is not code (lr=0x%05X r3=0x%05X) "
+                                          "-- skipped, back to the caller (SPU_JOB_BADCALL_SKIP=0 halts)\n",
+                                  ctx->image_id, (long)k, jpc, uji_lr, ctx->gpr[3]._u32[0] & SPU_LS_MASK);
+                          for (uint32_t a = d0; a < d0 + 0x80u && a + 16u <= SPU_LS_SIZE; a += 16u) {
+                              fprintf(stderr, "      LS[0x%05X]:", a);
+                              for (uint32_t o = 0; o < 16u; o += 4u)
+                                  fprintf(stderr, " %02X%02X%02X%02X", ctx->ls[a+o], ctx->ls[a+o+1], ctx->ls[a+o+2], ctx->ls[a+o+3]);
+                              fprintf(stderr, "\n");
+                          }
+                      }
+                      ctx->status = SPU_STATUS_RUNNING;
+                      ctx->pc = uji_lr;
+                      g_spu_trampoline_fn = 0;
+                      return;
+                  } }
                 ctx->pc &= SPU_LS_MASK;
                 g_spu_trampoline_fn = (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
                                     ? 0 : spu_indirect_branch;
