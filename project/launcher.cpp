@@ -155,10 +155,12 @@ static std::vector<Setting> g_set = {
       "helper threads for 4-core CPUs, Mid for 6-core CPUs, High changes nothing.",
       { {"Auto", "auto"}, {"Low  (4 cores)", "low"}, {"Mid  (6 cores)", "mid"}, {"High  (8+ cores)", "high"} }, 0 },
     { "shaders", "Shader compilation",
-      "How the Compatible renderer builds the GPU programs it needs. Asynchronous compiles them in the background: "
-      "no stutter, but an object can be missing for a moment the first time it appears. Synchronous waits for "
-      "each one (brief hitches the first time). Compiled shaders are kept, so either gets smoother as you play.",
-      { {"Asynchronous", "async"}, {"Asynchronous + interpreter  (experimental)", "interp"}, {"Synchronous", "sync"} }, 0 },
+      "How the Compatible renderer builds a GPU program that is not in the shader cache yet (the first visit to "
+      "an area). Synchronous (recommended) builds it at once: a short hitch the first time, but nothing is ever "
+      "missing from the picture. Asynchronous builds it in the background: no hitch, but an object can be "
+      "missing or show purple / green patches for a moment the first time it appears. Compiled shaders are "
+      "kept, so either gets smoother as you play.",
+      { {"Synchronous", "sync"}, {"Asynchronous", "async"}, {"Asynchronous + interpreter  (experimental)", "interp"} }, 0 },
 };
 
 // ---------------------------------------------------------------------------
@@ -645,12 +647,17 @@ static void load_settings()
             for (auto& l : lines) fprintf(w, "%s\n", l.c_str());
             fclose(w);
         }
+    // Shader compilation became Synchronous by default: an "async" saved before that (written by every launcher, so
+    // almost always the old default) is dropped once; files written since carry shaders_default=sync and keep it.
+    bool shaders_rev = false;
+    for (auto& l : lines) if (!strncmp(l.c_str(), "shaders_default=", 16)) shaders_rev = true;
     for (auto& l : lines) {
         snprintf(line, sizeof line, "%s", l.c_str());
         char* eq = strchr(line, '=');
         if (!eq) continue;
         *eq = 0;
         char* v = eq + 1;
+        if (!strcmp(line, "shaders") && !shaders_rev && !strcmp(v, "async")) continue;
         if (!strcmp(line, "precompile")) {   // old values: R2_PRELOAD_BOOT -1 / RSX_PSO_PRECOMPILE 1 = On, empty = Off
             v = (char*)(*v && strcmp(v, "0") ? "1" : "0");
         }
@@ -672,6 +679,7 @@ static bool save_settings()
     FILE* f = fopen(path_of("settings.ini").c_str(), "w");
     if (!f) return false;
     for (auto& s : g_set) fprintf(f, "%s=%s\n", s.key, s.choices[s.sel].value);
+    fprintf(f, "shaders_default=sync\n");   // see load_settings
     fclose(f);
     f = fopen(path_of("settings.bat").c_str(), "w");
     if (!f) return false;

@@ -72,7 +72,7 @@ struct Settings
     const char* filter = "linear";// RSX_FILTER: linear | point | fsr (FSR 1)
     const char* sharpen = "0.25"; // RSX_SHARPEN
     const char* cpu = "auto";     // PORT_CPU_PROFILE
-    const char* shader = "async"; // R2_SHADER_MODE
+    const char* shader = "sync";  // R2_SHADER_MODE
     const char* window = "1920x1080"; // RSX_WINDOW (windowed mode)
 };
 
@@ -300,7 +300,7 @@ inline Settings recommend(const Hardware& h, int tier = T_AUTO)
     if (tier == T_AUTO && weak_cpu && s.tier > T_MEDIUM) s.tier = T_MEDIUM;
 
     s.cpu = h.eff_cores <= 4.0 ? "low" : h.eff_cores < 8.0 ? "mid" : "high";
-    s.shader = "async";       // async recompiler: no compile stalls; the interpreter mode is untested
+    s.shader = "sync";        // a pipeline not in the cache is built at once: short first-time hitch, no skipped draws
     s.vsync = "auto";         // FIFO when the target matches the display, tear-free MAILBOX otherwise
     const char* aa = h.rtx && !h.wine ? "2" : "1";   // DLSS under Proton needs extra setup: FSR there
     const char* screen = res_for_height(sh);

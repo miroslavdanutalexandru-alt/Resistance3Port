@@ -226,17 +226,20 @@ namespace
 	}
 
 	// Shader compilation and logging defaults (env overrides, applied over rpcs3_config.yml).
-	//  R2_SHADER_MODE = async (default: async recompiler, draws skipped until ready)
-	//                 | interp (async recompiler + shader interpreter until ready; untested) | sync | interpreter
+	//  R2_SHADER_MODE = sync (default: a pipeline missing from the cache is built on the render thread: a short
+	//                   hitch the first time, no skipped draws / purple-green patches; GPL parts + fast link)
+	//                 | async (async recompiler, draws skipped until ready)
+	//                 | interp (async recompiler + shader interpreter until ready; untested) | interpreter
 	//  R2_SHADER_INTERP=1 (default 0): same as R2_SHADER_MODE=interp; R2_SHADER_MODE wins when set.
 	//  R2_SHADER_CACHE=0 disables the on-disk shader cache (shadercache\rpcs3\shaders_cache).
 	void apply_shader_defaults()
 	{
 		const char* m = std::getenv("R2_SHADER_MODE");
-		shader_mode mode = shader_mode::async_recompiler;
+		shader_mode mode = shader_mode::recompiler;
 		if (m && *m)
 		{
-			if (!_stricmp(m, "interp")) mode = shader_mode::async_with_interpreter;
+			if (!_stricmp(m, "async")) mode = shader_mode::async_recompiler;
+			else if (!_stricmp(m, "interp")) mode = shader_mode::async_with_interpreter;
 			else if (!_stricmp(m, "sync") || !_stricmp(m, "legacy")) mode = shader_mode::recompiler;
 			else if (!_stricmp(m, "interpreter")) mode = shader_mode::interpreter_only;
 		}
