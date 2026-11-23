@@ -40,10 +40,10 @@ def strip(txt, H):
 
 def main():
     fresh = sys.argv[1] if len(sys.argv) > 1 else None
-    src = rd(os.path.join(HERE, 'r3_regen.py'))
+    src = rd(os.path.join(HERE, 'r3_spu.py'))   # the SPU half of tools/r3_regen.py
     fails = 0
     if "hook('post', n, f)" not in src or "'spu_hooks.py'" not in src:
-        print('FAIL r3_regen.py does not apply tools/hooks/spu/*.json'); fails += 1
+        print('FAIL r3_spu.py (r3_regen.py --only spu) does not apply tools/hooks/spu/*.json'); fails += 1
     os.makedirs(WORK, exist_ok=True)
     gates = 0; n_mod = 0
     for hp in sorted(glob.glob(os.path.join(HK, '*.json'))):
