@@ -7,6 +7,12 @@
 #  - RPCS3: shallow fetch of the pinned commit -> full fetch (protocol v2, HTTP/1.1) -> GitHub source archive (.zip);
 #  - its submodules: all at once (shallow) -> one at a time (shallow) -> one at a time (full fetch, no --depth, for
 #    servers that refuse "unadvertised object" requests) -> GitHub source archive of the exact pinned commit;
+#  - TLS failures (antivirus HTTPS scanning, company proxies, unreachable revocation servers): git is tried again
+#    with Windows' certificate store (schannel) and without the revocation check; archives fall back to curl.exe
+#    with --ssl-no-revoke;
+#  - a Windows (browser) proxy that git doesn't know about is passed to git and to the archive downloads;
+#  - archives downloaded by hand in a browser and put into tools_cache\rpcs3_download\ are used first; when
+#    everything fails, the exact links and file names are printed;
 #  - every finished piece is stamped (.port_fetch\*.ok), so a run that stopped half way continues where it stopped
 #    and a damaged or half-downloaded piece is cleaned and downloaded again;
 #  - on exFAT/FAT32, network and other non-NTFS drives Git can't check who owns a repository, so the work is done in
@@ -24,6 +30,7 @@ param(
     [switch]$NoArchive,           # never fall back to GitHub's source archives
     [string]$Patch = '',          # default: the one ps3recomp\patches\*-rpcs3.patch
     [string]$Manifest = (Join-Path $PSScriptRoot '..\tools_cache\installed_by_setup.txt'),
+    [string]$ManualDir = (Join-Path $PSScriptRoot '..\tools_cache\rpcs3_download'),   # source archives downloaded by hand
     [switch]$CheckFiles,          # only check that every file the patch adds is there (build.bat); exit 1 if not
     [switch]$Library
 )
@@ -62,6 +69,7 @@ $script:GitCfg = @('-c', 'safe.directory=*', '-c', 'core.autocrlf=false', '-c', 
                    '-c', 'advice.detachedHead=false', '-c', 'init.defaultBranch=master')
 $script:GitText = New-Object System.Collections.Generic.List[string]   # everything git said, for Get-FetchFailureHint
 $script:SafeDirsAdded = @{}
+$script:NetFixes = @{}
 
 function Write-FetchLog([string]$Text, [switch]$Quiet) {
     if (-not $Quiet) { Write-Host $Text }
@@ -76,8 +84,11 @@ function Invoke-GitRaw([string[]]$GitArgs) {
     # otherwise stop at git's first progress line, and without the merge the messages never reach Setup's log.
     $ErrorActionPreference = 'Continue'
     $cfg = $script:GitCfg
-    $lines = @(& git @cfg @GitArgs 2>&1 | ForEach-Object { "$_" })
-    [pscustomobject]@{ Code = $LASTEXITCODE; Lines = $lines }
+    $all = @(& git @cfg @GitArgs 2>&1)
+    $code = $LASTEXITCODE
+    # Out: stdout only (stderr lines arrive as ErrorRecords), for commands whose output is a value
+    [pscustomobject]@{ Code = $code; Lines = @($all | ForEach-Object { "$_" })
+                       Out = @($all | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) }
 }
 function Invoke-Git {
     $gitArgs = @(foreach ($a in $args) { foreach ($b in @($a)) { "$b" } })   # arrays (submodule lists) flattened
@@ -86,9 +97,62 @@ function Invoke-Git {
         $r = Invoke-GitRaw $gitArgs
         foreach ($l in $r.Lines) { if ("$l".Trim()) { Write-FetchLog "     git: $l"; $script:GitText.Add("$l") } }
         if ($r.Code -eq 0) { return }
-        if ($attempt -eq 1 -and (Repair-DubiousOwnership ($r.Lines -join "`n"))) { continue }
+        if ($attempt -le 3) {   # each repair is made at most once per run
+            $said = $r.Lines -join "`n"
+            if ((Repair-DubiousOwnership $said) -or (Repair-GitNetwork $said)) { continue }
+        }
         throw "git $($gitArgs -join ' ') failed (exit code $($r.Code))"
     }
+}
+# Network trouble git does not get past by itself; the changed setting stays for the rest of the run.
+#  - TLS: antivirus HTTPS scanning and company proxies re-sign GitHub's certificate with one that only Windows'
+#    certificate store knows (git's default OpenSSL backend rejects it), and the schannel backend's revocation check
+#    fails when the revocation servers can't be reached (CRYPT_E_NO_REVOCATION_CHECK / CRYPT_E_REVOCATION_OFFLINE).
+#  - proxy: browsers use the Windows proxy setting; git only its own http.proxy or HTTPS_PROXY.
+function Repair-GitNetwork([string]$Text) {
+    if (-not $script:NetFixes.ContainsKey('tls') -and $Text -match '(?i)SSL|schannel|certificate|CRYPT_E_|revocation|TLS') {
+        $script:NetFixes['tls'] = $true
+        Write-FetchLog "   The secure connection to GitHub failed. Trying again with Windows' own certificate store and without the"
+        Write-FetchLog "   certificate revocation check (antivirus HTTPS scanning and company proxies often break those)..."
+        $script:GitCfg += @('-c', 'http.sslBackend=schannel', '-c', 'http.schannelCheckRevoke=false')
+        return $true
+    }
+    if (-not $script:NetFixes.ContainsKey('proxy') -and
+        $Text -match "(?i)Could not resolve host|Couldn't resolve|Failed to connect|Connection (timed out|refused)|Operation timed out|Timed out") {
+        $script:NetFixes['proxy'] = $true
+        if (Get-GitProxy) { return $false }
+        $p = Get-SystemProxy
+        if (-not $p) { return $false }
+        Write-FetchLog "   Windows is set to use the proxy $p, which Git does not use by itself. Trying again through it..."
+        $script:GitCfg += @('-c', "http.proxy=$p")
+        return $true
+    }
+    return $false
+}
+# [scheme://][user[:pass]@]host:port - anything else (a warning git printed, an error) is not a proxy.
+function Test-ProxyValue([string]$Value) {
+    $Value -match '^(?:[A-Za-z][A-Za-z0-9+.-]*://)?(?:[^@\s/]+@)?(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):\d{1,5}/?$'
+}
+# The proxy git is already told about (environment or git config), if any.
+function Get-GitProxy {
+    foreach ($v in 'HTTPS_PROXY', 'ALL_PROXY') {
+        $x = "$([Environment]::GetEnvironmentVariable($v))".Trim()
+        if ($x -and (Test-ProxyValue $x)) { return $x }
+    }
+    $r = Invoke-GitRaw @('config', '--get', 'http.proxy')
+    if ($r.Code -ne 0) { return $null }
+    $x = "$(@($r.Out | Where-Object { "$_".Trim() }) | Select-Object -Last 1)".Trim()
+    if ($x -and (Test-ProxyValue $x)) { return $x }
+    $null
+}
+# The proxy Windows uses for github.com (manual setting, PAC script or auto-detect), $null when it connects directly.
+function Get-SystemProxy {
+    try {
+        $u = [Uri]'https://github.com/'
+        $p = [Net.WebRequest]::GetSystemWebProxy().GetProxy($u)
+        if ($p -and $p.Host -ne $u.Host) { return $p.AbsoluteUri.TrimEnd('/') }
+    } catch {}
+    $null
 }
 # git: "detected dubious ownership in repository at 'F:/x'" ... "git config --global --add safe.directory F:/x".
 # Adds exactly the folder git names (never "*") and records it so it can be removed again.
@@ -114,9 +178,32 @@ function Add-SetupManifest([string]$Line) {
     } catch {}
 }
 function Get-UrlFile([string]$Url, [string]$OutFile) {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $OutFile
+    $proxy = Get-GitProxy
+    if (-not $proxy) { $proxy = Get-SystemProxy }
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        $ProgressPreference = 'SilentlyContinue'
+        $iwr = @{ UseBasicParsing = $true; Uri = $Url; OutFile = $OutFile }
+        if ($proxy) { $iwr.Proxy = $proxy; $iwr.ProxyUseDefaultCredentials = $true }
+        Invoke-WebRequest @iwr
+        return
+    } catch {
+        $first = $_.Exception.Message
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+    }
+    # curl.exe (Windows 10 1803 and newer) uses Windows' certificate store and can skip the revocation check that
+    # fails behind antivirus HTTPS scanning and some company networks.
+    $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+    if (-not (Test-Path -LiteralPath $curl)) { throw $first }
+    Write-FetchLog "     PowerShell's download failed ($first); trying again with curl..."
+    $ca = @('-fsSL', '--retry', '2', '--connect-timeout', '30', '--ssl-no-revoke', '-o', $OutFile)
+    if ($proxy) { $ca += @('-x', $proxy, '--proxy-anyauth', '--proxy-user', ':') }
+    $ErrorActionPreference = 'Continue'
+    $out = @(& $curl @ca $Url 2>&1 | ForEach-Object { "$_" })
+    if ($LASTEXITCODE -ne 0) {
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        throw "$first / curl: $(($out -join ' ').Trim()) (exit code $LASTEXITCODE)"
+    }
 }
 
 # --- helpers --------------------------------------------------------------------------------------------------
@@ -178,6 +265,17 @@ function Expand-GitHubArchive([string]$Url, [string]$Into, [string]$DlDir) {
         catch { Remove-Item -LiteralPath $zip -Force }
     }
     if (-not $ok) {
+        $manual = Find-ManualArchive $Url
+        if ($manual) {
+            try {
+                Add-Type -AssemblyName System.IO.Compression.FileSystem; ([IO.Compression.ZipFile]::OpenRead($manual)).Dispose()
+                Write-FetchLog "     using $manual (downloaded by hand)"
+                if ($manual -ne $zip) { Copy-Item -LiteralPath $manual -Destination $zip -Force }
+                $ok = $true
+            } catch { Write-FetchLog "     $manual is not a complete .zip file; downloading it instead" }
+        }
+    }
+    if (-not $ok) {
         Write-FetchLog "     downloading $Url"
         Get-UrlFile $Url "$zip.part"
         Move-Item -LiteralPath "$zip.part" -Destination $zip -Force
@@ -191,6 +289,41 @@ function Expand-GitHubArchive([string]$Url, [string]$Into, [string]$DlDir) {
     New-Item -ItemType Directory -Force -Path $Into | Out-Null
     Get-ChildItem -LiteralPath $src -Force | Move-Item -Destination $Into -Force
     Clear-Dir $tmp
+}
+# A GitHub source archive saved by a browser into $script:ManualDir under the name GitHub gives it: <repo>-<commit>.zip,
+# or <repo>-<tag without the v>.zip for a tag (pugixml-1.15.zip). $null when there is none.
+function Find-ManualArchive([string]$Url) {
+    if (-not $script:ManualDir -or $Url -notmatch '^https://codeload\.github\.com/[^/]+/([^/]+)/zip/(?:refs/tags/)?(.+)$') { return $null }
+    $name = $Matches[1]; $ref = $Matches[2]
+    foreach ($n in @("$name-$ref.zip", "$name-$($ref -replace '^v(?=\d)', '').zip")) {
+        $p = Join-Path ([IO.Path]::GetFullPath($script:ManualDir)) $n
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    $null
+}
+# Puts the source-archive method first when its archive was downloaded by hand, else last.
+function Add-ArchiveMethod([object[]]$Methods, [hashtable]$Archive, [string]$Url) {
+    if (Find-ManualArchive $Url) { return @(@($Archive) + $Methods) }
+    @($Methods + @($Archive))
+}
+# What to download by hand when nothing else works: the browser link and the file name it saves.
+function Get-ManualLinks {
+    $l = @(@{ Page = "https://github.com/RPCS3/rpcs3/archive/$script:Commit.zip"; File = "rpcs3-$script:Commit.zip" })
+    foreach ($s in $script:Subs) {
+        $l += @{ Page = "https://github.com/$($s.Repo)/archive/$($s.Sha).zip"; File = "$(($s.Repo -split '/')[-1])-$($s.Sha).zip" }
+    }
+    foreach ($e in $script:Extras) {
+        $l += @{ Page = "https://github.com/$($e.Repo)/archive/refs/tags/$($e.Tag).zip"; File = "$(($e.Repo -split '/')[-1])-$($e.Tag -replace '^v(?=\d)', '').zip" }
+    }
+    $l
+}
+function Write-ManualSteps {
+    if (-not $script:ManualDir) { return }
+    $dir = [IO.Path]::GetFullPath($script:ManualDir)
+    Write-FetchLog "   To get past this by hand: open each link below in a browser (each one saves a .zip file), put the"
+    Write-FetchLog "   .zip files as they are (not unpacked, not renamed) into this folder, then run Setup again:"
+    Write-FetchLog "     $dir"
+    foreach ($m in Get-ManualLinks) { Write-FetchLog "     $($m.Page)   (saved as $($m.File))" }
 }
 
 # --- where to work --------------------------------------------------------------------------------------------
@@ -246,10 +379,10 @@ function Get-Rpcs3Base([string]$Work, [string]$DlDir) {
             Invoke-Git -C $Work checkout -q -f $script:Commit } }
     )
     if (-not $script:NoArchive) {
-        $methods += @{ Name = 'source archive'; Cleanup = { Clear-Dir $Work }; Do = {
+        $methods = Add-ArchiveMethod $methods @{ Name = 'source archive'; Cleanup = { Clear-Dir $Work }; Do = {
             Write-FetchLog "   Downloading RPCS3's source archive from GitHub instead..."
             Expand-GitHubArchive $script:RepoArchive $Work $DlDir
-            Invoke-Git init -q $Work } }   # its own repository, so git apply works there like anywhere else
+            Invoke-Git init -q $Work } } $script:RepoArchive   # its own repository, so git apply works there like anywhere else
     }
     $how = Invoke-FirstWorking 'RPCS3' $methods
     $mode = 'git'; if ($how -eq 'source archive') { $mode = 'archive' }
@@ -284,7 +417,7 @@ function Get-Submodules([string]$Work, [string]$Mode, [string]$DlDir) {
         }
         if (-not $script:NoArchive) {
             $url = "https://codeload.github.com/$($sub.Repo)/zip/$($sub.Sha)"
-            $methods += @{ Name = 'source archive'; Cleanup = $clean; Do = { Expand-GitHubArchive $url (Join-Path $Work ($sub.Path -replace '/', '\')) $DlDir } }
+            $methods = Add-ArchiveMethod $methods @{ Name = 'source archive'; Cleanup = $clean; Do = { Expand-GitHubArchive $url (Join-Path $Work ($sub.Path -replace '/', '\')) $DlDir } } $url
         }
         [void](Invoke-FirstWorking $sub.Path $methods)
         Set-Stamp $Work "sub_$($sub.Path)" $sub.Sha
@@ -298,7 +431,7 @@ function Get-Extras([string]$Work, [string]$DlDir) {
         $methods = @(@{ Name = 'clone'; Cleanup = $clean; Do = { Invoke-Git clone -q --depth 1 --branch $x.Tag $x.Url $dir } })
         if (-not $script:NoArchive) {
             $url = "https://codeload.github.com/$($x.Repo)/zip/refs/tags/$($x.Tag)"
-            $methods += @{ Name = 'source archive'; Cleanup = $clean; Do = { Expand-GitHubArchive $url $dir $DlDir } }
+            $methods = Add-ArchiveMethod $methods @{ Name = 'source archive'; Cleanup = $clean; Do = { Expand-GitHubArchive $url $dir $DlDir } } $url
         }
         [void](Invoke-FirstWorking "$($x.Repo) $($x.Tag)" $methods)
         Set-Stamp $Work $x.Key $x.Tag
@@ -470,6 +603,11 @@ function Invoke-FetchRpcs3 {
     }
     Clear-Dir $DlDir
     $tc = Split-Path $DlDir   # an empty tools_cache\ is not left behind
+    if ($script:ManualDir) {
+        $md = [IO.Path]::GetFullPath($script:ManualDir)
+        if ($md -ne $DlDir) { Clear-Dir $md }
+        $tc = Split-Path $md
+    }
     if ((Split-Path -Leaf $tc) -eq 'tools_cache' -and (Test-Path -LiteralPath $tc) -and -not (Get-ChildItem -LiteralPath $tc -Force)) { Remove-Item -LiteralPath $tc -Force -ErrorAction SilentlyContinue }
     Write-FetchLog "   RPCS3 $($script:Commit.Substring(0,7)) downloaded and patched."
 }
@@ -489,6 +627,7 @@ catch {
     Write-FetchLog "   FAILED: $($_.Exception.Message)"
     Write-FetchLog "   What probably went wrong:"
     foreach ($h in Get-FetchFailureHint (($script:GitText -join "`n") + "`n" + $_.Exception.Message)) { Write-FetchLog "    - $h" }
+    if ($_.Exception.Message -match '^Could not download') { Write-ManualSteps }
     if ($script:LogFile) { Write-FetchLog "   Everything Git said is in $script:LogFile" }
     exit 1
 }

@@ -217,7 +217,13 @@ prints git's own error and what to do; everything is in `logs\fetch_rpcs3.log`. 
 - **"dubious ownership" / `safe.directory`:** Setup adds a `safe.directory` entry for this one folder by itself
   (recorded, so [Removing the build tools](#removing-the-build-tools) takes it out again).
 - **No connection to github.com:** a proxy, a firewall, an antivirus or a VPN. Allow Git and PowerShell, or try
-  another network. A half-finished download is cleaned up and resumed on the next run.
+  another network. A half-finished download is cleaned up and resumed on the next run. If Windows is set to use a
+  proxy, Setup passes it on to Git. If the secure connection fails (antivirus HTTPS scanning, a company proxy), Setup
+  tries again with Windows' own certificate store and without the certificate revocation check.
+- **Nothing gets through:** download the source by hand. When Setup stops it prints a list of links (also in
+  `logs\fetch_rpcs3.log`): open each one in a browser and put the `.zip` files it saves, as they are (not unpacked,
+  not renamed), into `tools_cache\rpcs3_download\` in the port folder, then run Setup again. It uses them instead of
+  downloading.
 
 ### The game copy is not accepted
 
