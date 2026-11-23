@@ -160,6 +160,25 @@ static void test_preload_safety()
 	CHECK(r2pipe::preload_keep_samples(2, true, false));
 	CHECK(r2pipe::preload_keep_samples(4, false, true));
 
+	// depth format in the render-pass key (bits 8-15): D24S8 = 129, D32S8 = 130
+	const uint64_t rp_d24 = (129ull << 8) | (1ull << 16) | 37, rp_d32 = (130ull << 8) | (1ull << 16) | 37;
+	uint64_t k = rp_d24;
+	CHECK(r2pipe::preload_fix_depth(k, true, true) == 0 && k == rp_d24);
+	CHECK(r2pipe::preload_fix_depth(k, false, true) == 1 && k == rp_d32);
+	k = rp_d24;
+	CHECK(r2pipe::preload_fix_depth(k, false, false) == -1);
+	k = rp_d32;
+	CHECK(r2pipe::preload_fix_depth(k, true, true) == 0 && k == rp_d32);
+	CHECK(r2pipe::preload_fix_depth(k, true, false) == -1);
+	k = (124ull << 8) | 5;
+	CHECK(r2pipe::preload_fix_depth(k, false, false) == 0);
+	k = 37;
+	CHECK(r2pipe::preload_fix_depth(k, false, false) == 0);
+	k = 1ull << 63;
+	CHECK(r2pipe::preload_fix_depth(k, false, false) == 0);
+	k = 200ull << 8;
+	CHECK(r2pipe::preload_fix_depth(k, true, true) == -1);
+
 	_putenv("PORT_PRELOAD_THREADS=");
 	_putenv("R2_PRELOAD_THREADS=");
 	CHECK(r2pipe::preload_bg_threads(16, 0x1002) == 1);
