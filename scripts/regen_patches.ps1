@@ -134,7 +134,7 @@ if ($head -ne $Commit) { throw "RPCS3 tree is at $head, but fetch_rpcs3.ps1 pins
 Write-Host "   tree HEAD = pinned commit $($Commit.Substring(0,10))"
 
 # ---------------------------------------------------------------- new files
-$untracked = @(Git-In $Tree ls-files --others --exclude-standard -- . ':(exclude)3rdparty') | Where-Object { $_ }
+$untracked = @(Git-In $Tree ls-files --others --exclude-standard -- . ':(exclude)3rdparty' ':(exclude).port_fetch') | Where-Object { $_ }
 $junk = @($untracked | Where-Object { $_ -match '\.(orig|rej|bak\w*|tmp|swp)$|~$|(^|/)(build|out|\.vs)/' })
 if ($junk.Count -and -not $AllowJunk) {
     $junk | ForEach-Object { Write-Host "   junk: $_" -ForegroundColor Red }
@@ -157,11 +157,11 @@ try {
         Git-In $Tree add -N -- @newFiles | Out-Null
     }
     # Every file the patch must add: intent-to-add entries (git diff --name-only --diff-filter=A).
-    $added = @(Git-In $Tree diff --name-only --diff-filter=A -- . ':(exclude)3rdparty') | Where-Object { $_ }
+    $added = @(Git-In $Tree diff --name-only --diff-filter=A -- . ':(exclude)3rdparty' ':(exclude).port_fetch') | Where-Object { $_ }
 
     # ------------------------------------------------------------ make the patch (byte-exact)
     # cmd's redirection keeps git's bytes untouched (PowerShell's pipeline would re-encode them).
-    $cmdLine = "git -C `"$Tree`" -c core.autocrlf=false -c core.quotepath=false diff --no-color --no-ext-diff --binary -- . `":(exclude)3rdparty`" > `"$NewPatch`" 2> `"$errFile`""
+    $cmdLine = "git -C `"$Tree`" -c core.autocrlf=false -c core.quotepath=false diff --no-color --no-ext-diff --binary -- . `":(exclude)3rdparty`" `":(exclude).port_fetch`" > `"$NewPatch`" 2> `"$errFile`""
     & cmd.exe /d /c $cmdLine
     if ($LASTEXITCODE -ne 0) { throw "git diff failed: $(Get-Content -Raw -LiteralPath $errFile)" }
 } finally {

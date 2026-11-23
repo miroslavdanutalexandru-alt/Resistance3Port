@@ -17034,10 +17034,10 @@ index 0000000..55d726f
 +#endif /* PORT_DLSS_QUALITY_H */
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FgDiag.h b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
 new file mode 100644
-index 0000000..6ecc46a
+index 0000000..c159fbb
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,938 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame-generation diagnostics for the DLSS-G (Streamline) path, R2_FG_DIAG / R3_FG_DIAG (default 0 = off, nothing
 +// is measured beyond the always-on reset counters):
@@ -17844,7 +17844,10 @@ index 0000000..6ecc46a
 +		// dump (levels 1-2) or user marker (level 3): hotkey edge; (level 2) a suspect event
 +		if (cfg().key)
 +		{
-+			const bool down = (GetAsyncKeyState(cfg().key) & 0x8000) != 0;
++			// Pause sends press+release together, so the held bit alone is usually missed: also take the
++			// 'pressed since the last call' bit; a held key still marks once
++			const SHORT ks = GetAsyncKeyState(cfg().key);
++			const bool down = (ks & 0x8001) != 0;
 +			if (down && !s.key_was)
 +			{
 +				if (cfg().level >= 3)
@@ -17860,7 +17863,7 @@ index 0000000..6ecc46a
 +					start_dump(s, "hotkey");
 +				}
 +			}
-+			s.key_was = down;
++			s.key_was = (ks & 0x8000) != 0;
 +		}
 +		if (cfg().level == 2 && s.left <= 0 && s.auto_n < cfg().auto_max && t - s.auto_last >= 20000.0)
 +		{
