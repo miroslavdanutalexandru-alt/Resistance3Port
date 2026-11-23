@@ -26,6 +26,26 @@ int main(void)
 {
     uint32_t cur[KBM_LAYOUT_SLOTS];
 
+    /* the shipped layout as func_003C8D30 stores it (offset, word), written out
+     * from the recompiled stores, not from kbm_def_layout: +0x2C is 0x8000 (Left;
+     * R_5 = R_11 | 0x8000 comes before that store, the 0x20 went to +0x8) */
+    {
+        static const uint32_t game[][2] = {
+            { 0x00, 0x0004 }, { 0x04, 0x0080 }, { 0x08, 0x0020 }, { 0x0C, 0x0040 },
+            { 0x10, 0x0002 }, { 0x14, 0x0002 }, { 0x18, 0x0800 }, { 0x1C, 0x0000 },
+            { 0x20, 0x0008 }, { 0x24, 0x0008 }, { 0x28, 0x2000 }, { 0x2C, 0x8000 },
+            { 0x30, 0x4000 }, { 0x34, 0x0010 }, { 0x38, 0x0400 }, { 0x3C, 0x0001 },
+            { 0x40, 0x0000 }, { 0x44, 0x1000 },
+        };
+        for (int i = 0; i < KBM_LAYOUT_SLOTS; i++) cur[game[i][0] / 4] = game[i][1];
+        for (int i = 0; i < KBM_LAYOUT_SLOTS; i++) assert(kbm_def_layout[i] == cur[i]);
+        assert(kbm_layout_valid(cur));
+        /* every key sends its own button, d-pad Left included */
+        assert(kbm_layout_translate(CELL_PAD_CTRL_LEFT, cur) == CELL_PAD_CTRL_LEFT);
+        for (int b = 0; b < 16; b++)
+            assert(kbm_layout_translate((uint16_t)(1u << b), cur) == (uint16_t)(1u << b));
+    }
+
     /* shipped layout: nothing moves */
     preset(cur, 0);
     assert(kbm_layout_valid(cur));

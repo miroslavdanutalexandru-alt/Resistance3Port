@@ -1056,7 +1056,8 @@ static void pad_poll_keyboard(void)
       if (fe3 && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }
     btns = pad_aim_toggle(0, btns, menu_raw);
     btns = pad_hold_toggle(0, btns, menu_raw);
-    hs->buttons   = menu_raw ? btns : kbm_translate(btns);   /* keys follow the game's controller layout */
+    if (!menu_raw) btns = kbm_translate(btns);   /* keys follow the game's controller layout (triggers, pressure too) */
+    hs->buttons   = btns;
     g_port_use_kbm = interact;
     hs->connected = 1;
     hs->analog_lx = padk_axis(lx < 0, lx > 0);   /* full deflection at once, no ramp */

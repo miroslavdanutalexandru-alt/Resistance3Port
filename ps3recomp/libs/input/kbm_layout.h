@@ -23,9 +23,11 @@
 #define KBM_LAYOUT_SLOTS   18
 #define KBM_SLOT_UNREAD    5    /* +0x14: a second Circle word the game's lookup never reads */
 
-/* func_003C8D30: jump, fire, secondary fire, zoom, crouch, (unread), melee, -,
- * reload, use, next grenade, previous grenade, call partner, throw grenade,
- * sprint, weapon select, -, d-pad up (scope zoom) */
+/* func_003C8D30 (offset = slot*4): jump, fire, secondary fire, zoom, crouch,
+ * (unread), melee, -, reload, use, next grenade (Right), previous grenade
+ * (+0x2C = Left: R_5 is set to 0x8000 before that store; its earlier 0x20 went
+ * to +0x8), call partner, throw grenade, sprint, weapon select, -, d-pad up
+ * (scope zoom) */
 static const uint16_t kbm_def_layout[KBM_LAYOUT_SLOTS] = {
     0x0004, 0x0080, 0x0020, 0x0040, 0x0002, 0x0002, 0x0800, 0x0000, 0x0008,
     0x0008, 0x2000, 0x8000, 0x4000, 0x0010, 0x0400, 0x0001, 0x0000, 0x1000,
