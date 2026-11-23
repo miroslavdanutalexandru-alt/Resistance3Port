@@ -187,7 +187,7 @@ static void opts_init(void)
     opt_add(OPT_FOV, L"Field of view", L"How much of the scene you see; the zoom while aiming scales with it. Shadows stay aligned.", "fov", 0,
             { {L"Original", ""}, {L"+10%", "1.1"}, {L"+20%", "1.2"}, {L"+30%", "1.3"}, {L"+40%", "1.4"}, {L"+50%", "1.5"},
               {L"+60%", "1.6"}, {L"Wider (old setting)", "0.85"}, {L"Widest (old setting)", "0.7"} }, fov);
-    opt_add(OPT_ASPECT, L"Ultrawide / aspect ratio", L"Fit window widens the view to the window's shape (Hor+: more on the sides). The HUD is stretched.", "aspect", 1,
+    opt_add(OPT_ASPECT, L"Ultrawide / aspect ratio", L"Fit window widens the view to the window's shape (Hor+: more on the sides). The HUD is stretched.", "aspect", 0,
             { {L"16:9 (PS3 original)", ""}, {L"Fit window", "auto"}, {L"21:9", "21:9"}, {L"32:9", "32:9"} }, env_or("R3_ULTRAWIDE", ""));
     opt_add(OPT_PROMPTS, L"Button prompts", L"Which buttons the game shows with a controller (keyboard always shows keys).", "padglyphs", 0,
             { {L"Auto", ""}, {L"Keyboard keys", "keys"}, {L"Xbox", "xbox"}, {L"PlayStation", "ps"}, {L"Nintendo", "nintendo"} }, env_or("R2_PAD_GLYPHS", ""));
@@ -209,6 +209,7 @@ static void fov_live(const std::string& v)
     r3_fov_set_live(v.c_str());
 }
 extern "C" void r3_fx_set_ads_blur(int on);   /* r3_pcextra.cpp */
+extern "C" void r3_aspect_set_live(const char* v);   /* r3_patches.cpp: R3_ULTRAWIDE */
 static void opt_apply(int i)
 {
     PcOpt& o = s_opt[i];
@@ -233,7 +234,7 @@ static void opt_apply(int i)
         bat_set("RSX_UPSCALE", v == "0" ? "1" : up);
         break; }
     case OPT_FOV: bat_set("R2_PATCH_FOV_VALUE", v); fov_live(v); break;
-    case OPT_ASPECT: bat_set("R3_ULTRAWIDE", v); break;
+    case OPT_ASPECT: bat_set("R3_ULTRAWIDE", v); if (vm_base) r3_aspect_set_live(v.c_str()); break;
     case OPT_PROMPTS: bat_set("R2_PAD_GLYPHS", v); cellpad_set_glyph_pref(v.c_str()); break;
     case OPT_ADSBLUR:
         /* retire a legacy R3_FX_DOF=aim (= DOF on + ADS blur off) so On sticks across restarts */

@@ -1094,6 +1094,15 @@ extern "C" int r2rsx_prof_sample(double* frames, double* draws_per_frame, double
 	return df != 0;
 }
 
+// R3_ULTRAWIDE changed from the game's menus (project/r3_patches.cpp, r3_aspect_set_live): stretch the
+// picture over the window, or pillarbox it again. RPCS3 reads this setting at every present.
+extern "C" void r2rsx_set_stretch(int on)
+{
+	if (g_cfg.video.stretch_to_display_area.get() == (on != 0)) return;
+	g_cfg.video.stretch_to_display_area.set(on != 0);
+	std::printf("[r2rsx] R3_ULTRAWIDE: picture %s\n", on ? "stretched to the window" : "16:9 with side bars");
+}
+
 extern "C" int r2rsx_enabled(void)
 {
 	if (s_enabled < 0)

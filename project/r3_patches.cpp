@@ -39,7 +39,9 @@
 #include "ppu_recomp.h"
 #include "r3_fov_math.h"
 #include "r3_dtfloor.h"
+#include <atomic>
 #include <chrono>
+#include <mutex>
 
 extern "C" double r2_fps_target(void);   /* stubs.cpp: 30 = the game's own limiter */
 extern "C" void r3_fov_set_live(const char* v);
@@ -208,28 +210,43 @@ extern "C" int r3_fov_safe_mode(void)
     return m;
 }
 
+/* R3_ULTRAWIDE, at boot and live (F10 menu / Options rows, r3_pcport.cpp): the mode and the fixed
+ * aspect are read by the frustum hook every frame, so a change takes effect on the next frame. */
+extern "C" void r2rsx_set_stretch(int on);   /* rpcs3_bridge: the picture stretched over the window */
+namespace {
+std::atomic<int> g_aspect_mode{-1};          /* -1 not read yet, 0 off, 1 follow the window, 2 fixed */
+std::atomic<double> g_aspect_fixed{0.0};
+std::once_flag g_aspect_once;
+} // namespace
+
+extern "C" void r3_aspect_set_live(const char* e)
+{
+    double fixed = 0.0;
+    int mode = r3fov::parse_aspect(e, &fixed);
+    fprintf(stderr, "[aspect] R3_ULTRAWIDE=%s: %s\n", (e && *e) ? e : "(unset)",
+            mode == 0 ? "off (16:9)" : mode == 1 ? "Hor+, follows the window" : "Hor+, fixed");
+    if (mode == 2) fprintf(stderr, "[aspect] target %.4f\n", fixed);
+    /* the native renderers (R2_RSX=vulkan/native/d3d12) always pillarbox the 16:9 image, so a
+     * wider frustum would only squeeze the picture: stay at 16:9 there */
+    if (mode != 0 && !r2rsx_enabled()) {
+        fprintf(stderr, "[aspect] WARNING: R3_ULTRAWIDE=%s needs the Compatible (RPCS3) renderer; the native "
+                        "renderer (R2_RSX=%s) shows 16:9 with side bars -- ultrawide off\n",
+                e, getenv("R2_RSX") ? getenv("R2_RSX") : "?");
+        mode = 0;
+    }
+    g_aspect_fixed.store(fixed);
+    g_aspect_mode.store(mode);
+    if (r2rsx_enabled()) r2rsx_set_stretch(mode != 0);
+}
+
 extern "C" double r3_target_aspect(void)
 {
-    static int mode = -1;
-    static double fixed = 0.0, live = 16.0 / 9.0;
+    static double live = 16.0 / 9.0;
     static unsigned long long next = 0;
-    if (mode < 0) {
-        const char* e = getenv("R3_ULTRAWIDE");
-        mode = r3fov::parse_aspect(e, &fixed);
-        fprintf(stderr, "[aspect] R3_ULTRAWIDE=%s: %s\n", e ? e : "(unset)",
-                mode == 0 ? "off (16:9)" : mode == 1 ? "Hor+, follows the window" : "Hor+, fixed");
-        if (mode == 2) fprintf(stderr, "[aspect] target %.4f\n", fixed);
-        /* the native renderers (R2_RSX=vulkan/native/d3d12) always pillarbox the 16:9 image, so a
-         * wider frustum would only squeeze the picture: stay at 16:9 there */
-        if (mode != 0 && !r2rsx_enabled()) {
-            fprintf(stderr, "[aspect] WARNING: R3_ULTRAWIDE=%s needs the Compatible (RPCS3) renderer; the native "
-                            "renderer (R2_RSX=%s) shows 16:9 with side bars -- ultrawide off\n",
-                    e, getenv("R2_RSX") ? getenv("R2_RSX") : "?");
-            mode = 0;
-        }
-    }
-    if (mode == 0) return 0.0;
-    if (mode == 2) return fixed;
+    std::call_once(g_aspect_once, [] { if (g_aspect_mode.load() < 0) r3_aspect_set_live(getenv("R3_ULTRAWIDE")); });
+    const int mode = g_aspect_mode.load();
+    if (mode <= 0) return 0.0;
+    if (mode == 2) return g_aspect_fixed.load();
     const unsigned long long now = GetTickCount64();
     if (now >= next && g_kbm_hwnd) {
         next = now + 250;
