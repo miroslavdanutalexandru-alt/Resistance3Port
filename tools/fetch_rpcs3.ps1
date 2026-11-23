@@ -84,8 +84,11 @@ function Invoke-GitRaw([string[]]$GitArgs) {
     # otherwise stop at git's first progress line, and without the merge the messages never reach Setup's log.
     $ErrorActionPreference = 'Continue'
     $cfg = $script:GitCfg
-    $lines = @(& git @cfg @GitArgs 2>&1 | ForEach-Object { "$_" })
-    [pscustomobject]@{ Code = $LASTEXITCODE; Lines = $lines }
+    $all = @(& git @cfg @GitArgs 2>&1)
+    $code = $LASTEXITCODE
+    # Out: stdout only (stderr lines arrive as ErrorRecords), for commands whose output is a value
+    [pscustomobject]@{ Code = $code; Lines = @($all | ForEach-Object { "$_" })
+                       Out = @($all | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) }
 }
 function Invoke-Git {
     $gitArgs = @(foreach ($a in $args) { foreach ($b in @($a)) { "$b" } })   # arrays (submodule lists) flattened
@@ -126,11 +129,20 @@ function Repair-GitNetwork([string]$Text) {
     }
     return $false
 }
+# [scheme://][user[:pass]@]host:port - anything else (a warning git printed, an error) is not a proxy.
+function Test-ProxyValue([string]$Value) {
+    $Value -match '^(?:[A-Za-z][A-Za-z0-9+.-]*://)?(?:[^@\s/]+@)?(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):\d{1,5}/?$'
+}
 # The proxy git is already told about (environment or git config), if any.
 function Get-GitProxy {
-    foreach ($v in 'HTTPS_PROXY', 'ALL_PROXY') { $x = [Environment]::GetEnvironmentVariable($v); if ($x) { return $x } }
-    $x = "$((Invoke-GitRaw @('config', '--get', 'http.proxy')).Lines)".Trim()
-    if ($x) { return $x }
+    foreach ($v in 'HTTPS_PROXY', 'ALL_PROXY') {
+        $x = "$([Environment]::GetEnvironmentVariable($v))".Trim()
+        if ($x -and (Test-ProxyValue $x)) { return $x }
+    }
+    $r = Invoke-GitRaw @('config', '--get', 'http.proxy')
+    if ($r.Code -ne 0) { return $null }
+    $x = "$(@($r.Out | Where-Object { "$_".Trim() }) | Select-Object -Last 1)".Trim()
+    if ($x -and (Test-ProxyValue $x)) { return $x }
     $null
 }
 # The proxy Windows uses for github.com (manual setting, PAC script or auto-detect), $null when it connects directly.

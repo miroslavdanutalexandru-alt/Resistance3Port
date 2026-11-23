@@ -81,6 +81,7 @@ $script:GitCfg += @('-c', 'protocol.file.allow=always', '-c', 'uploadpack.allowA
 $script:BaseCfg = $script:GitCfg
 $script:FakeSysProxy = $null
 function Get-SystemProxy { $script:FakeSysProxy }
+${function:Real-GitProxy} = ${function:Get-GitProxy}
 function Get-GitProxy { $null }
 ${function:Real-GitRaw} = ${function:Invoke-GitRaw}
 $script:Rules = @()      # @{ Match = regex on the joined args; Text = what "git" says; Times = how often (0 = always) }
@@ -177,6 +178,24 @@ Reset-Run; Clear-All
 $script:Rules = @(@{ Match = 'fetch -q --depth 1'; Text = 'fatal: unable to access: Failed to connect to github.com port 443'; Times = 1; Used = 0 })
 Check (Run-Fetch) 'no Windows proxy: finishes'
 Check (-not @($script:GitCfg | Where-Object { $_ -like 'http.proxy=*' }).Count) 'no Windows proxy: none set'
+# the real Get-GitProxy, with a stand-in "git" (a native process: stderr arrives the way git's does)
+$envProxy = @{}; foreach ($v in 'HTTPS_PROXY', 'ALL_PROXY') { $envProxy[$v] = [Environment]::GetEnvironmentVariable($v); [Environment]::SetEnvironmentVariable($v, $null) }
+$script:FakeGit = ''
+function git { cmd /d /c $script:FakeGit }
+$script:FakeGit = "(echo warning: Unsupported SSL backend 'schannel')1>&2&echo http://proxy.test:3128"
+Check ((Real-GitProxy) -eq 'http://proxy.test:3128') 'git config proxy: warning on stderr ignored'
+$script:FakeGit = "echo http://proxy.test:3128&(echo warning: Unsupported SSL backend 'schannel')1>&2"
+Check ((Real-GitProxy) -eq 'http://proxy.test:3128') 'git config proxy: warning after the value ignored'
+$script:FakeGit = "(echo warning: Unsupported SSL backend 'schannel')1>&2&exit /b 1"
+Check ($null -eq (Real-GitProxy)) 'no git config proxy (exit 1, only a warning): none'
+$script:FakeGit = "echo fatal: bad config line 3&exit /b 0"
+Check ($null -eq (Real-GitProxy)) 'git config output that is not host:port: none'
+$script:FakeGit = "echo user:p%40ss@10.0.0.1:8080"
+Check ((Real-GitProxy) -eq 'user:p%40ss@10.0.0.1:8080') 'git config proxy with credentials, no scheme'
+[Environment]::SetEnvironmentVariable('HTTPS_PROXY', 'not a proxy')
+Check ((Real-GitProxy) -eq 'user:p%40ss@10.0.0.1:8080') 'invalid HTTPS_PROXY skipped'
+Remove-Item function:git
+foreach ($v in $envProxy.Keys) { [Environment]::SetEnvironmentVariable($v, $envProxy[$v]) }
 
 Write-Host 'fetch_rpcs3: archives downloaded by hand'
 Reset-Run; Clear-All
