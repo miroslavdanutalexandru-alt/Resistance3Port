@@ -17032,6 +17032,539 @@ index 0000000..55d726f
 +}
 +
 +#endif /* PORT_DLSS_QUALITY_H */
+diff --git a/rpcs3/Emu/RSX/VK/VKR2FgDiag.h b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
+new file mode 100644
+index 0000000..b16e616
+--- /dev/null
++++ b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
+@@ -0,0 +1,527 @@
++// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
++// Frame-generation diagnostics for the DLSS-G (Streamline) path, R2_FG_DIAG / R3_FG_DIAG (default 0 = off, nothing
++// is measured beyond the always-on reset counters):
++//   1 = a "[fg-diag]" line per second (real vs generated presents, FG resets by reason with the held camera-cut
++//       values, pauses, frames whose inputs were missing, real present-interval histogram / spikes / pace jumps,
++//       time inside the Streamline present, Reflex sleep, DWM refresh and composition rate) plus a hotkey that writes
++//       the per-frame data of the previous 30 and the next R?_FG_DIAG_FRAMES (default 120) presents to logs\fgdiag.txt
++//   2 = as 1, and the same dump starts by itself on a suspect event (a mid-stream reset, a generated frame Streamline
++//       did not present, a pause, a frame-time spike or pace jump); at most R?_FG_DIAG_AUTO_MAX (default 10) dumps,
++//       20 s apart.
++// R?_FG_DIAG_KEY = pause (default) | scroll | f1..f24 | none. Pause is also RSX_MV_DUMP's capture key and Scroll Lock
++// PORT_FRAMETIME's marker; a conflict is logged.
++// Included once, by VKR2FrameGen.cpp (Streamline builds); the same file in the R2 and R3 ports.
++#pragma once
++
++#ifdef _WIN32
++#include <windows.h>
++#include <dwmapi.h>
++#endif
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace r2fgdiag
++{
++	inline const char* env(const char* name)
++	{
++		static const char* const pfx[] = { "R2_", "R3_", "R1_" };
++		char full[64];
++		for (const char* p : pfx)
++		{
++			std::snprintf(full, sizeof(full), "%s%s", p, name);
++			if (const char* v = std::getenv(full); v && *v) return v;
++		}
++		return nullptr;
++	}
++
++	struct cfg_t
++	{
++		int level = 0, frames = 120, key = 0, auto_max = 10;
++		char key_name[16] = "none";
++	};
++
++	inline int parse_key(const char* v, char* name, size_t cap)
++	{
++		if (!v || !*v || !_stricmp(v, "pause") || !_stricmp(v, "break")) { std::snprintf(name, cap, "Pause"); return 0x13; }
++		if (!_stricmp(v, "scroll") || !_stricmp(v, "scrolllock")) { std::snprintf(name, cap, "Scroll Lock"); return 0x91; }
++		if ((v[0] == 'f' || v[0] == 'F') && std::atoi(v + 1) >= 1 && std::atoi(v + 1) <= 24)
++		{
++			std::snprintf(name, cap, "F%d", std::atoi(v + 1));
++			return 0x70 + std::atoi(v + 1) - 1;
++		}
++		std::snprintf(name, cap, "none");
++		return 0;
++	}
++
++	inline const cfg_t& cfg()
++	{
++		static const cfg_t c = []
++		{
++			cfg_t r;
++			if (const char* v = env("FG_DIAG")) r.level = std::clamp(std::atoi(v), 0, 2);
++			if (!r.level) return r;
++			if (const char* v = env("FG_DIAG_FRAMES")) r.frames = std::clamp(std::atoi(v), 10, 2000);
++			if (const char* v = env("FG_DIAG_AUTO_MAX")) r.auto_max = std::clamp(std::atoi(v), 0, 1000);
++			r.key = parse_key(env("FG_DIAG_KEY"), r.key_name, sizeof(r.key_name));
++			std::fprintf(stderr, "[fg-diag] frame-generation diagnostics level %d: 1 line per second; %s dumps the previous 30 and next %d presents to logs\\fgdiag.txt%s\n",
++				r.level, r.key ? r.key_name : "no key", r.frames, r.level >= 2 ? " (also by itself on a suspect event)" : "");
++			const char* ft = std::getenv("PORT_FT_MARKER_KEY");
++			const bool ft_on = std::getenv("PORT_FRAMETIME") && *std::getenv("PORT_FRAMETIME") && *std::getenv("PORT_FRAMETIME") != '0';
++			if (r.key == 0x13 && std::getenv("RSX_MV_DUMP") && *std::getenv("RSX_MV_DUMP"))
++				std::fprintf(stderr, "[fg-diag] hotkey conflict: Pause is also RSX_MV_DUMP's capture key (set R2_FG_DIAG_KEY / R3_FG_DIAG_KEY)\n");
++			if (ft_on && ((r.key == 0x13 && ft && !_stricmp(ft, "pause")) || (r.key == 0x91 && (!ft || !*ft || !_stricmp(ft, "scroll") || !_stricmp(ft, "scrolllock")))))
++				std::fprintf(stderr, "[fg-diag] hotkey conflict: %s is also the PORT_FRAMETIME marker key (PORT_FT_MARKER_KEY)\n", r.key_name);
++			return r;
++		}();
++		return c;
++	}
++	inline bool on() { return cfg().level > 0; }
++
++	inline double now_ms()
++	{
++#ifdef _WIN32
++		static const double inv = []
++		{
++			LARGE_INTEGER f{};
++			QueryPerformanceFrequency(&f);
++			return 1000.0 / static_cast<double>(f.QuadPart ? f.QuadPart : 1);
++		}();
++		LARGE_INTEGER c{};
++		QueryPerformanceCounter(&c);
++		return static_cast<double>(c.QuadPart) * inv;
++#else
++		return 0.0;
++#endif
++	}
++
++	// upscaler-side state of the frame being built (VKR2Upscaler.cpp, the RSX thread); taken by the next present.
++	// The reset bits are always collected (a few atomics per frame) for the 10 s "[fg-vk] FG resets" line.
++	struct pending_t
++	{
++		std::atomic<u32> why{ 0 };       // upscaler reset_why bits (1 scene-switch, 2 created, 4 size, 8 no-previous,
++		                                  // 16 camera-cut, 32 nothing-matched, 64 hitch, 128 output-size, 256 mv-confidence, 512 parallax-cut)
++		std::atomic<u32> flags{ 0 };     // 1 upscaler reset, 2 held cut voted, 4 held cut untrusted, 8 held cut reset FG
++		std::atomic<float> cut_motion{ 0.f }, cut_par{ 0.f };
++		std::atomic<u32> cut_members{ 0 }, cut_matched{ 0 };
++		std::atomic<float> moved{ 0.f };  // sum |T - previous T| (VKR2FrameGen.cpp r2fg_tag_scene)
++		std::atomic<u64> sleep_us{ 0 }, sleep_max_us{ 0 };
++		std::atomic<u32> sleeps{ 0 };
++	};
++	inline pending_t& pend() { static pending_t p; return p; }
++
++	inline void note_upscaler(bool upscaler_reset, u32 why, int cut_kind, bool cut_reset)
++	{
++		auto& p = pend();
++		if (upscaler_reset) p.why.fetch_or(why ? why : 0x80000000u);
++		p.flags.fetch_or((upscaler_reset ? 1u : 0u) | (cut_kind == 2 ? 2u : cut_kind == 1 ? 4u : 0u) | (cut_reset ? 8u : 0u));
++	}
++	inline void note_cut(double motion, double par, u32 members, u32 matched)
++	{
++		if (!on()) return;
++		auto& p = pend();
++		p.cut_motion = static_cast<float>(motion);
++		p.cut_par = static_cast<float>(par);
++		p.cut_members = members;
++		p.cut_matched = matched;
++	}
++	inline void note_moved(double moved) { if (on()) pend().moved = static_cast<float>(moved); }
++	inline void note_sleep(double ms)
++	{
++		auto& p = pend();
++		const u64 us = static_cast<u64>(std::max(0.0, ms) * 1000.0);
++		p.sleep_us += us;
++		p.sleeps++;
++		u64 m = p.sleep_max_us.load();
++		while (us > m && !p.sleep_max_us.compare_exchange_weak(m, us)) {}
++	}
++
++	// one call per real (rendered) frame from fg_queue_present, after the Streamline present
++	struct present_in
++	{
++		bool on = false, want = false, ready = false, scene = false, tok = false, immediate = false;
++		bool reset = false, resume = false, sc_new = false, up_reset = false;
++		bool st_ok = false;
++		u32 n = 2, shown = 0, status = 0, reflex_us = ~0u;
++		u32 miss = 0; // wanted but not on: 1 no frame token, 2 scene inputs not ready, 4 no depth / MVs, 8 no HUD split
++		double call_ms = 0.0;
++		const std::string* reason = nullptr;
++	};
++
++	struct row
++	{
++		double t, dt, call_ms, sleep_ms;
++		float moved, cut_motion, cut_par;
++		u32 idx, n, shown, status, reflex_us, why, flags, cut_members, cut_matched, miss;
++		u8 on, want, ready, scene, reset, resume, sc_new, up_reset, st_ok, spike, jump;
++		char reason[40];
++	};
++
++	// cause of a reset (one per reset, first match): resume (FG was off last frame), swapchain, held camera cut, upscaler, other
++	enum { R_RESUME, R_SWAPCHAIN, R_CUT, R_UPSCALER, R_OTHER, R_COUNT };
++	inline const char* reset_name(int i)
++	{
++		static const char* const n[R_COUNT] = { "resume", "swapchain", "held-cut", "upscaler", "other" };
++		return n[i];
++	}
++
++	struct state_t
++	{
++		// always-on 10 s counters (the [fg-vk] FG resets line)
++		u32 r10[R_COUNT]{}, short10 = 0, pause10 = 0;
++		// per second (level >= 1)
++		double sec_t0 = 0.0, last_t = 0.0, ema = 0.0, prev_dt = 0.0;
++		u32 real = 0, on_frames = 0, gen = 0, short_n = 0, st_err = 0, pauses = 0, miss_n = 0, miss_bits = 0;
++		u32 resets[R_COUNT]{}, up_why = 0, cut_voted = 0, cut_untrusted = 0, cut_fg = 0;
++		float cut_motion_min = 0.f, cut_par_max = 0.f, cut_par_min = 0.f;
++		u32 hist[8]{}, spikes = 0, jumps = 0;
++		std::vector<float> dts;
++		double call_sum = 0.0, call_max = 0.0, sleep_sum = 0.0;
++		std::string pause_why;
++		bool prev_on = false;
++		// dwm
++		bool dwm_tried = false;
++		void* dwm_fn = nullptr;
++		u64 dwm_refresh = 0, dwm_frame = 0, dwm_dropped = 0, dwm_missed = 0;
++		double dwm_t = 0.0;
++		// dump
++		std::vector<row> ring;
++		u32 ring_pos = 0, idx = 0;
++		std::vector<row> dump;
++		int left = 0, auto_n = 0;
++		double auto_last = -1e18;
++		std::string dump_why;
++		bool key_was = false;
++	};
++	inline state_t& st() { static state_t s; return s; }
++
++	inline int bucket(double dt)
++	{
++		static const double edge[7] = { 8.0, 12.0, 16.0, 20.0, 25.0, 33.4, 50.0 };
++		int b = 0;
++		while (b < 7 && dt >= edge[b]) ++b;
++		return b;
++	}
++
++	inline std::string why_names(u32 w)
++	{
++		static const char* const n[10] = { "scene-switch", "created", "size", "no-previous", "camera-cut", "nothing-matched", "hitch", "output-size", "mv-confidence", "parallax-cut" };
++		std::string s;
++		for (int b = 0; b < 10; ++b)
++			if (w & (1u << b)) { if (!s.empty()) s += '+'; s += n[b]; }
++		if (w & 0x80000000u) { if (!s.empty()) s += '+'; s += "unlabelled"; }
++		return s;
++	}
++
++	inline std::string logs_dir()
++	{
++#ifdef _WIN32
++		char exe[MAX_PATH]{};
++		const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
++		std::string d(exe, n);
++		const size_t s = d.find_last_of('\\');
++		if (s != std::string::npos) d.resize(s);
++		return d + "\\..\\logs"; // <port>\build\X.exe -> <port>\logs
++#else
++		return "logs";
++#endif
++	}
++
++	inline void write_dump(std::vector<row> rows, std::string why, u32 frames_wanted)
++	{
++		std::thread([rows = std::move(rows), why = std::move(why), frames_wanted]
++		{
++			const std::string dir = logs_dir();
++#ifdef _WIN32
++			CreateDirectoryA(dir.c_str(), nullptr);
++#endif
++			const std::string path = dir + "\\fgdiag.txt";
++			FILE* fp = std::fopen(path.c_str(), "a");
++			if (!fp) { std::fprintf(stderr, "[fg-diag] cannot write %s\n", path.c_str()); return; }
++			SYSTEMTIME lt{};
++			GetLocalTime(&lt);
++			std::fprintf(fp, "\n=== fg-diag dump %04u-%02u-%02u %02u:%02u:%02u.%03u: %s (%u presents asked, %zu rows) ===\n",
++				lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds, why.c_str(), frames_wanted, rows.size());
++			std::fprintf(fp, "# one row per real (rendered) present; '<' rows are before the trigger. dt = interval since the previous real present (ms),\n"
++				"# call = time inside the Streamline present, sleep = Reflex sleep before this frame, on/n/shown = FG on, multiplier, frames Streamline presented\n"
++				"# (shown < n: a generated frame was not presented), status = DLSS-G status bits, reset = R resume / S swapchain / U upscaler / C held cut,\n"
++				"# why = upscaler reset bits, cut = held camera cut V voted / U untrusted (motion, parallax, vote), moved = camera matrix change,\n"
++				"# miss = wanted but not on (1 token 2 not ready 4 depth/MV 8 HUD split), mark: ! spike (> 1.6x average), J pace jump (> 1.5x previous interval)\n");
++			std::fprintf(fp, "%-1s %6s %10s %7s %6s %6s %2s %1s %5s %6s %-5s %-34s %-30s %8s %4s %6s %-2s %s\n",
++				"", "idx", "t_ms", "dt", "call", "sleep", "on", "n", "shown", "status", "reset", "why", "cut", "moved", "miss", "reflex", "mk", "want/ready/scene reason");
++			for (const row& r : rows)
++			{
++				char rs[8]{}; int k = 0;
++				if (r.resume) rs[k++] = 'R';
++				if (r.sc_new) rs[k++] = 'S';
++				if (r.up_reset) rs[k++] = 'U';
++				if (r.flags & 8) rs[k++] = 'C';
++				if (!k) rs[k++] = r.reset ? '?' : '-';
++				char cut[48] = "-";
++				if (r.flags & 6)
++					std::snprintf(cut, sizeof(cut), "%c m%.3f p%.3f v%u/%u", (r.flags & 4) ? 'U' : 'V', r.cut_motion, r.cut_par, r.cut_members, r.cut_matched);
++				const std::string w = r.why ? why_names(r.why) : std::string("-");
++				char mk[3] = { r.spike ? '!' : '.', r.jump ? 'J' : '.', 0 };
++				std::fprintf(fp, "%-1s %6u %10.1f %7.2f %6.2f %6.2f %2u %1u %5u %6x %-5s %-34s %-30s %8.4f %4x %6d %-2s %u%u%u %s\n",
++					r.idx & 0x80000000u ? "<" : "", r.idx & 0x7fffffffu, r.t, r.dt, r.call_ms, r.sleep_ms, r.on, r.n, r.shown, r.status, rs,
++					w.c_str(), cut, r.moved, r.miss, r.reflex_us == ~0u ? -1 : static_cast<int>(r.reflex_us), mk, r.want, r.ready, r.scene, r.reason);
++			}
++			std::fclose(fp);
++			std::fprintf(stderr, "[fg-diag] wrote %zu rows to %s (%s)\n", rows.size(), path.c_str(), why.c_str());
++		}).detach();
++	}
++
++	inline void start_dump(state_t& s, const char* why)
++	{
++		if (s.left > 0) return;
++		s.dump.clear();
++		s.dump.reserve(s.ring.size() + static_cast<size_t>(cfg().frames));
++		const u32 rn = static_cast<u32>(s.ring.size());
++		for (u32 i = 0; i < rn; ++i)
++		{
++			row r = s.ring[(s.ring_pos + i) % rn];
++			if (r.idx == 0 && r.t == 0.0) continue; // never filled
++			r.idx |= 0x80000000u;
++			s.dump.push_back(r);
++		}
++		s.left = cfg().frames;
++		s.dump_why = why;
++	}
++
++	inline void dwm_sample(state_t& s, double t, char* out, size_t cap)
++	{
++		out[0] = 0;
++#ifdef _WIN32
++		if (!s.dwm_tried)
++		{
++			s.dwm_tried = true;
++			if (HMODULE m = LoadLibraryW(L"dwmapi.dll")) s.dwm_fn = reinterpret_cast<void*>(GetProcAddress(m, "DwmGetCompositionTimingInfo"));
++		}
++		if (!s.dwm_fn) return;
++		using fn_t = HRESULT(WINAPI*)(HWND, DWM_TIMING_INFO*);
++		DWM_TIMING_INFO ti{};
++		ti.cbSize = sizeof(ti);
++		if (FAILED(reinterpret_cast<fn_t>(s.dwm_fn)(nullptr, &ti))) return;
++		if (s.dwm_t > 0.0 && t > s.dwm_t)
++		{
++			const double sec = (t - s.dwm_t) / 1000.0;
++			std::snprintf(out, cap, " | dwm %.0f Hz, %.0f compositions/s", static_cast<double>(ti.cRefresh - s.dwm_refresh) / sec,
++				static_cast<double>(ti.cFrame - s.dwm_frame) / sec);
++			if ((ti.cFramesDropped - s.dwm_dropped) || (ti.cFramesMissed - s.dwm_missed))
++			{
++				const size_t l = std::strlen(out);
++				std::snprintf(out + l, cap - l, ", dropped %llu missed %llu", static_cast<unsigned long long>(ti.cFramesDropped - s.dwm_dropped),
++					static_cast<unsigned long long>(ti.cFramesMissed - s.dwm_missed));
++			}
++		}
++		s.dwm_refresh = ti.cRefresh; s.dwm_frame = ti.cFrame; s.dwm_dropped = ti.cFramesDropped; s.dwm_missed = ti.cFramesMissed;
++		s.dwm_t = t;
++#else
++		(void)s; (void)t; (void)cap;
++#endif
++	}
++
++	// always called (cheap when off: the 10 s reset counters only)
++	inline void present(const present_in& in)
++	{
++		auto& s = st();
++		auto& p = pend();
++		const u32 why = p.why.exchange(0);
++		const u32 flags = p.flags.exchange(0);
++		int cause = R_COUNT;
++		if (in.on && in.reset)
++		{
++			cause = in.resume ? R_RESUME : in.sc_new ? R_SWAPCHAIN : (flags & 8) ? R_CUT : (in.up_reset && (flags & 1)) ? R_UPSCALER : R_OTHER;
++			s.r10[cause]++;
++		}
++		const bool is_short = in.on && in.st_ok && in.shown < in.n;
++		if (is_short) s.short10++;
++		const bool paused_now = s.prev_on && !in.on;
++		if (paused_now) s.pause10++;
++		if (!on())
++		{
++			s.prev_on = in.on;
++			return;
++		}
++
++		const double t = now_ms();
++		const double dt = s.last_t > 0.0 ? t - s.last_t : 0.0;
++		s.last_t = t;
++		if (!s.sec_t0) s.sec_t0 = t;
++		if (s.ring.empty()) s.ring.resize(30);
++
++		bool spike = false, jump = false;
++		if (dt > 0.0 && dt < 2000.0)
++		{
++			spike = s.ema > 0.0 && dt > 1.6 * s.ema;
++			jump = s.prev_dt > 0.0 && dt > 1.5 * s.prev_dt && dt - s.prev_dt > 4.0;
++			s.ema = s.ema > 0.0 ? s.ema * 0.9 + dt * 0.1 : dt;
++			s.prev_dt = dt;
++			s.hist[bucket(dt)]++;
++			s.dts.push_back(static_cast<float>(dt));
++			if (spike) s.spikes++;
++			if (jump && in.on) s.jumps++;
++		}
++
++		s.real++;
++		if (in.on)
++		{
++			s.on_frames++;
++			s.gen += in.st_ok ? (in.shown ? in.shown - 1 : 0) : in.n - 1;
++			if (is_short) s.short_n++;
++			if (in.st_ok && in.status) s.st_err++;
++		}
++		else if (in.want)
++		{
++			s.miss_n++;
++			s.miss_bits |= in.miss;
++		}
++		if (paused_now)
++		{
++			s.pauses++;
++			s.pause_why = in.want ? "inputs missing" : (in.reason && !in.reason->empty() ? *in.reason : std::string("?"));
++		}
++		if (cause != R_COUNT)
++		{
++			s.resets[cause]++;
++			if (cause == R_UPSCALER) s.up_why |= why;
++		}
++		const float cm = p.cut_motion.load(), cp = p.cut_par.load();
++		if (flags & 6)
++		{
++			if (flags & 4) s.cut_untrusted++; else s.cut_voted++;
++			if (flags & 8) s.cut_fg++;
++			if (s.cut_voted + s.cut_untrusted == 1) { s.cut_par_min = s.cut_par_max = cp; s.cut_motion_min = cm; }
++			s.cut_par_max = std::max(s.cut_par_max, cp);
++			s.cut_par_min = std::min(s.cut_par_min, cp);
++			s.cut_motion_min = std::min(s.cut_motion_min, cm);
++		}
++		s.call_sum += in.call_ms;
++		s.call_max = std::max(s.call_max, in.call_ms);
++
++		const u32 sleeps = p.sleeps.exchange(0);
++		const double sleep_ms = sleeps ? static_cast<double>(p.sleep_us.exchange(0)) / 1000.0 : 0.0;
++		s.sleep_sum += sleep_ms;
++
++		row r{};
++		r.t = t; r.dt = dt; r.call_ms = in.call_ms; r.sleep_ms = sleep_ms;
++		r.moved = p.moved.exchange(0.f); r.cut_motion = (flags & 6) ? cm : 0.f; r.cut_par = (flags & 6) ? cp : 0.f;
++		r.idx = ++s.idx & 0x7fffffffu; r.n = in.n; r.shown = in.shown; r.status = in.status; r.reflex_us = in.reflex_us;
++		r.why = in.up_reset ? why : 0u; r.flags = flags;
++		r.cut_members = (flags & 6) ? p.cut_members.load() : 0u; r.cut_matched = (flags & 6) ? p.cut_matched.load() : 0u;
++		r.miss = in.on ? 0u : in.miss;
++		r.on = in.on; r.want = in.want; r.ready = in.ready; r.scene = in.scene; r.reset = in.on && in.reset; r.resume = in.on && in.resume;
++		r.sc_new = in.on && in.sc_new; r.up_reset = in.on && in.up_reset; r.st_ok = in.st_ok; r.spike = spike; r.jump = jump;
++		if (in.reason && !in.reason->empty()) std::snprintf(r.reason, sizeof(r.reason), "%s", in.reason->c_str());
++
++		// dump: hotkey edge, or (level 2) a suspect event
++		if (cfg().key)
++		{
++			const bool down = (GetAsyncKeyState(cfg().key) & 0x8000) != 0;
++			if (down && !s.key_was)
++			{
++				if (s.left > 0) std::fprintf(stderr, "[fg-diag] dump already running (%d presents left)\n", s.left);
++				else
++				{
++					std::fprintf(stderr, "[fg-diag] %s: dumping the previous %zu and next %d presents\n", cfg().key_name, s.ring.size(), cfg().frames);
++					start_dump(s, "hotkey");
++				}
++			}
++			s.key_was = down;
++		}
++		if (cfg().level >= 2 && s.left <= 0 && s.auto_n < cfg().auto_max && t - s.auto_last >= 20000.0)
++		{
++			const char* ev = nullptr;
++			char evb[96];
++			if (cause != R_COUNT && cause != R_RESUME) { std::snprintf(evb, sizeof(evb), "auto: FG reset (%s%s%s)", reset_name(cause), why ? " " : "", why ? why_names(why).c_str() : ""); ev = evb; }
++			else if (is_short) { std::snprintf(evb, sizeof(evb), "auto: generated frame not presented (shown %u of %u)", in.shown, in.n); ev = evb; }
++			else if (paused_now) { std::snprintf(evb, sizeof(evb), "auto: FG paused (%.60s)", s.pause_why.c_str()); ev = evb; }
++			else if (in.on && spike && dt > 2.0 * (s.ema > 0.0 ? s.ema : dt)) { std::snprintf(evb, sizeof(evb), "auto: frame-time spike %.1f ms", dt); ev = evb; }
++			if (ev)
++			{
++				s.auto_n++;
++				s.auto_last = t;
++				std::fprintf(stderr, "[fg-diag] %s: dumping the previous %zu and next %d presents (%d of %d)\n", ev, s.ring.size(), cfg().frames, s.auto_n, cfg().auto_max);
++				start_dump(s, ev);
++			}
++		}
++		if (s.left > 0)
++		{
++			s.dump.push_back(r);
++			if (--s.left == 0) write_dump(std::move(s.dump), s.dump_why, static_cast<u32>(cfg().frames)), s.dump = {};
++		}
++		s.ring[s.ring_pos] = r;
++		s.ring_pos = (s.ring_pos + 1) % static_cast<u32>(s.ring.size());
++
++		if (t - s.sec_t0 >= 1000.0)
++		{
++			const double sec = (t - s.sec_t0) / 1000.0;
++			double p50 = 0.0, mx = 0.0;
++			if (!s.dts.empty())
++			{
++				auto mid = s.dts.begin() + s.dts.size() / 2;
++				std::nth_element(s.dts.begin(), mid, s.dts.end());
++				p50 = *mid;
++				mx = *std::max_element(s.dts.begin(), s.dts.end());
++			}
++			char dwm[96];
++			dwm_sample(s, t, dwm, sizeof(dwm));
++			char resets[200] = "";
++			u32 rtotal = 0;
++			for (int i = 0; i < R_COUNT; ++i)
++			{
++				if (!s.resets[i]) continue;
++				rtotal += s.resets[i];
++				const size_t l = std::strlen(resets);
++				std::snprintf(resets + l, sizeof(resets) - l, "%s%s %u", l ? ", " : " (", reset_name(i), s.resets[i]);
++			}
++			if (rtotal) { const size_t l = std::strlen(resets); std::snprintf(resets + l, sizeof(resets) - l, "%s%s)", s.up_why ? " " : "", s.up_why ? why_names(s.up_why).c_str() : ""); }
++			char cuts[160] = "";
++			if (s.cut_voted + s.cut_untrusted)
++				std::snprintf(cuts, sizeof(cuts), " | held cuts %u voted %u untrusted (FG reset on %u; parallax %.3f-%.3f, motion min %.3f)",
++					s.cut_voted, s.cut_untrusted, s.cut_fg, s.cut_par_min, s.cut_par_max, s.cut_motion_min);
++			char pause[120] = "";
++			if (s.pauses) std::snprintf(pause, sizeof(pause), " | pauses %u (last: %.70s)", s.pauses, s.pause_why.c_str());
++			char miss[64] = "";
++			if (s.miss_n) std::snprintf(miss, sizeof(miss), " | inputs missing %u (bits %x)", s.miss_n, s.miss_bits);
++			std::fprintf(stderr, "[fg-diag] %.2fs: real %u (FG on %u) + generated %u = %.1f fps shown | not presented %u, status errors %u | resets %u%s%s%s%s"
++				" | real dt p50 %.1f max %.1f ms, spikes %u, pace jumps %u | <8 %u 8-12 %u 12-16 %u 16-20 %u 20-25 %u 25-33 %u 33-50 %u >50 %u"
++				" | present call avg %.2f max %.2f ms | Reflex sleep %.1f ms/s, max %.1f ms%s\n",
++				sec, s.real, s.on_frames, s.gen, (s.real + s.gen) / sec, s.short_n, s.st_err, rtotal, resets, cuts, pause, miss,
++				p50, mx, s.spikes, s.jumps, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.hist[5], s.hist[6], s.hist[7],
++				s.real ? s.call_sum / s.real : 0.0, s.call_max, s.sleep_sum / sec, static_cast<double>(p.sleep_max_us.exchange(0)) / 1000.0, dwm);
++			s.sec_t0 = t;
++			s.real = s.on_frames = s.gen = s.short_n = s.st_err = s.pauses = s.miss_n = s.miss_bits = 0;
++			s.up_why = s.cut_voted = s.cut_untrusted = s.cut_fg = 0;
++			s.spikes = s.jumps = 0;
++			std::fill(std::begin(s.resets), std::end(s.resets), 0u);
++			std::fill(std::begin(s.hist), std::end(s.hist), 0u);
++			s.dts.clear();
++			s.call_sum = s.call_max = s.sleep_sum = 0.0;
++		}
++		s.prev_on = in.on;
++	}
++
++	// the always-on 10 s line, next to the "[fg-vk] DLSS-G" health line; empty when nothing happened
++	inline bool summary10(char* out, size_t cap)
++	{
++		auto& s = st();
++		u32 total = 0;
++		for (u32 v : s.r10) total += v;
++		out[0] = 0;
++		if (total || s.short10 || s.pause10)
++		{
++			std::snprintf(out, cap, "frame generation in 10 s: %u resets (resume %u, swapchain %u, held camera cut %u, upscaler %u, other %u) | %u generated frames not presented | %u pauses",
++				total, s.r10[R_RESUME], s.r10[R_SWAPCHAIN], s.r10[R_CUT], s.r10[R_UPSCALER], s.r10[R_OTHER], s.short10, s.pause10);
++		}
++		std::fill(std::begin(s.r10), std::end(s.r10), 0u);
++		s.short10 = s.pause10 = 0;
++		return out[0] != 0;
++	}
++}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Fossilize.cpp b/rpcs3/Emu/RSX/VK/VKR2Fossilize.cpp
 new file mode 100644
 index 0000000..9f877a4
@@ -17552,10 +18085,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..65ea5a0
+index 0000000..ef0b244
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2591 @@
+@@ -0,0 +1,2631 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -17599,6 +18132,7 @@ index 0000000..65ea5a0
 +
 +#ifdef _WIN32
 +#include <windows.h>
++#include "VKR2FgDiag.h" // R2_FG_DIAG / R3_FG_DIAG
 +#endif
 +
 +extern "C"
@@ -17726,6 +18260,20 @@ index 0000000..65ea5a0
 +				kind == PFG_CUT_UNTRUSTED ? "untrusted" : "voted", fgcfg().cut_reset);
 +		}
 +		return true;
++	}
++
++	void r2fg_diag_cut(double motion, double parallax, u32 members, u32 matched)
++	{
++#ifdef _WIN32
++		r2fgdiag::note_cut(motion, parallax, members, matched);
++#endif
++	}
++
++	void r2fg_diag_upscaler(bool upscaler_reset, u32 why, int cut_kind, bool cut_reset)
++	{
++#ifdef _WIN32
++		if (fgcfg().want) r2fgdiag::note_upscaler(upscaler_reset, why, cut_kind, cut_reset);
++#endif
 +	}
 +}
 +
@@ -18846,6 +19394,7 @@ index 0000000..65ea5a0
 +		f.reset = f.reset || reset;
 +		double moved = 0.0;
 +		for (int i = 0; i < 16; ++i) moved += std::fabs(T[i] - f.T[i]);
++		r2fgdiag::note_moved(moved);
 +		if (moved > 1e-4) f.cam_ms = now_ms();
 +		std::memcpy(f.T, T, sizeof(f.T));
 +		f.zA = zA; f.zB = zB;
@@ -19407,6 +19956,7 @@ index 0000000..65ea5a0
 +
 +		bool on = false;
 +		const u32 n = std::max<u32>(2, f.mult);
++		bool diag_reset = false;
 +		if (fg_usable())
 +		{
 +			on = tok && f.ready && f.want_on && f.depth && f.mv && (f.debug_view || (f.have_ui && f.hudless && f.ui));
@@ -19415,6 +19965,7 @@ index 0000000..65ea5a0
 +			if (on)
 +			{
 +				const bool reset = !f.prev_on || f.sc_new || f.reset;
++				diag_reset = reset;
 +				sl::Resource depth = sl_res(f.depth.get()), mv = sl_res(f.mv.get());
 +				const sl::Extent scene_ext{ 0, 0, f.rw, f.rh };
 +				const sl::Extent rect{ static_cast<u32>(std::max(0, f.rx)), static_cast<u32>(std::max(0, f.ry)),
@@ -19461,10 +20012,25 @@ index 0000000..65ea5a0
 +			}
 +		}
 +
++		const bool diag = r2fgdiag::on();
++		const double diag_t0 = diag ? r2fgdiag::now_ms() : 0.0;
 +		const VkResult res = g_sl.p_present(queue, info);
++		const double diag_call = diag ? r2fgdiag::now_ms() - diag_t0 : 0.0;
 +
 +		sl::DLSSGState gst{};
 +		const bool have_gst = on && g_sl.fn_g_state(sl::ViewportHandle(0u), gst, nullptr) == sl::Result::eOk;
++		if (fg_usable())
++		{	// R3_FG_DIAG (and the always-on 10 s reset counters below)
++			r2fgdiag::present_in d{};
++			d.on = on; d.want = f.want_on; d.ready = f.ready; d.scene = f.scene; d.tok = tok != nullptr; d.immediate = f.sc_immediate;
++			d.resume = !f.prev_on; d.sc_new = f.sc_new; d.up_reset = f.reset; d.reset = diag_reset;
++			d.st_ok = have_gst; d.n = n; d.shown = have_gst ? gst.numFramesActuallyPresented : 0u; d.status = have_gst ? static_cast<u32>(gst.status) : 0u;
++			d.reflex_us = f.reflex_limit;
++			d.miss = (tok ? 0u : 1u) | (f.ready ? 0u : 2u) | (f.depth && f.mv ? 0u : 4u) | (f.debug_view || (f.have_ui && f.hudless && f.ui) ? 0u : 8u);
++			d.call_ms = diag_call;
++			d.reason = &f.reason;
++			r2fgdiag::present(d);
++		}
 +		if (on)
 +		{
 +			const sl::DLSSGState& st = gst;
@@ -19516,6 +20082,8 @@ index 0000000..65ea5a0
 +						f.reflex_limit == ~0u ? "none" : (std::to_string(f.reflex_limit) + " us").c_str(),
 +						f.sc_immediate ? " | IMMEDIATE (no vsync)" : "",
 +						f.reason.empty() ? "" : " | last pause: ", f.reason.c_str());
++				char rs[256];
++				if (r2fgdiag::summary10(rs, sizeof(rs))) fglog("%s", rs);
 +				t0 = t; rendered = on_frames = 0; shown = 0;
 +			}
 +		}
@@ -20079,7 +20647,12 @@ index 0000000..65ea5a0
 +		id = f.sim_id;
 +	}
 +	sl::FrameToken* tok = nullptr;
-+	if (g_sl.fn_token(tok, &id) == sl::Result::eOk && tok) g_sl.fn_r_sleep(*tok);
++	if (g_sl.fn_token(tok, &id) == sl::Result::eOk && tok)
++	{
++		const double t0 = r2fgdiag::on() ? r2fgdiag::now_ms() : 0.0;
++		g_sl.fn_r_sleep(*tok);
++		if (r2fgdiag::on()) r2fgdiag::note_sleep(r2fgdiag::now_ms() - t0);
++	}
 +	{
 +		std::lock_guard lk(f.mu);
 +		tok = nullptr;
@@ -20149,10 +20722,10 @@ index 0000000..65ea5a0
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.h b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
 new file mode 100644
-index 0000000..d707215
+index 0000000..1c8fd36
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
-@@ -0,0 +1,68 @@
+@@ -0,0 +1,72 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation: NVIDIA DLSS Frame Generation (2x, 3x/4x Multi Frame Generation) through Streamline
 +// (sl.interposer.dll and its plugins), or AMD FSR 3 frame interpolation (2x, amd_fidelityfx_vk.dll) for GPUs
@@ -20200,6 +20773,10 @@ index 0000000..d707215
 +	// VKR2Upscaler.cpp: a camera cut the upscaler keeps its history through (PFG_CUT_UNTRUSTED / PFG_CUT_HELD):
 +	// true when frame generation should reset on it anyway (R2_DLSS_FG_CUT_RESET, default 1 = untrusted ones)
 +	bool r2fg_cut_reset(int kind);
++	// VKR2Upscaler.cpp, for R2_FG_DIAG / R3_FG_DIAG (VKR2FgDiag.h): the values of a held camera cut, and once per
++	// frame-generation-tagged frame the upscaler's reset (reset_why bits), held cut kind and whether FG reset on it
++	void r2fg_diag_cut(double motion, double parallax, u32 members, u32 matched);
++	void r2fg_diag_upscaler(bool upscaler_reset, u32 why, int cut_kind, bool cut_reset);
 +
 +	// VKPresent.cpp present_frame. phase 0: after the game image is on the swapchain image, before RPCS3/port
 +	// overlays; phase 1: after the overlays, before the transition to the present layout. 'src' is the flipped
@@ -26507,10 +27084,10 @@ index 0000000..3cb23c0
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..6723fdc
+index 0000000..3eaf2ee
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12029 @@
+@@ -0,0 +1,12032 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -36417,6 +36994,7 @@ index 0000000..6723fdc
 +					T = pdq_last_t_usable(r2cfg().vote_hold, st.frame, st.last_T_frame) ? st.last_T : m4_identity();
 +					fg_cut = 1;
 +				}
++				vk::r2fg_diag_cut(motion, par, members, matched);
 +				if (r2cfg().debug) r2log("parallax cut f%u held (motion %.3f, parallax %.3f, vote %u/%u): %s motion, no reset", st.frame, motion, par, members, matched,
 +					par_untrusted ? "last trusted / no" : "voted");
 +			}
@@ -37103,7 +37681,9 @@ index 0000000..6723fdc
 +	if (labelled) label_end(cmd);
 +	ph.mark(4);
 +
-+	const bool fg_reset = ok && (reset || (fg_cut && vk::r2fg_cut_reset(fg_cut)));
++	const bool fg_cut_rs = ok && !reset && fg_cut && vk::r2fg_cut_reset(fg_cut);
++	const bool fg_reset = ok && (reset || fg_cut_rs);
++	if (ok) vk::r2fg_diag_upscaler(reset, label_why, fg_cut, fg_cut_rs);
 +	if (ok) vk::r2fg_tag_scene(cmd, st.depth.get(), st.mv.get(), rw, rh, jx, jy, st.vw, st.vh, st.inverted, fg_reset, &T.m[0][0], zA, zB); // R2PORT frame generation
 +	if (ok && mvd_on())
 +	{
