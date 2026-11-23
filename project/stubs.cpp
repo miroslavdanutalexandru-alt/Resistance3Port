@@ -1814,12 +1814,16 @@ extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
                 aim_assist_apply(hero, sp); }
     if (!g_ml_mode || !hero) return;
     r3ml_load();
-    if (r3ml_learn_mode() == 3) r3ml_follow_game(hero, sp);
     const int dbg = r3ml_dbg();
     const int mouse = ml_stick_is_mouse();
+    /* the directions are shared: take them only from the keyboard & mouse player's
+     * hero (split-screen: player 2's stick and Invert options must not change them) */
+    const int follow = r3ml_learn_mode() == 3 &&
+        (port_local_players() <= 1 || (cellpad_kbm_guest_port() >= 0 && aim_assist_hero_pad(hero) == cellpad_kbm_guest_port()));
     /* a controller with gyro aiming (one local player): the stick still turns
      * as on PS3, and the gyro adds to it */
     if (!dbg && !mouse && port_local_players() <= 1 && cellpad_gyro_active()) {
+        if (follow) r3ml_follow_game(hero, sp);
         r3ml_note_aim(sp);
         s_r3ml_gyro = 1;
         s_r3ml_hero = hero;
@@ -1827,6 +1831,7 @@ extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
     }
     s_r3ml_gyro = 0;
     if (!dbg && !mouse) return;   /* controller / look keys: the stick turns the view as on PS3 */
+    if (follow) r3ml_follow_game(hero, sp);
     const float ra = ml_rdf(hero + 0x52C), rb = ml_rdf(hero + 0x530);
     const int fx = g_ml_fed_rx, fy = g_ml_fed_ry;
     const int ax = fx >= 0 ? fx : -fx, ay = fy >= 0 ? fy : -fy;
