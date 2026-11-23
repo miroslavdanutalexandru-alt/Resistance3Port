@@ -11,7 +11,8 @@
  *   The profile only sets the existing env switches the user has not set:
  *   low  GCM_VBLANK_SPIN_US=0 R2_PACE_SPIN_US=100 RSX_SPIN_US=50
  *        RSX_PERF_VK_SUBMIT_THREAD=0 RSX_VK_PIPELINE_THREADS=1 (2 with >= 8
- *        logical CPUs) PS3_PRIO_BOOST=0
+ *        logical CPUs) PS3_PRIO_BOOST=0, and below 8 logical CPUs
+ *        PORT_RSX_PRIO=1 (rsx::thread above normal; needs thread placement)
  *        (SPURS_AUDIO_BOOST_FORCE is now 1 by default on every CPU: the synth
  *        lane keeps its priority boost. Opt out: SPURS_AUDIO_BOOST_FORCE=0,
  *        or PORT_PLACE_AUDIO=0, which sets it to 0 with any profile but off)
@@ -40,6 +41,7 @@
 enum { PORT_CPU_OFF = 0, PORT_CPU_LOW, PORT_CPU_MID, PORT_CPU_HIGH };
 static int s_cpu_profile = PORT_CPU_OFF;
 static int s_cpu_place = 0;
+static int s_rsx_prio = 0;   /* PORT_RSX_PRIO */
 
 static struct {
     int sys_phys, sys_logical;      /* the whole CPU */
@@ -272,6 +274,20 @@ extern "C" unsigned long spurs_synth_host_tid(void);   /* cellSpurs.c: lane runn
 extern "C" int ps3_host_nospin(void);                  /* sys_ppu_thread.c */
 static DWORD s_place_walker_tid = 0;
 
+/* PORT_RSX_PRIO=1 (the low profile's default below 8 logical CPUs; 0 = off): rsx::thread at ABOVE_NORMAL
+ * (never lowered). On a 4-core / 4-thread CPU (R3 #33, i5-7300HQ) it ran only 55-77% of the time it was
+ * busy: the SPURS lanes, the RSX Offloader and the guest threads at the same priority took its core
+ * while the main thread waited for it. */
+static void port_rsx_prio_raise(HANDLE h, DWORD tid)
+{
+    if (!s_rsx_prio) return;
+    const int cur = GetThreadPriority(h);
+    if (cur == THREAD_PRIORITY_ERROR_RETURN || cur >= THREAD_PRIORITY_ABOVE_NORMAL) return;
+    const BOOL ok = SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL);
+    fprintf(stderr, "[cpu] rsx::thread (thread %lu): priority above normal %s (PORT_RSX_PRIO; 0 = off)\n",
+            (unsigned long)tid, ok ? "ok" : "FAILED");
+}
+
 /* Applies placement to threads that appear later: the RSX engine thread
  * (RSX_PERF_MT starts it on the first FIFO work) and background threads that
  * name themselves (pipeline compilers, monitors). Every 2 s while threads keep
@@ -378,6 +394,7 @@ static DWORD WINAPI port_place_keeper(LPVOID)
                                                   PORT_PCORE_FIFO, 0, PORT_PCORE_PRIO);
                         /* RPCS3 RSX mode: rsx::thread is the RSX thread (no engine tid) */
                         if (s_place_audio && !wcscmp(d, L"rsx::thread") && !et) port_place_hot(h, PORT_ROLE_ENGINE);
+                        if (!wcscmp(d, L"rsx::thread")) port_rsx_prio_raise(h, te.th32ThreadID);
                     }
                     else if (!wcscmp(d, L"cellAudio mixer"))
                         port_pcore_place_role(hp, te.th32ThreadID, "audio mixer", PORT_PCORE_AUDIO, 0, 0);
@@ -519,6 +536,7 @@ static void port_cpu_profile_init(void)
         port_cpu_setdef("RSX_PERF_VK_SUBMIT_THREAD", "0", log, sizeof log);
         port_cpu_setdef("RSX_VK_PIPELINE_THREADS", s_cpu.logical >= 8 ? "2" : "1", log, sizeof log);
         port_cpu_setdef("PS3_PRIO_BOOST", "0", log, sizeof log);
+        if (s_cpu.logical < 8) port_cpu_setdef("PORT_RSX_PRIO", "1", log, sizeof log);
     } else if (prof == PORT_CPU_MID) {
         port_cpu_setdef("GCM_VBLANK_SPIN_US", "100", log, sizeof log);
         port_cpu_setdef("R2_PACE_SPIN_US", "250", log, sizeof log);
@@ -536,6 +554,7 @@ static void port_cpu_profile_init(void)
         if (pa && *pa && atoi(pa) == 0) port_cpu_setdef("SPURS_AUDIO_BOOST_FORCE", "0", log, sizeof log);
     }
     if (log[0]) fprintf(stderr, "[cpu] profile %s sets:%s\n", pn[prof], log);
+    s_rsx_prio = port_native_parse_bool(getenv("PORT_RSX_PRIO"), 0);
 
     s_cpu_place = port_thread_placement_env();
     if (!s_cpu_place) { fprintf(stderr, "[cpu] thread placement off (PORT_THREAD_PLACEMENT=off)\n"); return; }
