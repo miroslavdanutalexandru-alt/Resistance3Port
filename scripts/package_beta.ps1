@@ -224,6 +224,8 @@ foreach ($f in $set) {
 }
 $hits = @($hits | Sort-Object -Unique)
 foreach ($h in $hits) { Fail "the installer would ship $h" }
+# Pipelines the game creates only in play (no shader code; scripts\export_pipeline_seed.ps1, README 'Pipeline seed').
+if ($tracked -notcontains 'tools/pipeline_seed.bin') { Warn "tools/pipeline_seed.bin is not committed: first visits to an area skip draws while shaders compile (run scripts\export_pipeline_seed.ps1 -Merge after a playthrough)" }
 # The SDL3 pad backend (DualSense / DualShock 4 without Steam Input) is compiled in only if this lib is in the
 # release; it used to be caught by ps3recomp/.gitignore's *.lib (R2 GitHub issue #6, "DualSense does not work").
 if ($tracked -notcontains 'ps3recomp/third_party/SDL3/lib/SDL3-static.lib') {
