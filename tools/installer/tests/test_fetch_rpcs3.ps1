@@ -66,7 +66,8 @@ $Zips = @{ 'rpcs3' = (New-Archive $up 'rpcs3-x'); 's1' = (New-Archive $s1 's1-x'
 
 # ---- load the script under test ---------------------------------------------------------------------------
 . (Join-Path $Port 'tools\fetch_rpcs3.ps1') -Library -Dest (Join-Path $Root 'dest') -LogFile (Join-Path $Root 'fetch.log') `
-    -RetryDelay 0 -Tries 2 -Patch $patch -Manifest (Join-Path $Root 'manifest.txt') -StageRoot (Join-Path $Root 'stage')
+    -RetryDelay 0 -Tries 2 -Patch $patch -Manifest (Join-Path $Root 'manifest.txt') -StageRoot (Join-Path $Root 'stage') `
+    -ManualDir (Join-Path $Root 'manual')
 $ErrorActionPreference = 'Stop'
 $script:Commit = $upCommit
 $script:RepoUrl = "file:///$($up -replace '\\','/')"
@@ -77,6 +78,10 @@ $script:Subs = @(
     @{ Path = '3rdparty/s2';    Name = '3rdparty/s2';    Repo = 'zip/s2'; Sha = ((G -C $s2 rev-parse HEAD) -join '').Trim() })
 $script:Extras = @(@{ Path = '3rdparty/ex'; Key = 'ex'; Repo = 'zip/ex'; Tag = 'v1'; Url = "file:///$($ex -replace '\\','/')" })
 $script:GitCfg += @('-c', 'protocol.file.allow=always', '-c', 'uploadpack.allowAnySHA1InWant=true')
+$script:BaseCfg = $script:GitCfg
+$script:FakeSysProxy = $null
+function Get-SystemProxy { $script:FakeSysProxy }
+function Get-GitProxy { $null }
 ${function:Real-GitRaw} = ${function:Invoke-GitRaw}
 $script:Rules = @()      # @{ Match = regex on the joined args; Text = what "git" says; Times = how often (0 = always) }
 $script:GitCalls = New-Object System.Collections.Generic.List[string]
@@ -99,9 +104,10 @@ function Get-UrlFile([string]$Url, [string]$OutFile) {
     $key = 'rpcs3'; if ($Url -match 'zip/(s1|s2|ex)') { $key = $Matches[1] }
     Copy-Item -LiteralPath $Zips[$key] -Destination $OutFile -Force
 }
-function Reset-Run { $script:Rules = @(); $script:GitCalls.Clear(); $script:Downloads.Clear(); $script:FailDownloads = $false; $script:GitText.Clear(); $script:SafeDirsAdded = @{} }
+function Reset-Run { $script:Rules = @(); $script:GitCalls.Clear(); $script:Downloads.Clear(); $script:FailDownloads = $false; $script:GitText.Clear(); $script:SafeDirsAdded = @{}
+                     $script:NetFixes = @{}; $script:GitCfg = $script:BaseCfg; $script:FakeSysProxy = $null }
 function Clear-All {
-    foreach ($d in 'dest', 'stage') { $p = Join-Path $Root $d; if (Test-Path $p) { Remove-Item $p -Recurse -Force } }
+    foreach ($d in 'dest', 'stage', 'manual') { $p = Join-Path $Root $d; if (Test-Path $p) { Remove-Item $p -Recurse -Force } }
     $dl = Join-Path $Port 'tools_cache\rpcs3_download'; if (Test-Path $dl) { Remove-Item $dl -Recurse -Force }
     $tc = Join-Path $Port 'tools_cache'; if ((Test-Path $tc) -and -not (Get-ChildItem -LiteralPath $tc -Force)) { Remove-Item -LiteralPath $tc -Force }
 }
@@ -152,6 +158,44 @@ Check (Run-Fetch) 'finishes from archives'
 Check (Test-Complete $Dest) 'complete'
 Check ($script:Downloads.Count -eq 4) "4 archives downloaded ($($script:Downloads.Count))"
 Check ((Get-FetchMode $Dest) -eq 'archive') 'archive mode recorded'
+
+Write-Host 'fetch_rpcs3: TLS failure - retried with schannel, no revocation check'
+Reset-Run; Clear-All
+$script:Rules = @(@{ Match = 'fetch -q --depth 1'; Times = 1; Used = 0
+    Text = 'fatal: unable to access: schannel: next InitializeSecurityContext failed: CRYPT_E_NO_REVOCATION_CHECK (0x80092012)' })
+Check (Run-Fetch) 'finishes'
+Check ((Count-Calls 'fetch -q --depth 1') -eq 2) 'shallow fetch tried again'
+Check (($script:GitCfg -contains 'http.sslBackend=schannel') -and ($script:GitCfg -contains 'http.schannelCheckRevoke=false')) 'schannel without revocation check for the rest of the run'
+
+Write-Host 'fetch_rpcs3: Windows proxy git does not know about'
+Reset-Run; Clear-All
+$script:FakeSysProxy = 'http://proxy.test:8080'
+$script:Rules = @(@{ Match = 'fetch -q --depth 1'; Text = 'fatal: unable to access: Failed to connect to github.com port 443'; Times = 1; Used = 0 })
+Check (Run-Fetch) 'finishes'
+Check ($script:GitCfg -contains 'http.proxy=http://proxy.test:8080') "git told about the Windows proxy"
+Reset-Run; Clear-All
+$script:Rules = @(@{ Match = 'fetch -q --depth 1'; Text = 'fatal: unable to access: Failed to connect to github.com port 443'; Times = 1; Used = 0 })
+Check (Run-Fetch) 'no Windows proxy: finishes'
+Check (-not @($script:GitCfg | Where-Object { $_ -like 'http.proxy=*' }).Count) 'no Windows proxy: none set'
+
+Write-Host 'fetch_rpcs3: archives downloaded by hand'
+Reset-Run; Clear-All
+$script:Rules = @(@{ Match = 'submodule update'; Text = 'fatal: unable to access: Could not resolve host: github.com'; Times = 0; Used = 0 }); $script:FailDownloads = $true
+New-Item -ItemType Directory -Force (Join-Path $Root 'manual') | Out-Null
+foreach ($s in $script:Subs) { Copy-Item $Zips[($s.Repo -split '/')[-1]] (Join-Path $Root "manual\$(($s.Repo -split '/')[-1])-$($s.Sha).zip") }
+Check (Run-Fetch) 'finishes'
+Check (Test-Complete $Dest) 'complete'
+Check (-not $script:Downloads.Count) 'nothing downloaded'
+Check ((Count-Calls 'HTTP/1\.1 submodule update') -eq 0) 'hand-downloaded archives used before trying git again'
+Check (-not (Test-Path (Join-Path $Root 'manual'))) 'hand-downloaded archives removed afterwards'
+$links = @(Get-ManualLinks)
+Check ($links.Count -eq 1 + $script:Subs.Count + $script:Extras.Count) 'every piece has a link'
+New-Item -ItemType Directory -Force (Join-Path $Root 'manual') | Out-Null
+foreach ($l in $links) { New-Item -ItemType File -Force (Join-Path $Root "manual\$($l.File)") | Out-Null }
+Check ((Find-ManualArchive "https://codeload.github.com/zip/s2/zip/$($script:Subs[1].Sha)") -like '*s2-*.zip') 'commit archive found under the name the link saves'
+Check ((Find-ManualArchive 'https://codeload.github.com/zip/ex/zip/refs/tags/v1') -like '*ex-1.zip') 'tag archive found under the name the link saves (no v)'
+Check ((Write-ManualSteps 6>&1 | Out-String) -match [regex]::Escape($links[1].Page)) 'manual steps list the links'
+Remove-Item (Join-Path $Root 'manual') -Recurse -Force
 
 Write-Host 'fetch_rpcs3: resume after a stopped run'
 Reset-Run; Clear-All
