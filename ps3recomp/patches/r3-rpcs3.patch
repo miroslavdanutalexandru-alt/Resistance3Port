@@ -17034,10 +17034,10 @@ index 0000000..55d726f
 +#endif /* PORT_DLSS_QUALITY_H */
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FgDiag.h b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
 new file mode 100644
-index 0000000..b16e616
+index 0000000..0f3becc
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FgDiag.h
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,924 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame-generation diagnostics for the DLSS-G (Streamline) path, R2_FG_DIAG / R3_FG_DIAG (default 0 = off, nothing
 +// is measured beyond the always-on reset counters):
@@ -17048,6 +17048,13 @@ index 0000000..b16e616
 +//   2 = as 1, and the same dump starts by itself on a suspect event (a mid-stream reset, a generated frame Streamline
 +//       did not present, a pause, a frame-time spike or pace jump); at most R?_FG_DIAG_AUTO_MAX (default 10) dumps,
 +//       20 s apart.
++//   3 = as 1, and every real present (the dump's row) is written to logs\fgdiag.txt for the whole session (the previous
++//       session's file becomes fgdiag_prev.txt). Events (FG resets with the reason, pauses, generated frames not
++//       presented, DLSS-G status changes, frame-time spikes) are "--- ... ---" lines after the row they happened on,
++//       plus a "# second" line per second; the hotkey writes a "--- user marker ---" line instead of a dump. The present
++//       thread only copies the row into a preallocated queue (a short spin lock); one writer thread empties it every
++//       250 ms. A full queue drops rows (counted in the file and run.log). The file stops at R?_FG_DIAG_MAX_MB (512).
++//       It is closed at exit (atexit, or a TLS callback after ExitProcess).
 +// R?_FG_DIAG_KEY = pause (default) | scroll | f1..f24 | none. Pause is also RSX_MV_DUMP's capture key and Scroll Lock
 +// PORT_FRAMETIME's marker; a conflict is logged.
 +// Included once, by VKR2FrameGen.cpp (Streamline builds); the same file in the R2 and R3 ports.
@@ -17060,12 +17067,19 @@ index 0000000..b16e616
 +#include <algorithm>
 +#include <atomic>
 +#include <cmath>
++#include <cstdarg>
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
 +#include <string>
 +#include <thread>
 +#include <vector>
++
++#if defined(__clang__) || defined(__GNUC__)
++#define R2FGD_PRINTF(f, a) __attribute__((format(printf, f, a)))
++#else
++#define R2FGD_PRINTF(f, a)
++#endif
 +
 +namespace r2fgdiag
 +{
@@ -17083,7 +17097,7 @@ index 0000000..b16e616
 +
 +	struct cfg_t
 +	{
-+		int level = 0, frames = 120, key = 0, auto_max = 10;
++		int level = 0, frames = 120, key = 0, auto_max = 10, max_mb = 512;
 +		char key_name[16] = "none";
 +	};
 +
@@ -17105,13 +17119,18 @@ index 0000000..b16e616
 +		static const cfg_t c = []
 +		{
 +			cfg_t r;
-+			if (const char* v = env("FG_DIAG")) r.level = std::clamp(std::atoi(v), 0, 2);
++			if (const char* v = env("FG_DIAG")) r.level = std::clamp(std::atoi(v), 0, 3);
 +			if (!r.level) return r;
 +			if (const char* v = env("FG_DIAG_FRAMES")) r.frames = std::clamp(std::atoi(v), 10, 2000);
 +			if (const char* v = env("FG_DIAG_AUTO_MAX")) r.auto_max = std::clamp(std::atoi(v), 0, 1000);
++			if (const char* v = env("FG_DIAG_MAX_MB")) r.max_mb = std::clamp(std::atoi(v), 1, 65536);
 +			r.key = parse_key(env("FG_DIAG_KEY"), r.key_name, sizeof(r.key_name));
-+			std::fprintf(stderr, "[fg-diag] frame-generation diagnostics level %d: 1 line per second; %s dumps the previous 30 and next %d presents to logs\\fgdiag.txt%s\n",
-+				r.level, r.key ? r.key_name : "no key", r.frames, r.level >= 2 ? " (also by itself on a suspect event)" : "");
++			if (r.level >= 3)
++				std::fprintf(stderr, "[fg-diag] frame-generation diagnostics level 3: 1 line per second; every present is recorded to logs\\fgdiag.txt until exit "
++					"(previous session: fgdiag_prev.txt, limit %d MB); %s writes a '--- user marker ---' line there\n", r.max_mb, r.key ? r.key_name : "no key");
++			else
++				std::fprintf(stderr, "[fg-diag] frame-generation diagnostics level %d: 1 line per second; %s dumps the previous 30 and next %d presents to logs\\fgdiag.txt%s\n",
++					r.level, r.key ? r.key_name : "no key", r.frames, r.level >= 2 ? " (also by itself on a suspect event)" : "");
 +			const char* ft = std::getenv("PORT_FT_MARKER_KEY");
 +			const bool ft_on = std::getenv("PORT_FRAMETIME") && *std::getenv("PORT_FRAMETIME") && *std::getenv("PORT_FRAMETIME") != '0';
 +			if (r.key == 0x13 && std::getenv("RSX_MV_DUMP") && *std::getenv("RSX_MV_DUMP"))
@@ -17238,6 +17257,9 @@ index 0000000..b16e616
 +		double auto_last = -1e18;
 +		std::string dump_why;
 +		bool key_was = false;
++		// continuous stream (level 3)
++		bool stream_started = false;
++		u32 marks = 0, prev_status = 0;
 +	};
 +	inline state_t& st() { static state_t s; return s; }
 +
@@ -17257,6 +17279,54 @@ index 0000000..b16e616
 +			if (w & (1u << b)) { if (!s.empty()) s += '+'; s += n[b]; }
 +		if (w & 0x80000000u) { if (!s.empty()) s += '+'; s += "unlabelled"; }
 +		return s;
++	}
++
++	// why_names without the heap (the stream writer, and its exit path)
++	inline void why_buf(u32 w, char* out, size_t cap)
++	{
++		static const char* const n[11] = { "scene-switch", "created", "size", "no-previous", "camera-cut", "nothing-matched", "hitch", "output-size", "mv-confidence", "parallax-cut", "unlabelled" };
++		size_t l = 0;
++		out[0] = 0;
++		for (int b = 0; b < 11; ++b)
++		{
++			if (!(w & (b < 10 ? 1u << b : 0x80000000u)) || l + 1 >= cap) continue;
++			const int k = std::snprintf(out + l, cap - l, "%s%s", l ? "+" : "", n[b]);
++			if (k > 0) l = std::min(cap - 1, l + static_cast<size_t>(k));
++		}
++	}
++
++	// legend after the first comment line, and the column line (dump and stream)
++	inline const char* legend()
++	{
++		return "# call = time inside the Streamline present, sleep = Reflex sleep before this frame, on/n/shown = FG on, multiplier, frames Streamline presented\n"
++			"# (shown < n: a generated frame was not presented), status = DLSS-G status bits, reset = R resume / S swapchain / U upscaler / C held cut,\n"
++			"# why = upscaler reset bits, cut = held camera cut V voted / U untrusted (motion, parallax, vote), moved = camera matrix change,\n"
++			"# miss = wanted but not on (1 token 2 not ready 4 depth/MV 8 HUD split), mark: ! spike (> 1.6x average), J pace jump (> 1.5x previous interval)\n";
++	}
++	inline int fmt_columns(char* out, size_t cap)
++	{
++		return std::snprintf(out, cap, "%-1s %6s %10s %7s %6s %6s %2s %1s %5s %6s %-5s %-34s %-30s %8s %4s %6s %-2s %s\n",
++			"", "idx", "t_ms", "dt", "call", "sleep", "on", "n", "shown", "status", "reset", "why", "cut", "moved", "miss", "reflex", "mk", "want/ready/scene reason");
++	}
++
++	// one row line; no heap
++	inline int fmt_row(const row& r, char* out, size_t cap)
++	{
++		char rs[8]{}; int k = 0;
++		if (r.resume) rs[k++] = 'R';
++		if (r.sc_new) rs[k++] = 'S';
++		if (r.up_reset) rs[k++] = 'U';
++		if (r.flags & 8) rs[k++] = 'C';
++		if (!k) rs[k++] = r.reset ? '?' : '-';
++		char cut[48] = "-";
++		if (r.flags & 6)
++			std::snprintf(cut, sizeof(cut), "%c m%.3f p%.3f v%u/%u", (r.flags & 4) ? 'U' : 'V', r.cut_motion, r.cut_par, r.cut_members, r.cut_matched);
++		char w[160] = "-";
++		if (r.why) why_buf(r.why, w, sizeof(w));
++		char mk[3] = { r.spike ? '!' : '.', r.jump ? 'J' : '.', 0 };
++		return std::snprintf(out, cap, "%-1s %6u %10.1f %7.2f %6.2f %6.2f %2u %1u %5u %6x %-5s %-34s %-30s %8.4f %4x %6d %-2s %u%u%u %s\n",
++			r.idx & 0x80000000u ? "<" : "", r.idx & 0x7fffffffu, r.t, r.dt, r.call_ms, r.sleep_ms, r.on, r.n, r.shown, r.status, rs,
++			w, cut, r.moved, r.miss, r.reflex_us == ~0u ? -1 : static_cast<int>(r.reflex_us), mk, r.want, r.ready, r.scene, r.reason);
 +	}
 +
 +	inline std::string logs_dir()
@@ -17288,34 +17358,315 @@ index 0000000..b16e616
 +			GetLocalTime(&lt);
 +			std::fprintf(fp, "\n=== fg-diag dump %04u-%02u-%02u %02u:%02u:%02u.%03u: %s (%u presents asked, %zu rows) ===\n",
 +				lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds, why.c_str(), frames_wanted, rows.size());
-+			std::fprintf(fp, "# one row per real (rendered) present; '<' rows are before the trigger. dt = interval since the previous real present (ms),\n"
-+				"# call = time inside the Streamline present, sleep = Reflex sleep before this frame, on/n/shown = FG on, multiplier, frames Streamline presented\n"
-+				"# (shown < n: a generated frame was not presented), status = DLSS-G status bits, reset = R resume / S swapchain / U upscaler / C held cut,\n"
-+				"# why = upscaler reset bits, cut = held camera cut V voted / U untrusted (motion, parallax, vote), moved = camera matrix change,\n"
-+				"# miss = wanted but not on (1 token 2 not ready 4 depth/MV 8 HUD split), mark: ! spike (> 1.6x average), J pace jump (> 1.5x previous interval)\n");
-+			std::fprintf(fp, "%-1s %6s %10s %7s %6s %6s %2s %1s %5s %6s %-5s %-34s %-30s %8s %4s %6s %-2s %s\n",
-+				"", "idx", "t_ms", "dt", "call", "sleep", "on", "n", "shown", "status", "reset", "why", "cut", "moved", "miss", "reflex", "mk", "want/ready/scene reason");
++			std::fprintf(fp, "# one row per real (rendered) present; '<' rows are before the trigger. dt = interval since the previous real present (ms),\n%s", legend());
++			char line[512];
++			if (fmt_columns(line, sizeof(line)) > 0) std::fputs(line, fp);
 +			for (const row& r : rows)
-+			{
-+				char rs[8]{}; int k = 0;
-+				if (r.resume) rs[k++] = 'R';
-+				if (r.sc_new) rs[k++] = 'S';
-+				if (r.up_reset) rs[k++] = 'U';
-+				if (r.flags & 8) rs[k++] = 'C';
-+				if (!k) rs[k++] = r.reset ? '?' : '-';
-+				char cut[48] = "-";
-+				if (r.flags & 6)
-+					std::snprintf(cut, sizeof(cut), "%c m%.3f p%.3f v%u/%u", (r.flags & 4) ? 'U' : 'V', r.cut_motion, r.cut_par, r.cut_members, r.cut_matched);
-+				const std::string w = r.why ? why_names(r.why) : std::string("-");
-+				char mk[3] = { r.spike ? '!' : '.', r.jump ? 'J' : '.', 0 };
-+				std::fprintf(fp, "%-1s %6u %10.1f %7.2f %6.2f %6.2f %2u %1u %5u %6x %-5s %-34s %-30s %8.4f %4x %6d %-2s %u%u%u %s\n",
-+					r.idx & 0x80000000u ? "<" : "", r.idx & 0x7fffffffu, r.t, r.dt, r.call_ms, r.sleep_ms, r.on, r.n, r.shown, r.status, rs,
-+					w.c_str(), cut, r.moved, r.miss, r.reflex_us == ~0u ? -1 : static_cast<int>(r.reflex_us), mk, r.want, r.ready, r.scene, r.reason);
-+			}
++				if (fmt_row(r, line, sizeof(line)) > 0) std::fputs(line, fp);
 +			std::fclose(fp);
 +			std::fprintf(stderr, "[fg-diag] wrote %zu rows to %s (%s)\n", rows.size(), path.c_str(), why.c_str());
 +		}).detach();
 +	}
++
++	// ---------------------------------------------------------------- level 3: continuous stream
++	// The present thread copies a row or an event line into qv[fi] under a spin lock (no allocation: both queues are
++	// reserved once); the writer swaps fi under the same lock every 250 ms and writes the other queue with WriteFile.
++	struct citem
++	{
++		u8 kind; // 0 row, 1 event line, 2 comment line
++		row r;
++		char text[128];
++	};
++
++	struct stream_t
++	{
++		static constexpr size_t QCAP = 8192; // per queue: ~34 s of 240 fps if the writer stalls
++		std::atomic_flag lk = ATOMIC_FLAG_INIT;
++		std::vector<citem> qv[2];
++		int fi = 0;
++		std::atomic<bool> accepting{ false }, stop{ false }, done{ false }, finishing{ false };
++		std::atomic<int> busy{ 0 };
++		std::atomic<u64> dropped{ 0 };
++#ifdef _WIN32
++		HANDLE wake = nullptr, done_ev = nullptr;
++		HANDLE file = INVALID_HANDLE_VALUE;
++#endif
++		// writer only (or the exit path once the writer is gone)
++		u64 bytes = 0, cap = 0, rows = 0, events = 0, drop_seen = 0;
++		double drop_log_t = -1e18;
++		bool capped = false;
++		char path[260]{};
++		char buf[256 * 1024];
++		char xbuf[64 * 1024];
++	};
++	inline std::atomic<stream_t*> g_stream{ nullptr }; // never freed: the exit path may run after static destructors
++
++	struct out_t { char* b; size_t cap; size_t len; };
++
++	// to run.log without the CRT (the exit path may run after ExitProcess killed a thread inside it)
++	R2FGD_PRINTF(1, 2) inline void elog(const char* fmt, ...)
++	{
++		char b[512];
++		va_list ap;
++		va_start(ap, fmt);
++		const int n = std::vsnprintf(b, sizeof(b), fmt, ap);
++		va_end(ap);
++		if (n <= 0) return;
++#ifdef _WIN32
++		const HANDLE e = GetStdHandle(STD_ERROR_HANDLE);
++		if (e && e != INVALID_HANDLE_VALUE) { DWORD w = 0; WriteFile(e, b, static_cast<DWORD>(std::min<size_t>(static_cast<size_t>(n), sizeof(b) - 1)), &w, nullptr); }
++#endif
++	}
++
++	inline void q_lock(stream_t& q)
++	{
++		for (u32 i = 0; q.lk.test_and_set(std::memory_order_acquire); ++i)
++			if (i > 64) std::this_thread::yield();
++	}
++	inline bool q_lock_timed(stream_t& q, int ms) // exit path: the holder may have been killed
++	{
++		for (int i = 0; q.lk.test_and_set(std::memory_order_acquire); ++i)
++		{
++			if (i >= ms) return false;
++#ifdef _WIN32
++			Sleep(1);
++#endif
++		}
++		return true;
++	}
++	inline void q_unlock(stream_t& q) { q.lk.clear(std::memory_order_release); }
++
++	inline void stream_push(const row* r, u8 kind, const char* text)
++	{
++		stream_t* qp = g_stream.load(std::memory_order_acquire);
++		if (!qp || !qp->accepting.load(std::memory_order_relaxed)) return;
++		stream_t& q = *qp;
++		q_lock(q);
++		std::vector<citem>& v = q.qv[q.fi];
++		if (v.size() < v.capacity())
++		{
++			citem& c = v.emplace_back();
++			c.kind = kind;
++			if (r) c.r = *r;
++			if (text) std::snprintf(c.text, sizeof(c.text), "%s", text);
++		}
++		else q.dropped.fetch_add(1, std::memory_order_relaxed);
++		q_unlock(q);
++	}
++	R2FGD_PRINTF(1, 2) inline void stream_event(const char* fmt, ...)
++	{
++		char t[128];
++		va_list ap;
++		va_start(ap, fmt);
++		std::vsnprintf(t, sizeof(t), fmt, ap);
++		va_end(ap);
++		stream_push(nullptr, 1, t);
++	}
++
++	inline void stream_flush(stream_t& q, out_t& o)
++	{
++#ifdef _WIN32
++		if (o.len && q.file != INVALID_HANDLE_VALUE)
++		{
++			DWORD w = 0;
++			WriteFile(q.file, o.b, static_cast<DWORD>(o.len), &w, nullptr);
++			q.bytes += w;
++		}
++		o.len = 0;
++		if (!q.capped && q.bytes >= q.cap && q.file != INVALID_HANDLE_VALUE)
++		{
++			q.capped = true;
++			q.accepting = false;
++			char t[256];
++			const int n = std::snprintf(t, sizeof(t), "--- size limit reached (%llu MB, R2_FG_DIAG_MAX_MB / R3_FG_DIAG_MAX_MB): recording stops here; the per-second [fg-diag] lines continue in run.log ---\n",
++				static_cast<unsigned long long>(q.cap >> 20));
++			DWORD w = 0;
++			if (n > 0) WriteFile(q.file, t, static_cast<DWORD>(n), &w, nullptr);
++			q.bytes += w;
++			elog("[fg-diag] logs\\fgdiag.txt reached %llu MB: continuous recording stopped (the per-second lines go on)\n", static_cast<unsigned long long>(q.cap >> 20));
++		}
++#else
++		o.len = 0;
++#endif
++	}
++	inline void stream_room(stream_t& q, out_t& o)
++	{
++		if (o.cap - o.len < 1024) stream_flush(q, o);
++	}
++	inline void stream_emit(stream_t& q, out_t& o, const citem& c)
++	{
++		stream_room(q, o);
++		const int n = c.kind == 0 ? fmt_row(c.r, o.b + o.len, o.cap - o.len) : std::snprintf(o.b + o.len, o.cap - o.len, "%s\n", c.text);
++		if (n > 0) o.len += std::min(static_cast<size_t>(n), o.cap - o.len - 1);
++		if (c.kind == 0) q.rows++;
++		else if (c.kind == 1) q.events++;
++	}
++	R2FGD_PRINTF(3, 4) inline void stream_text(stream_t& q, out_t& o, const char* fmt, ...)
++	{
++		stream_room(q, o);
++		va_list ap;
++		va_start(ap, fmt);
++		const int n = std::vsnprintf(o.b + o.len, o.cap - o.len, fmt, ap);
++		va_end(ap);
++		if (n > 0) o.len += std::min(static_cast<size_t>(n), o.cap - o.len - 1);
++	}
++
++	// write out one queue; then the drop note. Writer thread, or the exit path once the writer is gone.
++	inline void stream_write_queue(stream_t& q, out_t& o, std::vector<citem>& v)
++	{
++		for (const citem& c : v)
++		{
++			if (q.capped) break;
++			stream_emit(q, o, c);
++		}
++		v.clear();
++		const u64 d = q.dropped.load(std::memory_order_relaxed);
++		if (d != q.drop_seen && !q.capped)
++		{
++			stream_text(q, o, "--- %llu records dropped: the writer fell behind (%llu in this session) ---\n",
++				static_cast<unsigned long long>(d - q.drop_seen), static_cast<unsigned long long>(d));
++			const double t = now_ms();
++			if (t - q.drop_log_t >= 5000.0)
++			{
++				elog("[fg-diag] fgdiag.txt: %llu records dropped so far (the writer fell behind)\n", static_cast<unsigned long long>(d));
++				q.drop_log_t = t;
++			}
++			q.drop_seen = d;
++		}
++		stream_flush(q, o);
++	}
++
++	inline void stream_trailer(stream_t& q, out_t& o, const char* how)
++	{
++		stream_text(q, o, "=== fg-diag session end (%s): %llu rows, %llu event lines, %llu dropped, %.1f MB ===\n", how,
++			static_cast<unsigned long long>(q.rows), static_cast<unsigned long long>(q.events), static_cast<unsigned long long>(q.dropped.load()),
++			static_cast<double>(q.bytes + o.len) / (1024.0 * 1024.0));
++		stream_flush(q, o);
++	}
++
++#ifdef _WIN32
++	inline void stream_writer(stream_t* qp)
++	{
++		stream_t& q = *qp;
++		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
++		const std::string dir = logs_dir();
++		CreateDirectoryA(dir.c_str(), nullptr);
++		std::snprintf(q.path, sizeof(q.path), "%s\\fgdiag.txt", dir.c_str());
++		const std::string prev = dir + "\\fgdiag_prev.txt";
++		MoveFileExA(q.path, prev.c_str(), MOVEFILE_REPLACE_EXISTING);
++		const HANDLE f = CreateFileA(q.path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
++		if (f == INVALID_HANDLE_VALUE)
++		{
++			q.accepting = false;
++			elog("[fg-diag] cannot write %s (error %lu): continuous recording off\n", q.path, GetLastError());
++			q.done = true;
++			SetEvent(q.done_ev);
++			return;
++		}
++		q.file = f;
++		out_t o{ q.buf, sizeof(q.buf), 0 };
++		SYSTEMTIME lt{};
++		GetLocalTime(&lt);
++		char exe[MAX_PATH]{};
++		GetModuleFileNameA(nullptr, exe, MAX_PATH);
++		const char* base = std::strrchr(exe, '\\');
++		stream_text(q, o, "=== fg-diag continuous log (FG_DIAG=3), %s, started %04u-%02u-%02u %02u:%02u:%02u.%03u; t_ms = %.1f now ===\n",
++			base ? base + 1 : exe, lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond, lt.wMilliseconds, now_ms());
++		stream_text(q, o, "# one row per real (rendered) present while frame generation is selected. dt = interval since the previous real present (ms),\n%s", legend());
++		stream_text(q, o, "# '--- ... ---' lines: events of the row above (FG reset + reason, FG paused, generated frame not presented, DLSS-G status,\n"
++			"# frame-time spike, '--- user marker ---' = %s pressed); '# second' lines: the per-second summary (also in run.log)\n", cfg().key ? cfg().key_name : "marker key (none set)");
++		o.len += std::max(0, fmt_columns(o.b + o.len, o.cap - o.len));
++		stream_flush(q, o);
++		elog("[fg-diag] recording every present to %s\n", q.path);
++
++		for (;;)
++		{
++			WaitForSingleObject(q.wake, 250);
++			const bool stopping = q.stop.load();
++			q.busy = 1;
++			q_lock(q);
++			const int mine = q.fi;
++			q.fi ^= 1;
++			q_unlock(q);
++			stream_write_queue(q, o, q.qv[mine]);
++			if (stopping)
++			{
++				// what came in during the last write
++				q_lock(q);
++				const int last = q.fi;
++				q.fi ^= 1;
++				q_unlock(q);
++				stream_write_queue(q, o, q.qv[last]);
++			}
++			q.busy = 0;
++			if (q.capped || stopping) break;
++		}
++		q.busy = 1;
++		q.accepting = false;
++		stream_trailer(q, o, q.stop ? "exit" : "size limit");
++		q.file = INVALID_HANDLE_VALUE;
++		CloseHandle(f);
++		elog("[fg-diag] fgdiag.txt closed: %llu rows, %llu event lines, %llu dropped, %.1f MB\n", static_cast<unsigned long long>(q.rows),
++			static_cast<unsigned long long>(q.events), static_cast<unsigned long long>(q.dropped.load()), static_cast<double>(q.bytes) / (1024.0 * 1024.0));
++		q.busy = 0;
++		q.done = true;
++		SetEvent(q.done_ev);
++	}
++
++	// threads_alive: from atexit (the writer is running: ask it to finish and wait). Otherwise from the TLS callback
++	// after ExitProcess, which has killed the writer: write what is still queued here.
++	inline void stream_finish(bool threads_alive)
++	{
++		stream_t* qp = g_stream.load(std::memory_order_acquire);
++		if (!qp || qp->done) return;
++		stream_t& q = *qp;
++		q.accepting = false;
++		if (threads_alive)
++		{
++			if (q.finishing.exchange(true)) return;
++			q.stop = true;
++			SetEvent(q.wake);
++			WaitForSingleObject(q.done_ev, 3000);
++			return;
++		}
++		if (q.file == INVALID_HANDLE_VALUE) return;
++		out_t o{ q.xbuf, sizeof(q.xbuf), 0 };
++		if (q.busy) stream_text(q, o, "--- the writer was stopped in the middle of a write: rows just before this line may be missing ---\n");
++		if (q_lock_timed(q, 100))
++		{
++			const int cur = q.fi; // the writer only touches the other queue
++			q_unlock(q);
++			stream_write_queue(q, o, q.qv[cur]);
++		}
++		stream_trailer(q, o, "process exit");
++		const HANDLE f = q.file;
++		q.file = INVALID_HANDLE_VALUE;
++		CloseHandle(f);
++		q.done = true;
++	}
++	inline void __cdecl stream_atexit() { stream_finish(true); }
++
++	inline void stream_start()
++	{
++		stream_t* q = new stream_t;
++		q->cap = static_cast<u64>(cfg().max_mb) << 20;
++		q->qv[0].reserve(stream_t::QCAP);
++		q->qv[1].reserve(stream_t::QCAP);
++		q->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++		q->done_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++		if (!q->wake || !q->done_ev)
++		{
++			std::fprintf(stderr, "[fg-diag] continuous recording could not start (CreateEvent failed)\n");
++			return;
++		}
++		q->accepting = true;
++		g_stream.store(q, std::memory_order_release);
++		std::atexit(stream_atexit);
++		std::thread(stream_writer, q).detach();
++	}
++#else
++	inline void stream_start() {}
++#endif
 +
 +	inline void start_dump(state_t& s, const char* why)
 +	{
@@ -17460,13 +17811,38 @@ index 0000000..b16e616
 +		r.sc_new = in.on && in.sc_new; r.up_reset = in.on && in.up_reset; r.st_ok = in.st_ok; r.spike = spike; r.jump = jump;
 +		if (in.reason && !in.reason->empty()) std::snprintf(r.reason, sizeof(r.reason), "%s", in.reason->c_str());
 +
-+		// dump: hotkey edge, or (level 2) a suspect event
++		// level 3: the row, then this present's events
++		const bool big_spike = in.on && spike && dt > 2.0 * (s.ema > 0.0 ? s.ema : dt);
++		if (cfg().level >= 3)
++		{
++			if (!s.stream_started) { s.stream_started = true; stream_start(); }
++			stream_push(&r, 0, nullptr);
++			if (cause != R_COUNT)
++			{
++				char wb[160] = "";
++				if (why) why_buf(why, wb, sizeof(wb));
++				stream_event("--- FG reset: %s%s%s ---", reset_name(cause), wb[0] ? " " : "", wb);
++			}
++			if (is_short) stream_event("--- generated frame not presented (shown %u of %u) ---", in.shown, in.n);
++			if (paused_now) stream_event("--- FG paused: %.80s ---", s.pause_why.c_str());
++			if (in.on && in.st_ok && in.status != s.prev_status) stream_event("--- DLSS-G status %x (was %x) ---", in.status, s.prev_status);
++			if (big_spike) stream_event("--- frame-time spike %.1f ms (average %.1f) ---", dt, s.ema);
++		}
++		if (in.on && in.st_ok) s.prev_status = in.status;
++
++		// dump (levels 1-2) or user marker (level 3): hotkey edge; (level 2) a suspect event
 +		if (cfg().key)
 +		{
 +			const bool down = (GetAsyncKeyState(cfg().key) & 0x8000) != 0;
 +			if (down && !s.key_was)
 +			{
-+				if (s.left > 0) std::fprintf(stderr, "[fg-diag] dump already running (%d presents left)\n", s.left);
++				if (cfg().level >= 3)
++				{
++					s.marks++;
++					stream_event("--- user marker --- #%u (%s) at present %u, t_ms %.1f", s.marks, cfg().key_name, r.idx, t);
++					std::fprintf(stderr, "[fg-diag] user marker #%u (%s) at present %u -> logs\\fgdiag.txt\n", s.marks, cfg().key_name, r.idx);
++				}
++				else if (s.left > 0) std::fprintf(stderr, "[fg-diag] dump already running (%d presents left)\n", s.left);
 +				else
 +				{
 +					std::fprintf(stderr, "[fg-diag] %s: dumping the previous %zu and next %d presents\n", cfg().key_name, s.ring.size(), cfg().frames);
@@ -17475,14 +17851,14 @@ index 0000000..b16e616
 +			}
 +			s.key_was = down;
 +		}
-+		if (cfg().level >= 2 && s.left <= 0 && s.auto_n < cfg().auto_max && t - s.auto_last >= 20000.0)
++		if (cfg().level == 2 && s.left <= 0 && s.auto_n < cfg().auto_max && t - s.auto_last >= 20000.0)
 +		{
 +			const char* ev = nullptr;
 +			char evb[96];
 +			if (cause != R_COUNT && cause != R_RESUME) { std::snprintf(evb, sizeof(evb), "auto: FG reset (%s%s%s)", reset_name(cause), why ? " " : "", why ? why_names(why).c_str() : ""); ev = evb; }
 +			else if (is_short) { std::snprintf(evb, sizeof(evb), "auto: generated frame not presented (shown %u of %u)", in.shown, in.n); ev = evb; }
 +			else if (paused_now) { std::snprintf(evb, sizeof(evb), "auto: FG paused (%.60s)", s.pause_why.c_str()); ev = evb; }
-+			else if (in.on && spike && dt > 2.0 * (s.ema > 0.0 ? s.ema : dt)) { std::snprintf(evb, sizeof(evb), "auto: frame-time spike %.1f ms", dt); ev = evb; }
++			else if (big_spike) { std::snprintf(evb, sizeof(evb), "auto: frame-time spike %.1f ms", dt); ev = evb; }
 +			if (ev)
 +			{
 +				s.auto_n++;
@@ -17536,6 +17912,13 @@ index 0000000..b16e616
 +				sec, s.real, s.on_frames, s.gen, (s.real + s.gen) / sec, s.short_n, s.st_err, rtotal, resets, cuts, pause, miss,
 +				p50, mx, s.spikes, s.jumps, s.hist[0], s.hist[1], s.hist[2], s.hist[3], s.hist[4], s.hist[5], s.hist[6], s.hist[7],
 +				s.real ? s.call_sum / s.real : 0.0, s.call_max, s.sleep_sum / sec, static_cast<double>(p.sleep_max_us.exchange(0)) / 1000.0, dwm);
++			if (cfg().level >= 3)
++			{
++				char sl[128];
++				std::snprintf(sl, sizeof(sl), "# second: %.1f fps shown (real %u, FG on %u, generated %u), not presented %u, resets %u, spikes %u, jumps %u",
++					(s.real + s.gen) / sec, s.real, s.on_frames, s.gen, s.short_n, rtotal, s.spikes, s.jumps);
++				stream_push(nullptr, 2, sl);
++			}
 +			s.sec_t0 = t;
 +			s.real = s.on_frames = s.gen = s.short_n = s.st_err = s.pauses = s.miss_n = s.miss_bits = 0;
 +			s.up_why = s.cut_voted = s.cut_untrusted = s.cut_fg = 0;
@@ -17565,6 +17948,20 @@ index 0000000..b16e616
 +		return out[0] != 0;
 +	}
 +}
++
++#ifdef _WIN32
++// The game usually quits with ExitProcess, which skips atexit; a TLS callback still runs at DLL_PROCESS_DETACH (as in
++// port_frametime.h). It does nothing unless the level-3 stream was started.
++static void NTAPI r2fgdiag_tls(PVOID, DWORD reason, PVOID)
++{
++	if (reason == DLL_PROCESS_DETACH) r2fgdiag::stream_finish(false);
++}
++#pragma comment(linker, "/INCLUDE:_tls_used")
++#pragma comment(linker, "/INCLUDE:r2fgdiag_tls_cb")
++#pragma const_seg(".CRT$XLF")
++extern "C" const PIMAGE_TLS_CALLBACK r2fgdiag_tls_cb = r2fgdiag_tls;
++#pragma const_seg()
++#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Fossilize.cpp b/rpcs3/Emu/RSX/VK/VKR2Fossilize.cpp
 new file mode 100644
 index 0000000..9f877a4
