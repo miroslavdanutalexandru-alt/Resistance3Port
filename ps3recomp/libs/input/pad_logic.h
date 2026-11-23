@@ -211,19 +211,39 @@ static inline int padd_close(unsigned a, unsigned b)
     const unsigned d = a ^ b;
     return (d & 0xFFFFu) == 0 && padd_popc(d & 0x03FF0000u) <= 1;
 }
+/* sig_c close to a non-zero state in the history. */
+static inline int padd_hist_close(const PadSigHist* h, unsigned sig_c)
+{
+    for (int i = 0; i < h->n; i++) if (h->sig[i] && padd_close(h->sig[i], sig_c)) return 1;
+    return 0;
+}
+static inline int padd_hist_neutral(const PadSigHist* h)
+{
+    for (int i = 0; i < h->n; i++) if (h->sig[i]) return 0;
+    return 1;
+}
 /* One sample of the candidate against the real pad's recent history.
  * min_seen: how many different non-zero states must have matched before it
  * counts as a mirror (1 for a wrapper's Xbox-id pad; more for any other pad,
  * so two real pads both held the same way -- sticks forward -- stay separate).
+ * min_match: matched samples needed (PADD_MIN_MATCH; more for a pad that is playing).
+ * A candidate one stick axis or trigger away from a neutral reference proves
+ * nothing either way (a wrapper's deadzone / curve puts the copy's stick over
+ * the threshold before the real one), so it is not counted as a mismatch.
  * Returns +1 = ghost (mirrors it), -1 = a different controller, 0 = not sure yet. */
 #define PADD_MIN_SEEN_ANY 4
-#define PADD_RECHECK_MS   3000   /* a ghost is compared afresh this often, so its own input can free it */
-static inline int padd_update(PadPair* pp, unsigned sig_c, const PadSigHist* real, int min_seen)
+#define PADD_MIN_MATCH    12
+#define PADD_RECHECK_MS   3000   /* evidence about an ignored / watched pad decays this often */
+static inline int padd_update(PadPair* pp, unsigned sig_c, const PadSigHist* real, int min_seen, int min_match)
 {
     if (sig_c) {
-        int hit = 0;
-        for (int i = 0; i < real->n && !hit; i++) if (real->sig[i] && padd_close(real->sig[i], sig_c)) hit = 1;
-        if (hit) {
+        const int hit = padd_hist_close(real, sig_c);
+        int near_neutral = 0;
+        if (!hit && padd_close(0, sig_c))
+            for (int i = 0; i < real->n && !near_neutral; i++) if (!real->sig[i]) near_neutral = 1;
+        if (near_neutral) {
+            /* no evidence */
+        } else if (hit) {
             pp->match++;
             int known = 0;
             for (int i = 0; i < pp->nseen && !known; i++) if (pp->seen[i] == sig_c) known = 1;
@@ -231,9 +251,36 @@ static inline int padd_update(PadPair* pp, unsigned sig_c, const PadSigHist* rea
         } else pp->mismatch++;
         if (pp->match + pp->mismatch > 400) { pp->match /= 2; pp->mismatch /= 2; }
     }
-    if (pp->match >= 12 && pp->mismatch * 5 <= pp->match && pp->nseen >= min_seen) return 1;
+    if (pp->match >= min_match && pp->mismatch * 5 <= pp->match && pp->nseen >= min_seen) return 1;
     if (pp->mismatch >= 8 && pp->mismatch > pp->match) return -1;
     return 0;
+}
+static inline void padd_pair_decay(PadPair* pp) { pp->match /= 2; pp->mismatch /= 2; }
+
+/* Freeing a pad that was judged a copy needs clearly independent input: buttons
+ * (stick and trigger bits are left out: a wrapper's curves and gyro / touchpad
+ * mappings move those on their own) pressed while every reference pad was fully
+ * neutral, in several different combinations. Buttons close to what a
+ * reference pad just did start the count over. */
+#define PADD_FREE_SAMPLES 60
+#define PADD_FREE_SEEN    3
+typedef struct { int indep; unsigned seen[PADD_SEEN]; int nseen; } PadFree;
+static inline int padd_free_update(PadFree* f, unsigned sig_c, int refs_neutral, int refs_close)
+{
+    const unsigned b = sig_c & 0xFFFFu;
+    if (b && refs_close) { memset(f, 0, sizeof *f); return 0; }
+    if (b && refs_neutral) {
+        f->indep++;
+        int known = 0;
+        for (int i = 0; i < f->nseen && !known; i++) if (f->seen[i] == b) known = 1;
+        if (!known && f->nseen < PADD_SEEN) f->seen[f->nseen++] = b;
+    }
+    return f->indep >= PADD_FREE_SAMPLES && f->nseen >= PADD_FREE_SEEN;
+}
+static inline void padd_free_decay(PadFree* f)
+{
+    f->indep /= 2;
+    if (!f->indep) f->nseen = 0;
 }
 /* Ids that a virtual wrapper pad reports: Xbox 360 wired (ViGEm / DS4Windows,
  * also a real 360 pad) and SDL's generic XInput id. */

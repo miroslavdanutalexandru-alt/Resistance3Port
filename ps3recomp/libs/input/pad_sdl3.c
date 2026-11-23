@@ -36,8 +36,9 @@ typedef struct {
     int            cand;          /* could be a wrapper's virtual copy of another pad */
     int            recheck;       /* active candidate still being compared */
     int            real_ref;      /* a PlayStation / Nintendo pad (the kind wrappers copy) */
-    int            ghosted;       /* was judged a duplicate (logged once; rechecked every PADD_RECHECK_MS) */
-    Uint64         ghost_ms;
+    int            ghosted;       /* was judged a duplicate: watched for that from then on */
+    Uint64         ghost_ms;      /* last decay of the evidence (PADD_RECHECK_MS) */
+    PadFree        fr;            /* evidence that an ignored pad is used on its own */
     PadPair        pair[PADX_MAX_DEV];
     PadSigHist     hist;
     unsigned       sig;
@@ -128,12 +129,12 @@ static void padx_give_slot(PadDev* d)
 }
 /* Can d be checked against s_dev[j]? An active wrapper candidate under
  * recheck is compared with the real PlayStation / Nintendo pads only; a pad
- * still waiting (state 0) with every pad that is playing. */
+ * still waiting (state 0), ignored (2) or once ignored with every pad that is playing. */
 static int padx_is_ref(const PadDev* d, int j)
 {
     const PadDev* r = &s_dev[j];
     if (r == d || r->state != 1) return 0;
-    return d->state == 1 ? r->real_ref : 1;
+    return (d->state == 1 && !d->ghosted) ? r->real_ref : 1;
 }
 static int padx_any_ref(const PadDev* d)
 {
@@ -272,44 +273,62 @@ static void padx_dedup(void)
         if (c->state == 2) {   /* a duplicate whose original is gone is a controller again */
             if (!padx_any_ref(c)) {
                 printf("[pad-sdl3] %s: the controller it copied is gone, using it\n", c->name);
-                c->recheck = 0; c->ghosted = 0; memset(c->pair, 0, sizeof c->pair);
+                c->recheck = 0; c->ghosted = 0; memset(c->pair, 0, sizeof c->pair); memset(&c->fr, 0, sizeof c->fr);
                 padx_give_slot(c);
                 if (s_cfg_gyro) padx_sensors(c, 1);
-            } else if (SDL_GetTicks() - c->ghost_ms >= PADD_RECHECK_MS) {
-                c->state = 0; memset(c->pair, 0, sizeof c->pair);   /* compare afresh: own input frees it */
+                continue;
+            }
+            const Uint64 now = SDL_GetTicks();
+            if (now - c->ghost_ms >= PADD_RECHECK_MS) { padd_free_decay(&c->fr); c->ghost_ms = now; }
+            int neutral = 1, close = 0;
+            for (int j = 0; j < s_ndev; j++) {
+                if (!padx_is_ref(c, j)) continue;
+                if (s_dev[j].sig || !padd_hist_neutral(&s_dev[j].hist)) neutral = 0;
+                if (padd_hist_close(&s_dev[j].hist, c->sig)) close = 1;
+            }
+            if (padd_free_update(&c->fr, c->sig, neutral, close)) {
+                printf("[pad-sdl3] %s is used on its own: not a duplicate after all (still watched)\n", c->name);
+                fflush(stdout);
+                memset(c->pair, 0, sizeof c->pair); memset(&c->fr, 0, sizeof c->fr);
+                c->ghost_ms = now; c->recheck = 1;
+                padx_give_slot(c);
+                if (s_cfg_gyro) padx_sensors(c, 1);
             }
             continue;
         }
         if (!(c->state == 0 || (c->state == 1 && c->recheck))) continue;
         if (!s_dedup || !padx_any_ref(c)) {
             if (c->state == 0) padx_give_slot(c);
-            c->recheck = 0;
+            if (!c->ghosted) c->recheck = 0;
             continue;
+        }
+        /* A once-ignored pad that plays again is watched with more evidence needed
+         * (so a second player doing the same things is not taken for a copy). */
+        const int watched = c->state == 1 && c->ghosted;
+        if (watched && SDL_GetTicks() - c->ghost_ms >= PADD_RECHECK_MS) {
+            for (int j = 0; j < s_ndev; j++) padd_pair_decay(&c->pair[j]);
+            c->ghost_ms = SDL_GetTicks();
         }
         int ghost = 0, distinct = 1;
         for (int j = 0; j < s_ndev; j++) {
             if (!padx_is_ref(c, j)) continue;
             const int min_seen = (c->cand && s_dev[j].real_ref) ? 1 : PADD_MIN_SEEN_ANY;
-            const int v = padd_update(&c->pair[j], c->sig, &s_dev[j].hist, min_seen);
+            const int v = padd_update(&c->pair[j], c->sig, &s_dev[j].hist, min_seen,
+                                      watched ? 4 * PADD_MIN_MATCH : PADD_MIN_MATCH);
             if (v > 0) ghost = 1;
             if (v >= 0) distinct = 0;
         }
         if (ghost) {
-            if (!c->ghosted)
-                printf("[pad-sdl3] %s (%04x:%04x) mirrors another controller: ignored as a duplicate "
-                       "(DSX / DS4Windows / Steam Input virtual pad; PAD_DEDUP=0 keeps it)\n", c->name, c->vid, c->pid);
+            printf("[pad-sdl3] %s (%04x:%04x) mirrors another controller: ignored as a duplicate%s "
+                   "(DSX / DS4Windows / Steam Input virtual pad; PAD_DEDUP=0 keeps it)\n", c->name, c->vid, c->pid,
+                   c->ghosted ? " again" : "");
             fflush(stdout);
-            c->ghosted = 1; c->ghost_ms = SDL_GetTicks();
+            c->ghosted = 1; c->ghost_ms = SDL_GetTicks(); memset(&c->fr, 0, sizeof c->fr);
             c->state = 2; c->slot = -1; c->recheck = 0;
             if (c->has_gyro) padx_sensors(c, 0);
-        } else if (distinct) {
+        } else if (distinct && !watched) {
             c->recheck = 0;
-            if (c->state == 0) {
-                if (c->ghosted) printf("[pad-sdl3] %s is used on its own: not a duplicate after all\n", c->name);
-                c->ghosted = 0;
-                padx_give_slot(c);
-                if (s_cfg_gyro) padx_sensors(c, 1);
-            }
+            if (c->state == 0) padx_give_slot(c);
         }
     }
 }
