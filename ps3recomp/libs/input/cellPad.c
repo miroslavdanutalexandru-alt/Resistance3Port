@@ -607,6 +607,15 @@ volatile int g_port_space_start = 0;   /* v160v: set by stubs.cpp while a level 
 volatile int g_port_use_kbm = 0;              /* an INTERACT key is held */
 volatile int g_port_kbm_interact_bound = 0;   /* controls.txt binds INTERACT */
 volatile int g_port_input_kbm = 0;            /* port 0 is the keyboard (no controller) */
+/* stubs.cpp (aim assist Auto): the guest port the keyboard & mouse drive, -1 = none right now.
+ * With PAD_P2_KEYBOARD that is always player 2's port 1 (pad_host_port swaps 0 and 1);
+ * otherwise port 0 while the keyboard pad feeds it instead of a controller. */
+int cellpad_kbm_guest_port(void)
+{
+    pad_coop_init();
+    if (s_coop_p2kb) return 1;
+    return (g_port_input_kbm || GetTickCount64() - g_ml_kbm_ms < 500) ? 0 : -1;
+}
 /* Resistance 2: project/stubs.cpp (r2_text_patch, r2_menu_icon) sets this to
  * switch the on-screen button prompts and the menus' button icons between keys
  * and PS3 buttons; called every poll

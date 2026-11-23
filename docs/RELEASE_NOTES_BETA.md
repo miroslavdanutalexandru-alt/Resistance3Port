@@ -10,6 +10,9 @@ This is a **beta**. Only the intro and the opening Haven level have been played 
 
 ## 0.3.1-beta (unreleased)
 
+### New
+- **Aim assist option.** Launcher > Controls > Aiming and sticks > **Aim assist**, or in game with F9 or Options > *PC Controls & HUD*, where a change takes effect at once and is saved for the launcher too: *Auto* (the default) turns the game's aim assist off while you play with keyboard & mouse and keeps it with a controller; *On* keeps it always, as on PS3; *Off* turns it off for everyone. Aim assist is the slowdown when your aim passes over an enemy and the pull toward it. In split-screen, *Auto* only turns it off for the keyboard & mouse player (also with *Player 2 uses keyboard and mouse*). Enemies aim as before. `PORT_AIM_ASSIST=on` / `off` (unset = Auto). *Not yet tested in play; please report how it feels.*
+
 ### Controls
 - **Keyboard keys now follow the game's own controller setup.** Choosing another preset in the game's Options > Controls (for example fire on R2 and zoom on L2) or changing buttons on its *Customize* screen used to leave the keyboard unchanged: keys sent the same PS3 button as before, so they did the action of the new layout, not the one their launcher row names. Now each key keeps doing what its launcher row says (Fire fires, Crouch crouches, Sprint sprints) whatever the in-game layout; controllers are unchanged. The keys pick the layout up once you are back in play (not while you are still in a menu), and `logs\run.log` shows a `[controls] keys follow ...` line when they do. `PORT_KBM_LAYOUT=off` turns this off (keys always send the default PS3 buttons). An older keyboard-swap routine copied from Resistance 2 never ran in Resistance 3; it is only kept for `PORT_KBM_LAYOUT=old`.
 - **Launcher Controls page:** the last key of a game action can no longer be cleared by accident (right-click shows a message instead), and right-clicking an empty row puts its default key back.
