@@ -170,7 +170,7 @@ function Get-ToolStatus {
         Add 'ninja' $st $v $exe 'Ninja 1.10+' 'Ninja-build.Ninja'
     } else { Add 'ninja' 'missing' '' '' 'Ninja 1.10+' 'Ninja-build.Ninja' }
 
-    $exe = Find-Exe 'clang-cl'
+    $exe = Find-BtClangCl   # the copy the build uses (buildtools.ps1), not just the first one on PATH
     if ($exe) {
         $v = First-Version "$(& $exe --version 2>$null | Select-Object -First 1)"
         # 22+: the committed PGO profile is LLVM profile format 13 (buildtools.ps1 $BtMinClang)
