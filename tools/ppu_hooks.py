@@ -12,11 +12,20 @@ every chunk. ppu_recomp.h is handled as one file.
 """
 import difflib, glob, json, os, re, sys
 
+PPU_CHUNK_NAME = re.compile(r"ppu_recomp_[0-9]+\.cpp\Z")
+
+def ppu_chunks(directory):
+    """Return translated PPU source chunks, excluding the function table."""
+    return sorted(path for path in glob.glob(os.path.join(directory, "ppu_recomp_*.cpp"))
+                  if PPU_CHUNK_NAME.fullmatch(os.path.basename(path)))
+
+
 FR = re.compile(r'^void (func_[0-9A-F]+)\(ppu_context\* ctx\) \{$')
 TAIL = re.compile(r'^(#undef _RCX_RL|#define _RCX_RL .*|\s*)$')
 
 def rd(p):
-    return open(p, encoding='utf-8', errors='surrogateescape').read().split('\n')
+    with open(p, encoding='utf-8', errors='surrogateescape') as stream:
+        return stream.read().split('\n')
 
 def split_chunk(lines):
     """-> preamble lines, [(name, body lines)] ; trailing blank/_RCX_RL lines of a
@@ -45,7 +54,7 @@ def split_chunk(lines):
 
 def load(d):
     funcs, pres = {}, []
-    for f in sorted(glob.glob(os.path.join(d, 'ppu_recomp_0*.cpp'))):
+    for f in ppu_chunks(d):
         pre, fs = split_chunk(rd(f))
         pres.append(pre)
         for n, b in fs: funcs[n] = b
@@ -92,13 +101,15 @@ def extract(ed, fr, outp):
     ha, hb = os.path.join(ed, 'ppu_recomp.h'), os.path.join(fr, 'ppu_recomp.h')
     if os.path.exists(ha) and os.path.exists(hb):
         res['header'] = hunks(rd(hb), rd(ha))
-    json.dump(res, open(outp, 'w'), indent=0)
+    with open(outp, 'w', encoding='utf-8') as stream:
+        json.dump(res, stream, indent=0)
     print('%s: %d functions, %d preamble lines, %d header hunks' % (outp, len(res['funcs']), len(res['preamble']), len(res['header'] or [])))
 
 def apply(fr, hp):
-    H = json.load(open(hp))
+    with open(hp, encoding='utf-8') as stream:
+        H = json.load(stream)
     todo = dict(H['funcs']); n = 0
-    for f in sorted(glob.glob(os.path.join(fr, 'ppu_recomp_0*.cpp'))):
+    for f in ppu_chunks(fr):
         L = rd(f); out = []; i = 0; changed = False
         # preamble: right after the include line
         if H['preamble']:
@@ -119,12 +130,15 @@ def apply(fr, hp):
                 L[k:e] = body; k += len(body); changed = True; n += 1
                 continue
             k += 1
-        if changed: open(f, 'w', encoding='utf-8', errors='surrogateescape').write('\n'.join(L))
+        if changed:
+            with open(f, 'w', encoding='utf-8', errors='surrogateescape') as stream:
+                stream.write('\n'.join(L))
     if todo: raise SystemExit('functions not found: %s' % ', '.join(sorted(todo)[:10]))
     if H.get('header'):
         hp2 = os.path.join(fr, 'ppu_recomp.h')
         txt = '\n'.join(apply_hunks(rd(hp2), H['header'], 'ppu_recomp.h'))   # read before opening for write
-        open(hp2, 'w', encoding='utf-8', errors='surrogateescape').write(txt)
+        with open(hp2, 'w', encoding='utf-8', errors='surrogateescape') as stream:
+            stream.write(txt)
     print('applied %d function hooks' % n)
 
 if __name__ == '__main__':

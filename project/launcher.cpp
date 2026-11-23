@@ -87,7 +87,7 @@ static std::vector<Setting> g_set = {
     { "window", "Window size",
       "The size of the game window in Windowed mode. Fullscreen modes always use your screen's resolution.",
       { {"1280 x 720", "1280x720"}, {"1600 x 900", "1600x900"}, {"1920 x 1080", "1920x1080"},
-        {"2560 x 1440", "2560x1440"}, {"3840 x 2160", "3840x2160"} }, 2 },
+        {"2560 x 1440", "2560x1440"}, {"3840 x 2160", "3840x2160"}, {"5120 x 2160 (ultrawide)", "5120x2160"} }, 2 },
     { "fps", "Frame rate",
       "The PS3 game runs at 30 fps. 60 fps doubles how often the game updates and draws; the game measures "
       "real time each frame, so it does not play faster. Needs about twice the CPU and GPU time. "

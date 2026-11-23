@@ -3,7 +3,15 @@
 and its post passes on an ELF, apply the port's hooks, and post-process lifted
 SPU modules.
 """
-import glob, os, shutil, subprocess, sys
+import glob, os, re, shutil, subprocess, sys
+
+PPU_CHUNK_NAME = re.compile(r"ppu_recomp_[0-9]+\.cpp\Z")
+
+def ppu_chunks(directory):
+    """Find all translated PPU units, excluding ppu_recomp_table.cpp."""
+    return sorted(path for path in glob.glob(os.path.join(directory, "ppu_recomp_*.cpp"))
+                  if PPU_CHUNK_NAME.fullmatch(os.path.basename(path)))
+
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -23,7 +31,7 @@ def ppu(port, tk, elf, outdir, name, chunks, post_passes, hooks, work, reglocals
     if os.path.isdir(tmp): shutil.rmtree(tmp)
     run([sys.executable, os.path.join(tk, 'ppu_lifter.py'), elf, '--functions', os.path.join(od, stem + '.functions.json'),
          '--hle-stubs', os.path.join(od, stem + '.imports.json'), '--chunks', str(chunks), '--output', tmp])
-    chunksf = sorted(glob.glob(os.path.join(tmp, 'ppu_recomp_0*.cpp')))
+    chunksf = ppu_chunks(tmp)
     if post_passes:
         print('[%s] register cache + fast memory passes...' % name, flush=True)
         for f in chunksf:

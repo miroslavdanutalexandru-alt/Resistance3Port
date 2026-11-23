@@ -211,6 +211,25 @@ def write_workloads(path, d, plain_elfs, igjobs, igpics, wwspics):
     open(path, 'w', newline='\n').write('\n'.join(L))
 
 
+def spu_worker_count():
+    """Use normal concurrency unless R3_SPU_WORKERS explicitly limits it.
+
+    Set R3_SPU_WORKERS=4 (or lower) on systems with constrained memory.
+    The default preserves the upstream full-CPU concurrency.
+    """
+    default = os.cpu_count() or 4
+    value = os.environ.get("R3_SPU_WORKERS", "").strip()
+    if not value:
+        return default
+    try:
+        workers = int(value)
+    except ValueError as exc:
+        raise ValueError("R3_SPU_WORKERS must be a positive integer") from exc
+    if workers < 1:
+        raise ValueError("R3_SPU_WORKERS must be a positive integer")
+    return min(workers, default)
+
+
 def spu(port, tk, eboot, work, spudir=None):
     sys.path.insert(0, tk)
     from wrap_spu_elf import wrap
@@ -286,7 +305,7 @@ def spu(port, tk, eboot, work, spudir=None):
             raise SystemExit('lift of %s FAILED:\n%s' % (nm, (r.stdout + r.stderr)[-2000:]))
         return nm
     print('[spu] lifting %d images...' % len(jobs), flush=True)
-    with ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+    with ThreadPoolExecutor(spu_worker_count()) as ex:
         for i, nm in enumerate(ex.map(run_one, jobs)):
             if i % 25 == 0: print('  [%d/%d] %s' % (i + 1, len(jobs), nm), flush=True)
     spans = {nm: code_span(pe, base, size) for nm, _, pe, base, size in jobs if size}
@@ -343,7 +362,7 @@ def spu(port, tk, eboot, work, spudir=None):
         hook('post', n, f)
         subprocess.run([sys.executable, os.path.join(HERE, 'spu_w0.py'), f], check=True, capture_output=True)
         shutil.copytree(x, os.path.join(spudir, n))
-    with ThreadPoolExecutor(os.cpu_count() or 4) as ex:
+    with ThreadPoolExecutor(spu_worker_count()) as ex:
         list(ex.map(post, mods))
     print('[spu] %d images in %s' % (len(mods), spudir), flush=True)
 

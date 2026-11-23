@@ -105,6 +105,12 @@
           "set": {
             "window": "3840x2160"
           }
+        },
+        {
+          "label": "5120 x 2160 (ultrawide)",
+          "set": {
+            "window": "5120x2160"
+          }
         }
       ],
       "defaults": {
