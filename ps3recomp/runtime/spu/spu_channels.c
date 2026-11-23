@@ -5126,6 +5126,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
                 g_spu_interp_norejoin = 1; g_spu_interp_stop_sp = 0xFFFFFFFFu; g_spu_interp_maxsteps = 0;
                 g_spu_interp_nowall = 1; g_spu_interp_jobonly = 1;
                 const uint32_t uji_lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                const uint32_t uji_drain_ret = ctx->drain_ret_pc & SPU_LS_MASK;
                 spu_interp_run_until(ctx, jpc, 0);
                 g_spu_interp_norejoin = 0; g_spu_interp_nowall = 0; g_spu_interp_jobonly = 0;
                 uji_busy = 0;
@@ -5137,12 +5138,24 @@ static void spu_indirect_branch_full(spu_context* ctx)
                  * its first instruction, nothing executed) and a lifted caller
                  * waits for the link, treat it as a null callback and return to
                  * the caller, like SPU_RAW_BADCALL_SKIP does for the sound SPU.
+                 * r0 is only trusted as the link when it IS this call's link:
+                 * the drain waiting for it returns there, or the word before it
+                 * is `bisl $r0,$ra` with ra still holding this target (calls
+                 * that link through another register, or a stale r0 after a
+                 * tail chain, keep the halt rather than resume mid-caller).
                  * SPU_JOB_BADCALL_SKIP=0 halts as before. */
                 { static int s_bcs = -1;
                   if (s_bcs < 0) { const char* e = getenv("SPU_JOB_BADCALL_SKIP"); s_bcs = e ? atoi(e) : 1; }
-                  if (s_bcs && (ctx->status & SPU_STATUS_STOPPED_BY_HALT) &&
-                      (ctx->pc & SPU_LS_MASK) == jpc && ctx->host_depth > 0 &&
-                      uji_lr >= 0x100u && uji_lr != jpc) {
+                  int lr_ok = uji_lr >= 0x104u && uji_lr != jpc && uji_lr == uji_drain_ret;
+                  if (!lr_ok && uji_lr >= 0x104u && uji_lr != jpc) {
+                      const uint8_t* c = ctx->ls + uji_lr - 4u;
+                      const uint32_t w = ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
+                      const uint32_t ra = (w >> 7) & 0x7Fu;
+                      lr_ok = (w >> 21) == 0x1A9u && (w & 0x7Fu) == 0u &&
+                              (ra == 0u || (ctx->gpr[ra]._u32[0] & SPU_LS_MASK & ~3u) == jpc);
+                  }
+                  if (s_bcs && lr_ok && (ctx->status & SPU_STATUS_STOPPED_BY_HALT) &&
+                      (ctx->pc & SPU_LS_MASK) == jpc && ctx->host_depth > 0) {
                       static volatile LONG n_bcs = 0;
                       const LONG k = InterlockedIncrement(&n_bcs);
                       if (k <= 8 || (k & (k - 1)) == 0) {
