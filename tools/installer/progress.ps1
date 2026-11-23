@@ -153,10 +153,11 @@ function Initialize-SpProgress([string]$Port, [switch]$Unattended) {
 }
 function Set-SpEstimate([string]$Key, [double]$Sec) { if ($script:SpSteps.Contains($Key)) { $script:SpSteps[$Key] = [math]::Max(1.0, $Sec) } }
 # How long the code generator takes for these stages ("ppu_lift", or "eboot:ppu_lift" for a port that runs a stage
-# more than once): each stage's time measured on this PC, else its default.
+# more than once): each stage's time measured on this PC, else its default. A stage that runs more than once is
+# measured as the sum of its runs, so it counts once.
 function Get-SpRegenEstimate([string[]]$Stages) {
-    $est = 0.0
-    foreach ($s in $Stages) { if ($s) { $est += Get-SpTime 'regen' (($s -split ':')[-1]) } }
+    $est = 0.0; $seen = @{}
+    foreach ($s in $Stages) { if ($s) { $base = ($s -split ':')[-1]; if (-not $seen[$base]) { $seen[$base] = 1; $est += Get-SpTime 'regen' $base } } }
     $est
 }
 # What the code generator will do in step 4, known before it starts: $Stages = the stages that will run (none = the

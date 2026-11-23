@@ -159,7 +159,7 @@ $ppu = 'ppu_analyze', 'ppu_lift', 'ppu_emit', 'ppu_post', 'ppu_hooks', 'ppu_copy
 $spu = 'spu_lift', 'spu_jobmods', 'spu_post', 'spu_copy'
 Check (Near (Get-SpRegenEstimate $spu) 30) 'SPU only: about 30 s by default'
 Check (Near (Get-SpRegenEstimate ($ppu + $spu)) 1080) 'PPU and SPU: about 18 min'
-Check (Near (Get-SpRegenEstimate @('eboot:ppu_lift', 'game:ppu_lift')) 600) 'a stage run twice (R1''s eboot: / game:) counts twice'
+Check (Near (Get-SpRegenEstimate @('eboot:ppu_lift', 'game:ppu_lift', 'spu_lift')) 315) 'a stage run twice (R1''s eboot: / game:) counts once: its time is measured over both runs'
 Set-SpGenPlan $spu
 Check ((Near $script:SpSteps['gen'] 30) -and -not $script:SpGenFull) 'an SPU-only update: the overall bar weights the gen step by 30 s, not 18 min'
 Set-SpGenPlan @()
