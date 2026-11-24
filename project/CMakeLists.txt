@@ -414,6 +414,7 @@ add_executable(${PROJECT_NAME}
     r3_mods.cpp
     mods_psarc.cpp
     r3_pcextra.cpp
+    r3_cheats.cpp     # PORT_CHEAT_GODMODE / _AMMO / _GRENADES (launcher and F9 rows, Ctrl+F1 / F2)
     r3_menurows.cpp   # PC SETTINGS tab in the game's Options menu (R3_MENU_ROWS=0 off, 2 = rows in CONTROLS)
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
