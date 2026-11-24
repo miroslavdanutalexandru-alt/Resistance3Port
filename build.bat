@@ -6,7 +6,8 @@ cd /d "%~dp0"
 if not exist logs mkdir logs
 if not exist recompiled\ppu_recomp.h (echo The game code has not been generated yet - run Setup.bat first. & goto fail)
 rem A game window left open locks the .exe and the link fails -- close any that are still running.
-taskkill /IM Resistance3.exe /F >nul 2>&1 && echo Closed a Resistance3.exe that was still running.
+rem Close only a copy of Resistance3.exe started from THIS folder (never one from another checkout).
+powershell -NoProfile -Command "$d=[IO.Path]::GetFullPath('%~dp0'); $k=0; Get-Process Resistance3 -EA 0 | ?{ $_.Path -and $_.Path.StartsWith($d,'OrdinalIgnoreCase') } | ForEach-Object { Stop-Process -Id $_.Id -Force; $k=1 }; if($k){ 'Closed a Resistance3.exe that was still running.' }"
 echo ============================================================
 echo  Resistance 3 - native PC build
 echo  Builds one program (EBOOT.BIN; game.self is the same file).
