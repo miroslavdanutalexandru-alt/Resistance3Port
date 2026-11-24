@@ -55,6 +55,36 @@ static __declspec(thread) size_t s_dbg_capn = 0;
 extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
 extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
+/* One report at a time. The diagnostic threads (debug console, freeze relauncher, hang / movie /
+ * no-flip watchdogs) share s_dbg_out and s_dbg_file_only, and each suspends every other thread in
+ * dump_threads: two reports at once lost output, closed one FILE* twice, or left two dumpers
+ * suspending each other for good (no freeze relaunch then). Every report section -- the s_dbg_out
+ * setup, dump_threads, spu_dbg_dump_all and the fclose -- holds s_diag_lock, and dump_threads
+ * never suspends a registered diagnostic thread. */
+static SRWLOCK s_diag_lock = SRWLOCK_INIT;
+static volatile LONG s_diag_tids[8];
+static void diag_thread_register(void)
+{
+    const LONG me = (LONG)GetCurrentThreadId();
+    for (int i = 0; i < 8; i++)
+        if (s_diag_tids[i] == me || InterlockedCompareExchange(&s_diag_tids[i], me, 0) == 0) return;
+}
+static int diag_thread_is(DWORD tid)
+{
+    for (int i = 0; i < 8; i++) if ((DWORD)s_diag_tids[i] == tid) return 1;
+    return 0;
+}
+/* Take the report lock, waiting at most wait_ms (0 = only if free). 1 = got it. */
+static int diag_lock(DWORD wait_ms)
+{
+    for (DWORD waited = 0;; waited += 50) {
+        if (TryAcquireSRWLockExclusive(&s_diag_lock)) return 1;
+        if (wait_ms != INFINITE && waited >= wait_ms) return 0;
+        Sleep(50);
+    }
+}
+static void diag_unlock(void) { ReleaseSRWLockExclusive(&s_diag_lock); }
+
 static void dump_threads(const char* label, HMODULE self)
 {
     dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
@@ -79,39 +109,40 @@ static void dump_threads(const char* label, HMODULE self)
       if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
     dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
     ppu_report_guest_lrs();
+    /* While a thread is suspended, NOTHING here may take a lock that thread could
+     * hold: no loader calls (GetModuleHandleEx / GetModuleFileName take the
+     * loader / module-table lock, held by any thread inside LoadLibrary or a
+     * DLL thread attach/detach -- e.g. threads made and ended by a level
+     * reload), no heap, no CRT stream. Only GetThreadContext, VirtualQuery and
+     * plain reads of its stack, against the boot module's address range taken
+     * from its own PE header up front. The return addresses go to a local array;
+     * they are resolved and printed after ResumeThread. Otherwise a watchdog
+     * meant to report a stall could turn it into a permanent hang. */
+    uint64_t self_lo = (uint64_t)self, self_hi = self_lo;
+    if (self) {
+        const IMAGE_DOS_HEADER* dh = (const IMAGE_DOS_HEADER*)self;
+        const IMAGE_NT_HEADERS* nh = (const IMAGE_NT_HEADERS*)((const char*)self + dh->e_lfanew);
+        self_hi = self_lo + nh->OptionalHeader.SizeOfImage;
+    }
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
     if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
         do {
-            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me || diag_thread_is(te.th32ThreadID)) continue;
             HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
                                    FALSE, te.th32ThreadID);
             if (!th) continue;
-            s_dbg_capn = 0; s_dbg_capbuf[0] = 0; s_dbg_cap = s_dbg_capbuf;
-            SuspendThread(th);
+            uint64_t rets[40]; int nret = 0;
             CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
-            if (GetThreadContext(th, &ctx)) {
-                HMODULE m = NULL;
-                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCSTR)ctx.Rip, &m);
-                if (m == self) {
-                    dbg_printf( "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
-                            (unsigned long)te.th32ThreadID,
-                            (unsigned long long)((char*)ctx.Rip - (char*)self));
-                } else {
-                    char path[MAX_PATH] = "?";
-                    if (m) GetModuleFileNameA(m, path, sizeof path);
-                    const char* base = strrchr(path, '\\');
-                    dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
-                            (unsigned long)te.th32ThreadID, base ? base + 1 : path);
-                }
+            SuspendThread(th);
+            const BOOL got_ctx = GetThreadContext(th, &ctx);
+            if (got_ctx) {
                 /* Scan the suspended thread's stack for boot-module return
                  * addresses to reconstruct the lifted call chain — done for ALL
                  * threads (even when RIP is parked in ntdll inside a CriticalSection
                  * call), since that's exactly where the busy-spin's lwmutex churn
-                 * lands the main thread. Map RVAs -> func_ names via flow.map.
+                 * lands the main thread.
                  * (some false positives expected — these are stack-scan hits.) */
                 {
                     uint64_t* sp = (uint64_t*)ctx.Rsp;
@@ -130,15 +161,32 @@ static void dump_threads(const char* label, HMODULE self)
                         region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
                     int maxk = (int)((region_end - (uint64_t)sp) / 8);
                     if (maxk > 0x200000 / 8) maxk = 0x200000 / 8;   /* lifted SPU frames are big */
-                    int found = 0;
-                    for (int k = 0; k < maxk && found < 40; k++) {
-                        uint64_t v = sp[k];
-                        if (v < (uint64_t)self) continue;
-                        HMODULE mm = NULL;
-                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                           (LPCSTR)v, &mm);
-                        if (mm == self) {
+                    for (int k = 0; k < maxk && nret < 40; k++) {
+                        const uint64_t v = sp[k];
+                        if (v >= self_lo && v < self_hi) rets[nret++] = v;
+                    }
+                }
+            }
+            ResumeThread(th);
+            CloseHandle(th);
+            if (!got_ctx) continue;
+            if ((uint64_t)ctx.Rip >= self_lo && (uint64_t)ctx.Rip < self_hi) {
+                dbg_printf( "[WATCHDOG]   tid %5lu BOOT rip rva=0x%llX\n",
+                        (unsigned long)te.th32ThreadID,
+                        (unsigned long long)(ctx.Rip - self_lo));
+            } else {
+                HMODULE m = NULL;
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCSTR)ctx.Rip, &m);
+                char path[MAX_PATH] = "?";
+                if (m) GetModuleFileNameA(m, path, sizeof path);
+                const char* base = strrchr(path, '\\');
+                dbg_printf( "[WATCHDOG]   tid %5lu in %s\n",
+                        (unsigned long)te.th32ThreadID, base ? base + 1 : path);
+            }
+            for (int r = 0; r < nret; r++) {
+                const uint64_t v = rets[r];
                             /* Resolve to the guest function containing this return
                              * address: the function_table entry with the largest host
                              * pointer <= it. A raw RVA needs symbols a release build
@@ -168,17 +216,9 @@ static void dump_threads(const char* label, HMODULE self)
                                     ? "[WATCHDOG]       tid %5lu ret rva=0x%llX  func_%08X+0x%llX\n"
                                     : "[WATCHDOG]       tid %5lu ret rva=0x%llX\n",
                                     (unsigned long)te.th32ThreadID,
-                                    (unsigned long long)(v - (uint64_t)self),
+                                    (unsigned long long)(v - self_lo),
                                     bestGuest, (unsigned long long)((uintptr_t)v - bestHost));
-                            found++;
-                        }
-                    }
-                }
             }
-            ResumeThread(th);
-            s_dbg_cap = NULL;
-            if (s_dbg_capn) dbg_printf("%s", s_dbg_capbuf);
-            CloseHandle(th);
         } while (Thread32Next(snap, &te));
     }
     if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
@@ -207,6 +247,7 @@ static void dump_threads(const char* label, HMODULE self)
  * with, which is the useful half of that.
  */
 static FILE* s_dbg_out = NULL;
+static volatile int s_dbg_file_only = 0;   /* no-flip watchdog: the full dump goes to its file only */
 
 static void dbg_printf(const char* fmt, ...)
 {
@@ -220,7 +261,7 @@ static void dbg_printf(const char* fmt, ...)
         return;
     }
     if (s_dbg_out) { va_list c; va_copy(c, ap); vfprintf(s_dbg_out, fmt, c); va_end(c); }
-    vfprintf(stderr, fmt, ap);
+    if (!s_dbg_file_only) vfprintf(stderr, fmt, ap);
     va_end(ap);
 }
 
@@ -1314,6 +1355,7 @@ static const struct semlog_hw_init { semlog_hw_init() { g_semlog_hwwatch_hook = 
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
+    diag_thread_register();
     char outpath[1024];
     snprintf(outpath, sizeof outpath, "%s.out", path);
 
@@ -1387,6 +1429,7 @@ static DWORD WINAPI debug_console(LPVOID param)
           const int edge = down && !f11_was;
           f11_was = down;
           if (edge && s_dbg_main_tid) {
+              diag_lock(INFINITE);
               s_dbg_out = fopen(outpath, "ab");
               dbg_printf("%c[dbg] > F11: prof main %lu 6 + render, FIFO, raw SPUs, SPURS lanes together%c", 10, (unsigned long)s_dbg_main_tid, 10);
               fprintf(stderr, "[dbg] F11: profiling main/render/FIFO/raw SPUs/SPURS lanes for 6 s%c", 10);
@@ -1398,6 +1441,7 @@ static DWORD WINAPI debug_console(LPVOID param)
               dbg_prof_frame_threads_cpu(6);
               dbg_fifo_mhist(3);
               if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+              diag_unlock();
               fprintf(stderr, "[dbg] F11 profile written%c", 10);
               f11_was = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
               continue;
@@ -1434,6 +1478,7 @@ static DWORD WINAPI debug_console(LPVOID param)
             if (ap_low >= 2 || ap_hot >= 3) {
                 if (ap_hot >= 3) ap_hot_done = 1; else ap_done++;
                 ap_low = 0; ap_hot = 0;
+                diag_lock(INFINITE);
                 s_dbg_out = fopen(outpath, "ab");
                 dbg_printf("%c[dbg] > F11: prof main %lu 6 (auto, %u fps, render load %d%%) + render, FIFO, raw SPUs, SPURS lanes together%c",
                            10, (unsigned long)s_dbg_main_tid, d, rsx_perf_render_load(), 10);
@@ -1447,6 +1492,7 @@ static DWORD WINAPI debug_console(LPVOID param)
                  * then the main thread */
                 dbg_prof_frame_threads_cpu(6);
                 if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+                diag_unlock();
                 fprintf(stderr, "[dbg] auto-profile written%c", 10);
                 ap_last = cellGcm_flip_request_count();
                 continue;
@@ -1462,6 +1508,7 @@ static DWORD WINAPI debug_console(LPVOID param)
         if (!cmd[0]) continue;
         FILE* t = fopen(path, "wb"); if (t) fclose(t);   /* consume it */
 
+        diag_lock(INFINITE);
         s_dbg_out = fopen(outpath, "ab");
         dbg_printf("%c[dbg] > %s%c", 10, cmd, 10);
 
@@ -1632,6 +1679,7 @@ static DWORD WINAPI debug_console(LPVOID param)
         }
 
         if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+        diag_unlock();
     }
     return 0;
 }
@@ -1647,6 +1695,7 @@ static DWORD WINAPI freeze_relauncher(LPVOID)
     const char* e = getenv("FREEZE_RELAUNCH");
     const unsigned secs = e ? (unsigned)atoi(e) : 0;
     if (!secs) return 0;
+    diag_thread_register();
     HMODULE self = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1659,12 +1708,17 @@ static DWORD WINAPI freeze_relauncher(LPVOID)
         if (++still < secs) continue;
         static int n = 0;
         { char fn[64]; snprintf(fn, sizeof fn, "logs\\freeze_%lu_%d.txt", (unsigned long)GetTickCount(), n++);
-          s_dbg_out = fopen(fn, "wb");
-          dbg_printf("[freeze] frame counter stuck at %u for %u s%c", f, secs, 10);
-          dump_threads("freeze", self);
-          spu_dbg_dump_all(dbg_out_str);
-          if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
-          fprintf(stderr, "[freeze] stuck at flip %u -- state in %s, relaunching%c", f, fn, 10); fflush(stderr); }
+          /* another report may be running; wait for it, but never let it stop the relaunch */
+          if (diag_lock(15000)) {
+              s_dbg_out = fopen(fn, "wb");
+              dbg_printf("[freeze] frame counter stuck at %u for %u s%c", f, secs, 10);
+              dump_threads("freeze", self);
+              spu_dbg_dump_all(dbg_out_str);
+              if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+              diag_unlock();
+          } else fn[0] = 0;
+          fprintf(stderr, "[freeze] stuck at flip %u -- state in %s, relaunching%c", f,
+                  fn[0] ? fn : "(none: another report held the lock)", 10); fflush(stderr); }
         STARTUPINFOA si; PROCESS_INFORMATION pi;
         ZeroMemory(&si, sizeof si); si.cb = sizeof si;
         si.dwFlags = STARTF_USESTDHANDLES;
@@ -1695,6 +1749,7 @@ static DWORD WINAPI movie_watchdog(LPVOID)
     const char* e = getenv("PORT_MOVIE_WATCHDOG");
     const unsigned secs = e ? (unsigned)atoi(e) : 20u;
     if (!secs) return 0;
+    diag_thread_register();
     HMODULE self = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1709,6 +1764,7 @@ static DWORD WINAPI movie_watchdog(LPVOID)
         /* a movie that ended properly hands the screen back to gameplay
          * (SetFlipMode 1); York's hang stayed in movie mode (2) */
         if (cellGcm_get_flip_mode() != 2) { done_for = t; continue; }
+        if (!diag_lock(0)) continue;   /* another report is running: try again next second */
         done_for = t;
         char fn[64]; snprintf(fn, sizeof fn, "logs\\moviehang_%lu.txt", (unsigned long)GetTickCount());
         s_dbg_out = fopen(fn, "wb");
@@ -1717,13 +1773,141 @@ static DWORD WINAPI movie_watchdog(LPVOID)
         dump_threads("moviehang", self);
         spu_dbg_dump_all(dbg_out_str);
         if (s_dbg_out) { fclose(s_dbg_out); s_dbg_out = NULL; }
+        diag_unlock();
         fprintf(stderr, "[moviehang] movie ended %u s ago and the game has not moved on -- state in %s%c",
                 secs, fn, 10); fflush(stderr);
     }
 }
 
+/* Ported from the R2 port, made for its respawn stall (Bryce Canyon, RTX 4070 laptop): after a death the screen stayed black ~20 s with
+ * no flip, the main thread idle (not in [thrcpu]), no file reads, the RSX FIFO empty -- and the game
+ * went on the moment the window lost focus, before its frame loop reached the focus pause.
+ * PORT_NOFLIP_WATCHDOG=<secs> (default 5; 0 = off): when the game has not flipped for that long
+ * while it is not paused on purpose, say once per stall what the main thread waits on -- the HLE
+ * each guest thread is inside and every guest thread's lr (both in the log), the main thread's
+ * guest waits over the next second (usleep spin / sleep, lwmutex, lwcond, yields), whether the game
+ * still polls the pad and the port 0 pad state it last read -- and write the thread stacks (twice,
+ * 1 s apart) and the SPU state to logs\noflip_<tick>.txt (the first 3 stalls of a run).
+ * PORT_NOFLIP_NUDGE=<ms> (default 500; 0 = off): then release all input for that long, the only
+ * game-visible part of an alt-tab before the focus pause parks the frame loop, and report whether
+ * the flips came back -- so the next log tells whether the input was what the game waited on. */
+extern "C" volatile unsigned long long g_pad_release_until;   /* cellPad.c */
+extern "C" volatile long g_pad_getdata_n;                      /* cellPad.c */
+extern "C" volatile long g_fs_guest_reads;                     /* ppu_fs.cpp */
+static void noflip_file_only(const char* s) { if (s_dbg_out) fputs(s, s_dbg_out); }
+static DWORD WINAPI noflip_watchdog(LPVOID)
+{
+    static const unsigned secs = [] { const char* e = getenv("PORT_NOFLIP_WATCHDOG"); return (e && *e) ? (unsigned)atoi(e) : 5u; }();
+    static const unsigned nudge_ms = [] { const char* e = getenv("PORT_NOFLIP_NUDGE"); const int v = (e && *e) ? atoi(e) : 500;
+                                          return v <= 0 ? 0u : (unsigned)(v > 5000 ? 5000 : v); }();
+    if (!secs) return 0;
+    diag_thread_register();
+    SetThreadDescription(GetCurrentThread(), L"noflip watchdog");
+    HMODULE self = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&noflip_watchdog, &self);
+    unsigned last = 0, dumps = 0;
+    ULONGLONG since = GetTickCount64(), nudged = 0, told_nudge = 0;
+    long fs_since = g_fs_guest_reads;
+    int reported = 0;
+    for (;;) {
+        Sleep(250);
+        const unsigned f = cellGcm_flip_request_count();
+        const ULONGLONG now = GetTickCount64();
+        if (f != last || f < 200 || g_r2pc_paused) {
+            if (reported && f != last)
+                fprintf(stderr, "[noflip] flips resumed after %.1f s without one%s%c", (double)(now - since) / 1000.0,
+                        nudged ? (now - nudged <= 1500 ? " -- right after the input release (the game waited on its input)"
+                                                       : " -- not right after the input release")
+                               : (g_r2pc_paused ? " (paused meanwhile)" : ""), 10);
+            last = f; since = now; reported = 0; nudged = told_nudge = 0;
+            fs_since = g_fs_guest_reads;
+            continue;
+        }
+        if (nudged && !told_nudge && now - nudged > 3000) {
+            told_nudge = 1;
+            fprintf(stderr, "[noflip] still no flip 3 s after the input release: input is not what the game waits on%c", 10);
+        }
+        if (reported || now - since < (ULONGLONG)secs * 1000ull) continue;
+        if (!diag_lock(0)) continue;   /* another report is running: try again next tick */
+        reported = 1;
+        /* main thread's guest waits over one second */
+        ps3_waitstat a = {}, b = {};
+        int slot = -1;
+        for (int k = 0; k < PS3_WAITSTAT_MAX; k++) if (g_ps3_waitstat[k].tid == s_dbg_main_tid && s_dbg_main_tid) { slot = k; break; }
+        if (slot >= 0) memcpy(&a, (const void*)&g_ps3_waitstat[slot], sizeof a);
+        const long pad0 = g_pad_getdata_n;
+        char file[64] = "";
+        if (dumps < 3) {
+            snprintf(file, sizeof file, "logs\\noflip_%lu.txt", (unsigned long)GetTickCount());
+            s_dbg_out = fopen(file, "wb");
+            if (!s_dbg_out) file[0] = 0;
+        }
+        if (s_dbg_out) {
+            s_dbg_file_only = 1;
+            dbg_printf("[noflip] no flip for %u s (flip %u), not paused%c", secs, f, 10);
+            dump_threads("noflip #1", self);
+            s_dbg_file_only = 0;
+        } else {
+            fprintf(stderr, "[noflip] guest threads, by guest lr:%c", 10);
+            ppu_report_guest_lrs();
+        }
+        Sleep(1000);
+        if (slot >= 0 && g_ps3_waitstat[slot].tid == s_dbg_main_tid) memcpy(&b, (const void*)&g_ps3_waitstat[slot], sizeof b);
+        else memcpy(&b, &a, sizeof b);
+        const long pad1 = g_pad_getdata_n;
+        char hle[512]; int hp = 0; hle[0] = 0;
+        for (unsigned t = 0; t < 64u && hp < (int)sizeof hle - 64; t++)
+            if (const char* n = g_hle_inflight[t]) hp += snprintf(hle + hp, sizeof hle - hp, "%s%u:%s", hp ? " " : "", t, n);
+        char pad[128] = "no pad read yet";
+        if (const uint32_t ea = g_pad_data_ea0) {
+            uint16_t w[8];
+            for (int i = 0; i < 8; i++) w[i] = (uint16_t)((vm_base[(size_t)ea + 4 + 2 * i] << 8) | vm_base[(size_t)ea + 5 + 2 * i]);
+            snprintf(pad, sizeof pad, "port 0 last read: buttons %04X %04X, sticks R %u,%u L %u,%u",
+                     w[2], w[3], w[4] & 0xFF, w[5] & 0xFF, w[6] & 0xFF, w[7] & 0xFF);
+        }
+        const double qms = (double)ps3_qpc_freq() / 1000.0;
+        fprintf(stderr, "[noflip] no flip for %u s (flip %u), not paused | guest threads in an HLE: %s | main over 1 s: usleep spin %llu (%.0f ms) "
+                        "sleep %llu (%.0f ms), lwmutex %llu (%.0f ms), lwcond %llu (%.0f ms), yields %llu%s | pad GetData calls %ld/s, %s%s%s%c",
+                secs, f, hp ? hle : "none",
+                b.short_n - a.short_n, (double)(b.short_qpc - a.short_qpc) / qms, b.long_n - a.long_n, (double)(b.long_qpc - a.long_qpc) / qms,
+                b.lwm_block_n - a.lwm_block_n, (double)(b.lwm_block_qpc - a.lwm_block_qpc) / qms,
+                b.lwc_wait_n - a.lwc_wait_n, (double)(b.lwc_wait_qpc - a.lwc_wait_qpc) / qms, b.yield_n - a.yield_n,
+                slot < 0 ? " (no wait slot)" : "", pad1 - pad0, pad, file[0] ? " | stacks in " : "", file, 10);
+        if (s_dbg_out) {
+            s_dbg_file_only = 1;
+            dump_threads("noflip #2 (1 s later)", self);
+            spu_dbg_dump_all(noflip_file_only);
+            s_dbg_file_only = 0;
+            fclose(s_dbg_out); s_dbg_out = NULL;
+            dumps++;
+        }
+        diag_unlock();
+        fflush(stderr);
+        /* Release input only where it can matter and cannot hurt: the game must have read the pad in
+         * the last second (if it does not read input, releasing it cannot be what it waits on), and
+         * must not have read a file since the last flip (a load that shows no frame for a while is
+         * legitimate; leave it alone). */
+        const long fs_now = g_fs_guest_reads;
+        if (nudge_ms && cellGcm_flip_request_count() == f && !g_r2pc_paused) {
+            if (pad1 == pad0)
+                fprintf(stderr, "[noflip] no input release: the game did not read the pad in that second%c", 10);
+            else if (fs_now != fs_since)
+                fprintf(stderr, "[noflip] no input release: the game read %ld file chunks since its last frame (loading)%c",
+                        fs_now - fs_since, 10);
+            else {
+                nudged = GetTickCount64();
+                g_pad_release_until = nudged + nudge_ms;
+                fprintf(stderr, "[noflip] releasing all input for %u ms, as an alt-tab does (PORT_NOFLIP_NUDGE=0 off)%c", nudge_ms, 10);
+            }
+        }
+    }
+}
+
 static DWORD WINAPI hang_watchdog(LPVOID)
 {
+    diag_thread_register();
     HMODULE self = NULL;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1736,9 +1920,11 @@ static DWORD WINAPI hang_watchdog(LPVOID)
       if (e && sscanf(e, "%d,%d", &a, &b) == 2 && a > 0 && b > a) { t1 = a; t2 = b; } }
     char lbl[64];
     Sleep((DWORD)t1 * 1000);
-    snprintf(lbl, sizeof lbl, "%ds sample", t1); dump_threads(lbl, self);
+    snprintf(lbl, sizeof lbl, "%ds sample", t1);
+    if (diag_lock(15000)) { dump_threads(lbl, self); diag_unlock(); }
     Sleep((DWORD)(t2 - t1) * 1000);
-    snprintf(lbl, sizeof lbl, "%ds sample", t2); dump_threads(lbl, self);
+    snprintf(lbl, sizeof lbl, "%ds sample", t2);
+    if (diag_lock(15000)) { dump_threads(lbl, self); diag_unlock(); }
     return 0;
 }
 #endif

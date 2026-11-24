@@ -3523,6 +3523,7 @@ extern "C" void ps3_load_prx_modules(void)
     if (getenv("WATCHDOG_AT")) CreateThread(NULL, 0, hang_watchdog, NULL, 0, NULL);
     if (getenv("FREEZE_RELAUNCH")) CreateThread(NULL, 0, freeze_relauncher, NULL, 0, NULL);
     CreateThread(NULL, 0, movie_watchdog, NULL, 0, NULL);   /* v126: logs\\moviehang_*.txt */
+    CreateThread(NULL, 0, noflip_watchdog, NULL, 0, NULL);  /* PORT_NOFLIP_WATCHDOG: logs\\noflip_*.txt */
 #endif
 }
 

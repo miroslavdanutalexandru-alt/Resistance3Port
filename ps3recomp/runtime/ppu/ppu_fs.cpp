@@ -574,8 +574,10 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
  * (ReadFile) into a page the RSX texture cache write-protected fails silently
  * instead of faulting, so the read comes back short; memcpy faults in user
  * mode and the RSX unprotects the page. */
+extern "C" { volatile long g_fs_guest_reads = 0; }   /* guest file reads (debugtools.inc no-flip watchdog: loading?) */
 static size_t fs_guest_fread(uint8_t* dst, size_t len, FILE* f)
 {
+    g_fs_guest_reads = g_fs_guest_reads + 1;   /* racy on purpose: only "changed or not" matters */
     static thread_local uint8_t* bounce = nullptr;
     const size_t chunk = 1u << 20;
     if (!bounce) bounce = (uint8_t*)malloc(chunk);

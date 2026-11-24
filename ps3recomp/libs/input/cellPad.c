@@ -342,8 +342,12 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
  * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
  * so a title that reads the stick instead is playable too. */
 #ifdef _WIN32
+/* PORT_NOFLIP_NUDGE (project/debugtools.inc): until this GetTickCount64() time every input reads as
+ * if the window were in the background (all released, sticks centred), as an alt-tab does */
+volatile unsigned long long g_pad_release_until = 0;
 static int pad_host_window_focused(void)
 {
+    if (g_pad_release_until && GetTickCount64() < g_pad_release_until) return 0;
     HWND fg = GetForegroundWindow();
     if (!fg) return 0;
     DWORD pid = 0;
@@ -2087,12 +2091,14 @@ void cellPad_poll(void)
  * parameter, which conflicts with the header now that it is included. */
 
 volatile u32 g_pad_data_ea0 = 0;   /* v147: guest address of port 0's last GetData buffer (pad watch) */
+volatile long g_pad_getdata_n = 0; /* cellPadGetData calls (debugtools.inc no-flip watchdog: is the game polling?) */
 static s32 pad_get_data_impl(u32 port_no, CellPadData* data_guest);
 /* Set by the renderer (VKR2PcExtras.cpp) while NVIDIA Reflex latency markers are on: INPUT_SAMPLE marker */
 void (*volatile g_pad_input_hook)(void) = 0;
 s32 cellPadGetData(u32 port_no, CellPadData* data_guest)
 {
     const uint64_t ht = port_hitch_t0();   /* [hitch] pad time */
+    g_pad_getdata_n++;
     if (port_no == 0) { void (*hook)(void) = g_pad_input_hook; if (hook) hook(); }
     const s32 r = pad_get_data_impl(port_no, data_guest);
     port_hitch_end(PH_PAD, ht);
