@@ -14,7 +14,8 @@
  *                      func_00641AE8; the HUD's SetHealth func_0064F6E8 is its vtable
  *                      slot +0x3C) is made invulnerable: byte +0x101, the flag the
  *                      game's own setter func_00641CC4 writes and the damage handler
- *                      func_006409B0 checks first (non-zero: the damage is zeroed).
+ *                      func_006409B0 checks first (non-zero: the damage is zeroed;
+ *                      kept at 2 so the game's own writes stay visible, see below).
  *                      Health is also kept at the maximum. The component is looked up
  *                      in the component-type table [0x0101DCD8] (entries of 0x14 bytes:
  *                      array, count; health is type 26) and cached.
@@ -219,22 +220,30 @@ static uint32_t find_health(uint32_t handle)
 static float rdf(uint32_t a) { const uint32_t u = vm_read32(a); float f; memcpy(&f, &u, 4); return f; }
 static void wrf(uint32_t a, float f) { uint32_t u; memcpy(&u, &f, 4); vm_write32(a, u); }
 
-/* Byte +0x101 is shared with the game, which sets / clears it itself (func_00641CC4 from
- * about 40 places: scripted sections, the hero's own state code at 0x00164A5C, ...).
- * The cheat only owns it when it found it 0 and wrote the 1 itself, for this component
- * (same address, vtable, owner handle, hero) in this level (r3_level_gen), and found
- * valid on every check since. Found 1 without owning it: the game's, left alone (taken over only once
- * the game has cleared it). Turning God mode off clears it only while still owned;
- * a new level, another component or hero, or a check that fails drops ownership, and
- * the byte is then left to the game. */
-extern "C" int r3_level_gen(void);   /* r3_pcextra.cpp: +1 when the game opens another level */
-struct Inv { uint32_t comp, handle, hero; int level; };
+/* Byte +0x101 is shared with the game, which writes it itself (func_00641CC4 from about
+ * 40 places, Lua: scripted sections, the hero's own state code at 0x00164A5C, ...) and
+ * only ever writes 0 or 1; the game only tests it against 0 (func_006409B0, every caller
+ * of the getter func_00641CBC). So while God mode is on the cheat keeps it at 2 (GOD_MARK):
+ * still "not damageable" for the game, but any write by the game shows up (0 or 1 instead
+ * of 2). That value is remembered as what the game wants (game_val) and the 2 is put back.
+ * Turning God mode off writes game_val back, and only where the byte is still the cheat's 2
+ * on the same component (address, vtable, owner handle), so a scripted invulnerability
+ * that started while God mode was on stays on. A health component built anew (new level,
+ * checkpoint) starts with the game's own 0 / 1, which is simply seen as a game write. */
+static const uint8_t GOD_MARK = 2;
+struct Inv { uint32_t comp, handle; uint8_t game_val; };
 static Inv s_inv[4];                 /* one per hero slot (god_hero cache index) */
-static void inv_drop(int k, const char* why)
+static void inv_release(int k, const char* why)
 {
-    if (s_inv[k].comp)
-        fprintf(stderr, "[cheat] god mode: health 0x%08X no longer the cheat's (%s); left to the game\n", s_inv[k].comp, why);
-    s_inv[k] = {};
+    Inv& o = s_inv[k];
+    if (!o.comp) return;
+    if (health_comp_ok(o.comp, o.handle) && vm_read8(o.comp + 0x101) == GOD_MARK) {
+        vm_write8(o.comp + 0x101, o.game_val);
+        fprintf(stderr, "[cheat] god mode %s: health 0x%08X back to the game's %s\n", why, o.comp,
+                o.game_val ? "not damageable (scripted)" : "damageable");
+    } else
+        fprintf(stderr, "[cheat] god mode %s: health 0x%08X already the game's again\n", why, o.comp);
+    o = {};
 }
 static void god_hero(uint32_t hero, uint32_t handle)
 {
@@ -242,14 +251,12 @@ static void god_hero(uint32_t hero, uint32_t handle)
     static int nf = 0, badhp = 0;
     int k = 0;
     while (k < 4 && cache[k].hero != hero) k++;
-    if (k == 4) { k = 0; for (int i = 1; i < 4; i++) if (!cache[i].hero) { k = i; break; } cache[k] = { hero, handle, 0, 0 }; inv_drop(k, "other hero"); }
-    if (cache[k].handle != handle) { cache[k] = { hero, handle, 0, 0 }; inv_drop(k, "other hero"); }
-    const int level = r3_level_gen();
-    if (s_inv[k].comp && s_inv[k].level != level) inv_drop(k, "new level");
+    if (k == 4) { k = 0; for (int i = 1; i < 4; i++) if (!cache[i].hero) { k = i; break; } inv_release(k, "(other hero)"); cache[k] = { hero, handle, 0, 0 }; }
+    if (cache[k].handle != handle) { inv_release(k, "(other hero)"); cache[k] = { hero, handle, 0, 0 }; }
     uint32_t c = cache[k].comp;
     if (!c || !health_comp_ok(c, handle)) {
         c = 0;
-        inv_drop(k, "component gone");
+        inv_release(k, "(component gone)");
         if (cache[k].miss-- <= 0) {               /* not every frame while there is none */
             c = find_health(handle);
             cache[k].miss = c ? 0 : 30;
@@ -260,14 +267,18 @@ static void god_hero(uint32_t hero, uint32_t handle)
         cache[k].comp = c;
         if (!c) return;
     }
-    if (s_inv[k].comp && (s_inv[k].comp != c || s_inv[k].handle != handle || s_inv[k].hero != hero)) inv_drop(k, "other component");
-    if (!vm_read8(c + 0x101)) {
-        /* 0: never set, or cleared by the game (also while the cheat owned it): set it and own it */
-        if (!s_inv[k].comp)
-            fprintf(stderr, "[cheat] god mode: health 0x%08X (hero 0x%08X) not damageable\n", c, hero);
-        s_inv[k] = { c, handle, hero, level };
-        vm_write8(c + 0x101, 1);
+    if (s_inv[k].comp && (s_inv[k].comp != c || s_inv[k].handle != handle)) inv_release(k, "(other component)");
+    const uint8_t b = vm_read8(c + 0x101);
+    if (!s_inv[k].comp) {
+        /* first sight: a 2 here can only be left from an earlier record of this cheat */
+        s_inv[k] = { c, handle, (uint8_t)(b == GOD_MARK ? 0 : b) };
+        fprintf(stderr, "[cheat] god mode: health 0x%08X (hero 0x%08X) not damageable (game's flag %u)\n", c, hero, s_inv[k].game_val);
+    } else if (b != GOD_MARK) {
+        if (b != s_inv[k].game_val)
+            fprintf(stderr, "[cheat] god mode: the game set its not-damageable flag of 0x%08X to %u (kept for when God mode is off)\n", c, b);
+        s_inv[k].game_val = b;
     }
+    if (b != GOD_MARK) vm_write8(c + 0x101, GOD_MARK);
     const float hp = rdf(c + 0xF8), mx = rdf(c + 0xF4);
     if (!std::isfinite(hp) || !std::isfinite(mx) || mx <= 0.0f || mx > 100000.0f) {
         told(&badhp, "[cheat] god mode: health values not usable (component 0x%08X, hero 0x%08X)\n", c, hero);
@@ -277,20 +288,7 @@ static void god_hero(uint32_t hero, uint32_t handle)
 }
 static void god_restore(void)
 {
-    const int level = r3_level_gen();
-    for (int k = 0; k < 4; k++) {
-        const Inv& o = s_inv[k];
-        if (!o.comp) continue;
-        uint32_t moby = 0, handle = 0;
-        const bool same = o.level == level && health_comp_ok(o.comp, o.handle) && heap_ok(o.hero, 0x2000)
-                          && hero_moby(o.hero, &moby, &handle) && handle == o.handle;
-        if (same && vm_read8(o.comp + 0x101) == 1) {
-            vm_write8(o.comp + 0x101, 0);
-            fprintf(stderr, "[cheat] god mode off: health 0x%08X damageable again\n", o.comp);
-        } else if (!same)
-            fprintf(stderr, "[cheat] god mode off: health 0x%08X not checked again (level / hero changed); left to the game\n", o.comp);
-        s_inv[k] = {};
-    }
+    for (int k = 0; k < 4; k++) inv_release(k, "off");
 }
 
 /* Every gameplay frame, per hero (stubs.cpp r3_mouselook_pre); local = the hero has a
