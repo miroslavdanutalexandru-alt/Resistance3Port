@@ -378,10 +378,10 @@ void sp_update_mark(uint32_t frame)
     if (frame - g_sp_settle_frame >= 2) { g_sp_mark = 0; g_sp_settling = 0; }
 }
 
-/* ---- R3_OCC_NOWAIT (default 1; R3_OCC_BLOCKING=1 and RSX_OCC_SPEC_VISIBLE=0 only), ported from R2 -----------------
+/* ---- R3_OCC_NOWAIT (default 1; R3_OCC_BLOCKING=1, RSX_OCC_SPEC_VISIBLE=0, R3_OCC_TIMEOUT_PARTIAL=0 only), ported from R2 -----------------
    Frame S: a set read from the per-object caller (0x00274E64, the only call site of func_0074EAB0) whose last report is
-   still not written after R3_OCC_NOWAIT_US (default 2000) is answered at once with occ_force_visible (every flag
-   visible -- the object is drawn and the depth test hides it if it really is occluded; never hidden). Sets that are
+   still not written after R3_OCC_NOWAIT_US (default 2000) is answered at once with occ_nw_visible (every flag
+   1 -- the object is drawn and the depth test hides it if it really is occluded; never hidden). Sets that are
    ready in S keep their exact results. The skipped reports can still land after the game zeroed and reused their
    slots, so at the FIRST set read of frame S+1 the main thread drains the RSX once (occ_nw_drain): it waits until
    rsx::thread has executed every command put so far and every report claimed by then is written. Afterwards every
@@ -420,7 +420,15 @@ int occ_nw_drain(long long* ns_out)   /* 0 passed, 1 timed out, -1 no RPCS3 rend
 int occ_nw_visible(uint32_t obj, int32_t b)
 {
     if (!occ_set_writable(obj, b)) return 0;
-    occ_force_visible(obj, b);
+    /* always 1, as R2's r2_occ_write_visible: never a landed report count (a skipped report's slot can be stale) */
+    const uint32_t count = ld_be16(obj + 0x84 + 2 * b);
+    const uint32_t list = ld_be32(obj + 0x74 + 4 * b);
+    const uint32_t flags = ld_be32(obj + 0x0);
+    for (uint32_t i = 0; i < count; i++) {
+        if (!span_ok(list + 2 * i, 2)) break;
+        const uint32_t fl = flags + ((uint32_t)ld_be16(list + 2 * i) << 2);
+        if (span_ok(fl, 4)) st_be32(fl, 1);
+    }
     return 1;
 }
 
@@ -531,7 +539,7 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
                     g_sp_on ? "on" : "off (needs R3_OCC_BLOCKING=1 and R3_OCC_TIMEOUT_PARTIAL=0)", g_sp_need);
         {
             const int nw = env_int("R3_OCC_NOWAIT", 1);
-            g_nw_on = (g_occ_block == 1 && !g_sp_on && nw > 0) ? 1 : 0;
+            g_nw_on = (g_occ_block == 1 && !g_sp_on && !g_occ_partial && nw > 0) ? 1 : 0;
             const char* u = getenv("R3_OCC_NOWAIT_US");
             g_nw_us = (u && *u) ? atoll(u) : 2000;
             if (g_nw_us < 0) g_nw_us = 0;
@@ -544,7 +552,7 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
                                 "(<= %lld ms, R3_OCC_NOWAIT_DRAIN_MS) so results stay exact. 0 = the game's own wait\n",
                         g_nw_us, g_nw_drain_us / 1000);
             else if (nw > 0)
-                fprintf(stderr, "[occ] R3_OCC_NOWAIT: off (needs R3_OCC_BLOCKING=1 and RSX_OCC_SPEC_VISIBLE=0)\n");
+                fprintf(stderr, "[occ] R3_OCC_NOWAIT: off (needs R3_OCC_BLOCKING=1, RSX_OCC_SPEC_VISIBLE=0 and R3_OCC_TIMEOUT_PARTIAL=0)\n");
         }
         g_occ_init = 1;
         fprintf(stderr, "[occ] occlusion report wait: skip %d frame(s) in a row, native timeout %lld us (-1 = lifted), "
