@@ -605,10 +605,15 @@ int64_t sys_fs_open(ppu_context* ctx)
     if (access == CELL_FS_O_RDONLY && lf_is_bink(host_path)) {
         const int lang = lf_system_language();
         int pol = lf_voice_policy(lang);
-        if (pol) {
-            uint8_t hdr[2048];
-            const size_t got = fread(hdr, 1, sizeof hdr, fp);
+        static int diag = -1;
+        if (diag < 0) { const char* e = getenv("PORT_DIALOGUE_DIAG"); diag = !(e && e[0] == '0'); }
+        uint8_t hdr[2048];
+        size_t got = 0;
+        if (pol || diag) {
+            got = fread(hdr, 1, sizeof hdr, fp);
             fseek(fp, 0, SEEK_SET);
+        }
+        if (pol) {
             if (lf_bink_plan(hdr, got, lang, &bplan) && pol == 2) {
                 /* not an English variant: only when the disc has no dub for it at all */
                 if (!s_disc_lang[lang]) {
@@ -625,6 +630,31 @@ int64_t sys_fs_open(ppu_context* ctx)
                 if (!said++) fprintf(stderr, "[lang] %s has no voice track for system language %d, "
                                              "playing the English one (PS3_LANG_VOICE_FALLBACK=0 off)\n", host_path, lang);
             }
+        }
+        /* PORT_DIALOGUE_DIAG (default on, 0 = off): per movie open, the language,
+         * the audio tracks on disc and the voice-track rename, so a log tells
+         * why a cutscene plays without dialogue. */
+        static int diag_lines;
+        if (diag && diag_lines < 200) {
+            diag_lines++;
+            char tracks[512], ren[160];
+            lf_bink_describe(hdr, got, tracks, sizeof tracks);
+            size_t w = 0;
+            ren[0] = 0;
+            for (int i = 0; i < bplan.n && w + 1 < sizeof ren; i++) {
+                const int r = snprintf(ren + w, sizeof ren - w, "%s%u", i ? "," : "", (unsigned)bplan.val[i]);
+                if (r < 0) break;
+                w += (size_t)r;
+            }
+            const char* base = strrchr(host_path, '/');
+            const char* b2 = strrchr(host_path, '\\');
+            if (b2 && (!base || b2 > base)) base = b2;
+            base = base ? base + 1 : host_path;
+            fprintf(stderr, "[dialogue] %s: system language %d, %s; %s; voice %s%s\n", base, lang,
+                    lf_title_english(lang) ? "the game asks for English (PS3_LANG_TITLE_ENGLISH)"
+                    : pol == 1 ? "English voice fallback" : pol == 2 ? "fallback if the disc has no dub"
+                    : !lf_enabled() ? "fallback off" : "no fallback needed",
+                    tracks, bplan.n ? "English tracks renamed to " : "tracks unchanged", ren);
         }
     }
 

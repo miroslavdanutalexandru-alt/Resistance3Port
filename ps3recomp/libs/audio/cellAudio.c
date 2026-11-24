@@ -2386,6 +2386,21 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     memset(&port->param, 0, sizeof(port->param));
     port->param.nChannel = nch;
     port->param.nBlock   = nblk;
+    {   /* PORT_DIALOGUE_DIAG: how this port reaches the stereo host output
+         * (cutscene speech sits in the centre channel of the 8-ch movie port). */
+        const char* e = getenv("PORT_DIALOGUE_DIAG");
+        if (!(e && e[0] == '0')) {
+            const char* sp = getenv("PORT_SPEAKERS");
+            if (nch == CELL_AUDIO_PORT_8CH)
+                printf("[dialogue] audio port %d: 8 ch -> host stereo: L/R + C x0.707 + LFE x%s + Ls/Rs x0.5 "
+                       "+ back x0.3 (PORT_SPEAKERS=%s)\n", (int)found,
+                       found == 1 ? (getenv("AUDIO_P1_LFE") ? getenv("AUDIO_P1_LFE") : "0") : "0.5",
+                       sp && *sp ? sp : "unset");
+            else
+                printf("[dialogue] audio port %d: 2 ch -> host stereo as is (PORT_SPEAKERS=%s)\n",
+                       (int)found, sp && *sp ? sp : "unset");
+        }
+    }
     port->read_index  = 0;
     port->write_index = 0;
     audio_lt_reset_port(found);   /* v141: no delay-line / concealment state from a previous open */

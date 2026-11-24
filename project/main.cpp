@@ -997,6 +997,17 @@ int main(int argc, char** argv)
 #endif
     }
 
+    /* Resistance 3's movie player (igBink) asks for the English voice tracks (20 + k) when the system
+     * language is Dutch (6) or 9..15, so the file layer's voice fallback must not rename them for those
+     * (lang_fallback.h). PS3_LANG_TITLE_ENGLISH=none restores 0.3.0's renaming. */
+    if (!getenv("PS3_LANG_TITLE_ENGLISH")) {
+#ifdef _WIN32
+        _putenv("PS3_LANG_TITLE_ENGLISH=6,9-15");
+#else
+        setenv("PS3_LANG_TITLE_ENGLISH", "6,9-15", 1);
+#endif
+    }
+
     /* LV2 mapper reservations from 0x30000000 as on the PS3 (the runtime's default is 0x40000000): the game's
      * GCM IO region (cellGcmInit ioAddress) comes from the first reservation, and everything tuned or
      * captured so far ran with it at 0x30000000. run.bat sets this too; a launcher that runs the exe directly
