@@ -41,7 +41,7 @@ This is a **beta**. Only the intro and the opening Haven level have been played 
 
 ### Project
 - **CI and release tooling**, contributed by @undecuple: a release build workflow that builds Setup, the zips and checksums with `scripts\package_beta.ps1` on a Windows runner and only ever creates a *draft* release from a version tag (PR #2); a check that no game files and no unexpected large files are committed, using the same patterns as `package_beta.ps1` (PR #19); a gitleaks secrets scan (PR #20); Dependabot updates for the pinned GitHub Actions (PR #21); and `ps3recomp/UPSTREAM_BASE`, which records the upstream ps3recomp commit range the original import came from (PR #22).
-
+- **5120 x 2160 window size, chunk filter fix and SPU worker limit**, contributed by @Thrashmetaldinosaur (PR #39): launcher Display > Window size now offers **5120 x 2160**; `build_cpu.bat` picks game code chunks by number, so it keeps working once there are 100 or more; `R3_SPU_WORKERS=N` limits how many workers generate SPU code (an invalid value prints a warning and uses the default). The PR's chunk discovery changes to the code generator will come in a later release that regenerates the game code anyway, so this update doesn't force a full regeneration.
 ## 0.3.0-beta.1 (hotfix)
 
 Setup fix only; the game itself is unchanged from 0.3.0.
