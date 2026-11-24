@@ -722,6 +722,10 @@ static void live_fx_mb(const std::string& v) { fx_init(); s_fx_mb = v != "0"; }
 static void live_cvd(const std::string& v) { g_pc_cvd_mode = atoi(v.c_str()); }
 static int crosshair_parse(const std::string& v) { return v == "dot" || v == "1" ? 1 : v == "cross" || v == "2" ? 2 : 0; }
 static void live_xhair(const std::string& v) { s_crosshair = crosshair_parse(v); }
+extern "C" void r3_hud_reticle_set(int on);     /* stubs.cpp: the game's own crosshair / hit markers */
+extern "C" void r3_hud_hitmarker_set(int on);
+static void live_reticle(const std::string& v) { r3_hud_reticle_set(v != "0"); }
+static void live_hitmarker(const std::string& v) { r3_hud_hitmarker_set(v != "0"); }
 static unsigned s_xh_rgb = 0xF0F0F0; static int s_xh_scale = 100;
 static void live_xhcolor(const std::string& v) { s_xh_rgb = pcx_xhair_rgb(v.c_str()); }
 static void live_xhsize(const std::string& v) { s_xh_scale = pcx_xhair_scale(v.c_str()); }
@@ -794,7 +798,11 @@ static void opts_init(void)
     opt_add(L"Brightness", L"Picture gamma on top of the game's own brightness option (SDR; in HDR use HDR paper white). Takes effect on restart.",
             "gamma", "PS3_DISPLAY_GAMMA", 1,
             { {L"Game default", ""}, {L"Brighter", "0.9"}, {L"Brightest", "0.8"}, {L"Darker", "1.1"}, {L"Darkest", "1.2"} }, "", NULL);
-    opt_add(L"Crosshair", L"A small extra marker at the screen centre while on foot.", "crosshair", ENVN("CROSSHAIR"), 0,
+    opt_add(L"Game crosshair", L"The game's own crosshair (the lines around the screen centre). Weapon scopes are not affected.",
+            "reticle", ENVN("RETICLE"), 0, onoff, "", live_reticle);
+    opt_add(L"Hit markers", L"The marker the game draws over the crosshair when a shot hits.", "hitmarker", ENVN("HITMARKER"), 0,
+            onoff, "", live_hitmarker);
+    opt_add(L"Extra crosshair", L"A small extra marker at the screen centre while on foot (drawn by the port, on top of the game's own).", "crosshair", ENVN("CROSSHAIR"), 0,
             { {L"Off", ""}, {L"Dot", "dot"}, {L"Cross", "cross"} }, "", live_xhair);
     opt_add(L"Crosshair colour", L"Colour of the extra crosshair (high-contrast choices; a dark outline is always drawn).", "xhair_color", ENVN("CROSSHAIR_COLOR"), 0,
             { {L"White", ""}, {L"Green", "green"}, {L"Yellow", "yellow"}, {L"Cyan", "cyan"}, {L"Red", "red"}, {L"Pink", "pink"}, {L"Orange", "orange"} }, "", live_xhcolor);
