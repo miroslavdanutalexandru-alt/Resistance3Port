@@ -2985,7 +2985,27 @@ static int r3_gfx_number(uint32_t v, double& d)
  * (an empty function in hud.swf). Weapon scopes (hud_*.swf) are separate and stay. */
 static std::atomic<int> s_r3_reticle{ -1 }, s_r3_hitmarker{ -1 };
 static int r3_env_on(const char* name) { const char* e = getenv(name); return !(e && (!strcmp(e, "0") || !_stricmp(e, "off"))); }
-extern "C" void r3_hud_reticle_set(int on) { s_r3_reticle = on ? 1 : 0; }
+/* Per HUD movie (split screen has two): want = the game's last explicit ShowReticule (1) / HideReticule (0),
+ * hidden = we turned the reticle off. LRU table; an entry not seen for R3_HUD_STALE_MS forgets want
+ * (the movie may have been destroyed and its address reused by a new HUD), so it is never force-shown.
+ * Hiding is always safe, so turning the crosshair off works for unknown entries too. */
+struct R3HudEnt { uint32_t menu; uint8_t want, hidden; uint64_t seen; };
+enum { R3_HUD_SLOTS = 8, R3_HUD_STALE_MS = 5000, R3_HUD_TOGGLE_KEEP_MS = 120000 };
+static R3HudEnt s_r3_huds[R3_HUD_SLOTS];
+static std::mutex s_r3_hud_mu;
+static uint64_t r3_hud_now_ms()
+{
+    return (uint64_t)GetTickCount64();
+}
+extern "C" void r3_hud_reticle_set(int on)
+{
+    s_r3_reticle = on ? 1 : 0;
+    /* a live toggle (often from a pause menu, while the HUD gets no calls) keeps recently active HUDs fresh */
+    std::lock_guard<std::mutex> lk(s_r3_hud_mu);
+    const uint64_t now = r3_hud_now_ms();
+    for (auto& x : s_r3_huds)
+        if (x.menu && now - x.seen < R3_HUD_TOGGLE_KEEP_MS) x.seen = now;
+}
 extern "C" void r3_hud_hitmarker_set(int on) { s_r3_hitmarker = on ? 1 : 0; }
 static void r3_hud_reticle_filter(ppu_context* ctx)
 {
@@ -2996,29 +3016,36 @@ static void r3_hud_reticle_filter(ppu_context* ctx)
     int ret = s_r3_reticle, hit = s_r3_hitmarker;
     if (ret < 0) { int e = -1; s_r3_reticle.compare_exchange_strong(e, r3_env_on("R3_RETICLE")); ret = s_r3_reticle; }
     if (hit < 0) { int e = -1; s_r3_hitmarker.compare_exchange_strong(e, r3_env_on("R3_HITMARKER")); hit = s_r3_hitmarker; }
-    /* per HUD movie (split screen has two): did the game ask for the reticle, and did we hide it */
-    struct Hud { uint32_t menu; uint8_t want, hidden; };
-    static Hud s_huds[4];
-    static std::mutex s_mu;
     static uint32_t s_names;   /* "HideReticule", "ShowReticule", "ResetReticule" in guest memory */
     const char* to = NULL;
     {
-        std::lock_guard<std::mutex> lk(s_mu);
-        Hud* h = NULL;
-        auto hud = [&]() -> Hud* {
-            for (auto& x : s_huds) if (x.menu == menu) return &x;
-            for (auto& x : s_huds) if (!x.menu) { x.menu = menu; return &x; }
-            s_huds[0] = Hud{ menu, 0, 0 }; return &s_huds[0];
+        std::lock_guard<std::mutex> lk(s_r3_hud_mu);
+        const uint64_t now = r3_hud_now_ms();
+        auto hud = [&]() -> R3HudEnt* {
+            R3HudEnt* lru = NULL;
+            for (auto& x : s_r3_huds) {
+                if (x.menu == menu) {
+                    if (now - x.seen > R3_HUD_STALE_MS) { x.want = 0; x.hidden = 0; }
+                    x.seen = now;
+                    return &x;
+                }
+                if (!lru || (lru->menu && (!x.menu || x.seen < lru->seen))) lru = &x;
+            }
+            *lru = R3HudEnt{ menu, 0, 0, now };
+            return lru;
         };
         if (!strcmp(n, "ShowReticule")) {
-            h = hud(); h->want = 1;
+            R3HudEnt* h = hud(); h->want = 1;
             if (!ret) { to = "HideReticule"; h->hidden = 1; } else h->hidden = 0;
         } else if (!strcmp(n, "HideReticule")) {
-            h = hud(); h->want = 0; h->hidden = 0;
+            R3HudEnt* h = hud(); h->want = 0; h->hidden = 0;
         } else if (!strcmp(n, "SetReticule")) {
-            h = hud();
-            if (h->want && !ret && !h->hidden) { to = "HideReticule"; h->hidden = 1; }       /* turned off while shown */
-            else if (h->want && ret && h->hidden) { to = "ShowReticule"; h->hidden = 0; }    /* turned back on */
+            R3HudEnt* h = hud();
+            if (!ret && !h->hidden) { to = "HideReticule"; h->hidden = 1; }      /* turned off (hiding is always safe) */
+            else if (ret && h->hidden) {
+                h->hidden = 0;
+                if (h->want) to = "ShowReticule";                                /* turned back on and the game wants it */
+            }
         } else if (!strcmp(n, "SetReticuleHit")) {
             if (!hit) to = "ResetReticule";
         }
