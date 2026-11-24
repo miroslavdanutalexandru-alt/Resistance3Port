@@ -701,6 +701,7 @@ extern "C" void port_jb_jump(ppu_context* ctx, uint32_t buf_ea)
  * disagrees for 15 frames running, e.g. after flipping invert in the options.
  * The game's controller sensitivity (0-9) scales it too (port_ml_game_sens). */
 extern "C" volatile long g_ml_mode, g_kbm_ml_dx, g_kbm_ml_dy;
+extern "C" volatile int g_kbm_wheel_look_off;
 extern "C" volatile double g_ml_deg_per_count;
 extern "C" volatile int g_ml_invert_y, g_ml_fed_rx, g_ml_fed_ry, g_kbm_capture, g_ml_rs_keys;
 extern "C" volatile ULONGLONG g_ml_kbm_ms;
@@ -995,7 +996,7 @@ extern "C" void port_mouselook(uint32_t player)
     { const uint32_t c = vm_read32(player + 16016);
       g_port_opts_ea = c ? vm_read32(c + 6848) : 0; }
     const ULONGLONG now = GetTickCount64();
-    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
+    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0); if (g_kbm_wheel_look_off) dx = dy = 0;   /* PORT_KBM_WHEEL: the mouse picks a weapon */
     if (port_local_players() > 1) return;   /* split-screen: the mouse is a right stick */
     /* counts gathered while the look code was not running (menus, pause,
      * cutscenes, a vehicle) are dropped, not applied in one jump */
@@ -1540,7 +1541,7 @@ extern "C" void r2_mouselook(ppu_context* ctx, uint32_t hero)
     const ULONGLONG now = GetTickCount64();
     const int mine = hero == s_r2ml_hero; s_r2ml_hero = 0;
     if (!mine) return;
-    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
+    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0); if (g_kbm_wheel_look_off) dx = dy = 0;   /* PORT_KBM_WHEEL: the mouse picks a weapon */
     /* counts gathered while this code was not running (menus, pause,
      * cutscenes, a vehicle) are dropped, not applied in one jump */
     if (now - s_r2ml_last > 150 || !g_kbm_capture || now < s_r2ml_lock_until) dx = dy = 0;
@@ -1930,7 +1931,7 @@ extern "C" void r3_mouselook(ppu_context* ctx, uint32_t hero)
         else              { ctx->fpr[31] = (double)(float)(ctx->fpr[31] + pitch); ctx->fpr[30] = (double)(float)(ctx->fpr[30] + yaw); }
         return;
     }
-    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
+    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0); if (g_kbm_wheel_look_off) dx = dy = 0;   /* PORT_KBM_WHEEL: the mouse picks a weapon */
     if (now - s_r3ml_last > 150 || !g_kbm_capture || now < s_r3ml_lock_until) dx = dy = 0;
     s_r3ml_last = now;
     if (!dx && !dy) return;

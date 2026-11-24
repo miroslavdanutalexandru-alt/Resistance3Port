@@ -118,6 +118,7 @@ Where the prompts are replaced: Resistance 3's menus and HUD are Scaleform (Flas
 | Turn boost | **Off**, 90, 180, 270 deg/s | `PAD_TURN_BOOST=<deg/s>`: right stick held at the edge for a moment ramps in extra turn speed (0.35 s), added like gyro/mouse turning; not while aiming |
 | Crouch button (experimental) | **As the game**, Toggle, Hold | `PAD_CROUCH_MODE=toggle\|hold` (Circle / B): the port turns presses into a held button (toggle) or taps on press and release (hold) |
 | Sprint button (experimental) | **As the game**, Toggle, Hold | `PAD_SPRINT_MODE=toggle\|hold` (L3), same way |
+| Weapon wheel on keyboard & mouse (no launcher option) | **On**, Off, Left stick only | `PORT_KBM_WHEEL=0\|left`: while the weapon wheel key (Q) is held, moving the mouse toward a slot (or WASD, diagonals included) picks it, and the choice stays until you let go of Q; the view holds still meanwhile. `0` = old behaviour (only the left stick from WASD, which menu mode could take away). `left` = only the left stick (which is what the wheel reads), not also the right one |
 
 All of these are also in game (**F9**, *More PC Options*) and apply at once. The crouch / sprint conversion assumes the game's own behaviour of those buttons, which was not verified in game; leave them on *As the game* if crouching or sprinting misbehaves.
 

@@ -792,6 +792,29 @@ void (*volatile g_port_xi_hook)(int port, void* gamepad) = 0;
  * one (pad_logic.h padk_latch_*). Cleared when cellPadGetData hands port 0 a
  * fresh report. */
 static PadKeyLatch s_kb_ls_latch;
+static volatile unsigned s_pad0_deliv;   /* reports port 0 handed to the game (kbm_wheel_step) */
+/* PORT_KBM_WHEEL: set while the weapon wheel takes the mouse; the direct mouse
+ * look (project/stubs.cpp) drops its counts then, so the view holds still. */
+volatile int g_kbm_wheel_look_off = 0;
+static kbm_wheel s_kbm_wheel;   /* PORT_KBM_WHEEL state (kbm_stick.h) */
+static int s_menu_last = 0;     /* menu mode at the last keyboard poll */
+/* The weapon wheel's button: Resistance 3 opens it by holding Triangle ("Switch weapon"). */
+#define KBM_WHEEL_BTN CELL_PAD_CTRL_TRIANGLE
+/* PORT_KBM_WHEEL: 0 = off (old behaviour); 1 (default) = the wheel direction goes
+ * to the left stick (what the Resistance 3 wheel reads) and, with direct mouse
+ * look, to the right stick too (the look code ignores its stick then);
+ * left = the left stick only. */
+static int kbm_wheel_mode(void)
+{
+    static int m = -1;
+    if (m < 0) {
+        const char* e = getenv("PORT_KBM_WHEEL");
+        m = !e || !*e ? 1 : !_stricmp(e, "left") ? 2 : atoi(e) ? 1 : 0;
+        printf("[controls] weapon wheel on keyboard & mouse: %s (PORT_KBM_WHEEL)\n",
+               m == 0 ? "off" : m == 2 ? "mouse / keys select, left stick only" : "mouse / keys select");
+    }
+    return m;
+}
 static unsigned s_kb_ls_tap;   /* PADK_* taps seen by pad_kbm_active (it queries the keys first) */
 static unsigned pad_kb_ls_bit(int act)
 {
@@ -838,6 +861,7 @@ static void pad_poll_keyboard(void)
         hs->trigger_l2 = hs->trigger_r2 = 0;
         hs->connected = 1;
         padk_latch_delivered(&s_kb_ls_latch); s_kb_ls_tap = 0;
+        g_kbm_wheel_look_off = 0;
         ClipCursor(NULL);
         InterlockedExchange(&g_kbm_mouse_dx, 0); InterlockedExchange(&g_kbm_mouse_dy, 0);
         InterlockedExchange(&g_kbm_wheel, 0);
@@ -888,6 +912,7 @@ static void pad_poll_keyboard(void)
 
     u16 btns = 0; int lx = 0, ly = 0, krx = 0, kry = 0, interact = 0;
     u16 wup_btn = 0;   /* v190e: buttons the wheel-up notch pressed this poll */
+    int wheel_key = 0; /* PORT_KBM_WHEEL: a key bound to the weapon wheel button is held (not a mouse-wheel notch) */
     unsigned ls_down = 0, ls_tap = 0;   /* movement keys (PADK_*): held now / tapped since the last sample */
     for (int i = 0; i < s_kbm_n; i++) {
         int vk = s_kbm[i].vk, down;
@@ -902,7 +927,9 @@ static void pad_poll_keyboard(void)
         }
         if (!down) continue;
         switch (s_kbm[i].act) {
-        case KA_BTN: btns |= s_kbm[i].btn; if (vk == KBM_WHEEL_UP) wup_btn |= s_kbm[i].btn; break;
+        case KA_BTN: btns |= s_kbm[i].btn; if (vk == KBM_WHEEL_UP) wup_btn |= s_kbm[i].btn;
+                     if ((s_kbm[i].btn & KBM_WHEEL_BTN) && vk != KBM_WHEEL_UP && vk != KBM_WHEEL_DOWN) wheel_key = 1;
+                     break;
         case KA_LS_UP: ls_down |= PADK_UP; break;      case KA_LS_DOWN: ls_down |= PADK_DOWN; break;
         case KA_LS_LEFT: ls_down |= PADK_LEFT; break;  case KA_LS_RIGHT: ls_down |= PADK_RIGHT; break;
         case KA_RS_UP: kry -= 1; break;   case KA_RS_DOWN: kry += 1; break;
@@ -912,6 +939,12 @@ static void pad_poll_keyboard(void)
     }
     if (wheel_up_frames > 0) wheel_up_frames--;
     if (wheel_dn_frames > 0) wheel_dn_frames--;
+    /* the weapon wheel button went down in a menu (menu mode before the press) */
+    const int wheel_menu = s_kbm_wheel.down ? s_kbm_wheel.menu : s_menu_last;
+    static int fe2_game = -1;   /* not the front-end executable */
+    if (fe2_game < 0) { char mp[MAX_PATH] = ""; GetModuleFileNameA(NULL, mp, MAX_PATH);
+                        const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
+                        fe2_game = _stricmp(b, "PortFrontEnd.exe") ? 1 : 0; }
     {   ls_tap |= s_kb_ls_tap; s_kb_ls_tap = 0;
         const unsigned ls = pad_kb_latch_on() ? padk_latch_sample(&s_kb_ls_latch, ls_down, ls_tap) : ls_down;
         lx = ((ls & PADK_RIGHT) ? 1 : 0) - ((ls & PADK_LEFT) ? 1 : 0);
@@ -1014,6 +1047,11 @@ static void pad_poll_keyboard(void)
        * held, and for 300 ms after, it is gameplay, not a menu. */
       static ULONGLONG s_r2_ms = 0;
       if (btns & CELL_PAD_CTRL_R2) s_r2_ms = now;
+      /* PORT_KBM_WHEEL: the same for the weapon wheel's own button (Triangle held:
+       * WASD would have turned into the d-pad and the stick the wheel reads gone
+       * to centre). Not when it went down in a menu. */
+      static ULONGLONG s_wheel_ms = 0;
+      if (wheel_key && kbm_wheel_mode() && !wheel_menu) s_wheel_ms = now;
       /* A hitch (shader compile, streaming) also stops the look code for > 200 ms;
        * then WASD pressed the d-pad raw, without the controls-screen swap: a
        * random crouch. A menu also needs >= 3 game frames without the look code
@@ -1026,7 +1064,9 @@ static void pad_poll_keyboard(void)
       static int s_menu_frames = -1;
       if (s_menu_frames < 0) { const char* e = getenv("PAD_MENU_FRAMES"); s_menu_frames = !(e && *e == '0'); }
       const int frames_ok = !s_menu_frames || !fno || fno - s_play_frame >= 3;
-      const int menu = fe2 && g_port_play_ms && now - g_port_play_ms > 200 && frames_ok && (!s_r2_ms || now - s_r2_ms > 300);
+      const int menu = fe2 && g_port_play_ms && now - g_port_play_ms > 200 && frames_ok && (!s_r2_ms || now - s_r2_ms > 300)
+                       && (!s_wheel_ms || now - s_wheel_ms > 300);
+      s_menu_last = menu;
       { static int was = -1;
         if (menu != was) { was = menu; static int n = 0;
           if (ps3_diag_enabled() && n++ < 200) { FILE* f = fopen("logs\\menumode.txt", n == 1 ? "w" : "a");
@@ -1078,6 +1118,20 @@ static void pad_poll_keyboard(void)
         static kbm_stick_carry carry_x, carry_y;   /* sub-step carry per axis (kbm_stick.h) */
         hs->analog_rx = kbm_mouse_axis(fx, &carry_x);
         hs->analog_ry = kbm_mouse_axis(fy, &carry_y);
+    }
+    {   /* PORT_KBM_WHEEL (kbm_stick.h kbm_wheel_step): the weapon wheel's direction */
+        const int wm = fe2_game ? kbm_wheel_mode() : 0;
+        unsigned char wx = 128, wy = 128;
+        const int on = wm && kbm_wheel_step(&s_kbm_wheel, wheel_key, wheel_menu, (double)mdx, (double)mdy, lx, ly,
+                                            (unsigned long long)now, s_pad0_deliv, 100.0, 150, &wx, &wy);
+        if (!wm) s_kbm_wheel.down = s_kbm_wheel.live = 0;
+        if (on) {
+            hs->analog_lx = wx; hs->analog_ly = wy;
+            if (wm == 1 && g_ml_mode && !krx && !kry) { hs->analog_rx = wx; hs->analog_ry = wy; }
+            static int said = 0;
+            if (!said) { said = 1; printf("[controls] weapon wheel: mouse / movement keys pick the slot (PORT_KBM_WHEEL=0 turns this off)\n"); }
+        }
+        g_kbm_wheel_look_off = on;
     }
     g_ml_fed_rx = (int)hs->analog_rx - 128; g_ml_fed_ry = (int)hs->analog_ry - 128;
     g_ml_rs_keys = (krx || kry); g_ml_kbm_ms = GetTickCount64();
@@ -2387,7 +2441,7 @@ emit:
         }
 #ifdef _WIN32
         /* the game got port 0's report: latched movement-key taps are delivered */
-        if (port_no == 0 && data->len) padk_latch_delivered(&s_kb_ls_latch);
+        if (port_no == 0 && data->len) { padk_latch_delivered(&s_kb_ls_latch); s_pad0_deliv++; }
 #endif
     }
     {
