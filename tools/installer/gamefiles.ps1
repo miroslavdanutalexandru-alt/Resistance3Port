@@ -207,13 +207,23 @@ function Set-Bad($c, [string]$status, [string]$code, [string]$problem, [string]$
     $c.Status = $status; $c.Code = $code; $c.Problem = $problem.Replace('PS3_GAME/', 'PS3_GAME\').Replace('USRDIR/', 'USRDIR\'); $c.Fix = $fix
 }
 function Format-GB([int64]$b) { return ('{0:N1} GB' -f ($b / 1GB)) }
+# The profile's title id, or one of its AltTitleIds (other discs of the game the port accepts too).
+function Test-ProfileId($Prof, [string]$id) {
+    if ($id -eq $Prof.TitleId) { return $true }
+    return [bool]($Prof.AltTitleIds -and $id -and $Prof.AltTitleIds.ContainsKey($id))
+}
+function Get-WantLabel($Prof) {
+    $w = "$($Prof.GameName) ($($Prof.TitleId), $($Prof.RegionLabel) disc"
+    if ($Prof.AltLabel) { $w += "; $($Prof.AltLabel)" }
+    return "$w)"
+}
 
 # ------------------------------------------------------------------ check one source
 # $Path may be an .iso, a game folder (the one with PS3_GAME), PS3_GAME itself, or a file inside it.
 function Test-GameSource($Prof, [string]$Path) {
     $Path = "$Path".Trim().Trim('"').Trim()
     $c = New-Check $Path
-    $name = $Prof.GameName; $want = "$($Prof.GameName) ($($Prof.TitleId), $($Prof.RegionLabel) disc)"
+    $name = $Prof.GameName; $want = Get-WantLabel $Prof
     if (-not $Path -or -not (Test-Path -LiteralPath $Path)) {
         Set-Bad $c 'error' 'NOT_FOUND' "Nothing was found at this path." "Check the path, or pick the .iso or the game folder again."; return $c
     }
@@ -265,6 +275,11 @@ function Test-SfoAndIds($Prof, $c, $sfo, [string]$where) {
         return $false
     }
     if ($c.TitleId -eq $Prof.TitleId) { return $true }
+    if (Test-ProfileId $Prof $c.TitleId) {
+        [void]$c.Notes.Add("$(Get-RegionName $c.TitleId) disc ($($c.TitleId)): $($Prof.AltTitleIds[$c.TitleId]).")
+        return $true
+    }
+    $want = Get-WantLabel $Prof
     $sameGame = $c.Title -match $Prof.TitleMatch
     if ($c.TitleId -match '^NP') {
         Set-Bad $c 'error' 'PSN' "This is the PlayStation Store version of $($c.Title) ($($c.TitleId))." "Only the disc version is supported: $want."
@@ -286,7 +301,7 @@ function Test-ProgramFile($Prof, $c, [string]$rel, [byte[]]$head, [scriptblock]$
             "Use a decrypted .iso or a game folder. An encrypted image (for example a Redump .iso with a .dkey file) can be decrypted first with PS3Dec and its disc key."
         return
     }
-    $known = $Prof.Sha1[$rel]
+    $known = if ($c.TitleId -eq $Prof.TitleId -or -not $c.TitleId) { $Prof.Sha1[$rel] } else { $null }   # known for the main disc only
     if ($known -and $hash) {
         $h = & $hash
         if ($h -ne $known) {
@@ -304,7 +319,7 @@ function Test-GameFolder($Prof, $c, [string]$Path) {
             $sfo = $null; try { $sfo = Read-Sfo ([IO.File]::ReadAllBytes((Join-Path $Path 'PARAM.SFO'))) } catch {}
             if ($sfo -and "$($sfo.TITLE_ID)" -match '^NP' -or $sfo.CATEGORY -eq 'HG') {
                 [void](Test-SfoAndIds $Prof $c $sfo $Path)
-                if ($c.Status -ne 'error') { Set-Bad $c 'error' 'PSN' "This is a PlayStation Store or installed copy, not a disc copy." "Pick the disc copy: $want." }
+                if ($c.Status -ne 'error') { Set-Bad $c 'error' 'PSN' "This is a PlayStation Store or installed copy, not a disc copy." "Pick the disc copy: $(Get-WantLabel $Prof)." }
                 return $c
             }
         }
@@ -517,7 +532,7 @@ function Find-GameSources($Prof, [string]$PortDir = '') {
         $c = Quick-Identify $Prof $p
         if ($c) { [void]$found.Add($c) }
     }
-    return @($found | Sort-Object @{ e = { if ($_.TitleId -eq $Prof.TitleId) { 0 } else { 1 } } }, Path)
+    return @($found | Sort-Object @{ e = { if ($_.TitleId -eq $Prof.TitleId) { 0 } elseif (Test-ProfileId $Prof $_.TitleId) { 1 } else { 2 } } }, Path)
 }
 # Cheap identification for the search: reads only PARAM.SFO, so it stays fast with many images.
 function Quick-Identify($Prof, [string]$p) {
@@ -546,9 +561,9 @@ function Quick-Identify($Prof, [string]$p) {
     } catch { return $null }
     if (-not $sfo) { return $null }
     $id = "$($sfo.TITLE_ID)"; $title = "$($sfo.TITLE)" -replace '[\r\n]+', ' ' -replace '[\u2122\u00AE]', ''
-    if ($id -ne $Prof.TitleId -and $title -notmatch $Prof.TitleMatch) { return $null }
+    if (-not (Test-ProfileId $Prof $id) -and $title -notmatch $Prof.TitleMatch) { return $null }
     $c = New-Check $p; $c.TitleId = $id; $c.Title = $title
-    if ($id -ne $Prof.TitleId) { $c.Status = 'error'; $c.Code = 'WRONG_REGION'; $c.Problem = "$(Get-RegionName $id) ($id): not supported" }
+    if (-not (Test-ProfileId $Prof $id)) { $c.Status = 'error'; $c.Code = 'WRONG_REGION'; $c.Problem = "$(Get-RegionName $id) ($id): not supported" }
     return $c
 }
 
@@ -578,7 +593,7 @@ function Test-IsWine {
 # typed, pasted or dragged-in path. The Windows file picker is offered as an option only.
 # Returns a checked source ($c, Status ok or an accepted warn), or $null if the player quits.
 function Select-GameSource($Prof, [string]$Game, [string]$Dest, [string]$PortDir = '') {
-    $want = "$($Prof.GameName) ($($Prof.TitleId), $($Prof.RegionLabel) disc)"
+    $want = Get-WantLabel $Prof
     $check = {
         param($path)
         $c = Test-GameSource $Prof $path

@@ -2,7 +2,9 @@
 
 The release zip contains the port's source code and `Setup.exe`. It contains no game code: Setup builds the
 game on your PC from your own copy of the game (decrypted ISO or game folder, **Resistance 3, US disc,
-BCUS98176**).
+BCUS98176**, version 1.00). The **European disc (BCES01118), version 1.00** is accepted too, but is
+**experimental: not yet tested on a real EU disc**. Setup then builds the game from the EU program and prints
+`EBOOT.elf: OK (BCES01118 v1.00, Europe disc, EXPERIMENTAL ...)`; please report whether it works.
 
 ## Quick install
 

@@ -845,7 +845,7 @@ static void opts_init(void)
             "language", "PS3_LANG", 1,
             { {L"Windows language", ""}, {L"English", "en"}, {L"English (UK)", "en-gb"}, {L"French", "fr"}, {L"Spanish", "es"},
               {L"German", "de"}, {L"Italian", "it"}, {L"Portuguese (Brazil)", "pt-br"}, {L"Portuguese", "pt"}, {L"Dutch", "nl"},
-              {L"Russian", "ru"}, {L"Polish", "pl"} }, "", NULL);
+              {L"Russian", "ru"}, {L"Polish", "pl"}, {L"Danish", "da"}, {L"Finnish", "fi"}, {L"Norwegian", "no"}, {L"Swedish", "sv"} }, "", NULL);
     opt_add(L"Discord Rich Presence", L"Shows the game and level in Discord (needs discord_appid.txt or " ENVN("DISCORD_APPID") L").",
             "discord", ENVN("DISCORD"), 1, { {L"Off", ""}, {L"On", "1"} }, "", NULL);
     opt_add(L"Benchmark capture key", L"Press to start recording frame times, again to stop: logs\\bench gets a summary (avg, 1% / 0.1% low, stutters) and a per-frame CSV.",

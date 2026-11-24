@@ -10,7 +10,7 @@
 #define PortLinkName  "Resistance 3 PC Port (Resistance3Port)"
 #define PortAppId     "{{6C1E6A0B-2F4D-4C55-9A4E-1F0A9B3D7E03}"
 #define PortUrl       "https://github.com/miroslavdanutalexandru-alt/Resistance3Port"
-#define GameTitle     "Resistance 3 (US disc, BCUS98176)"
+#define GameTitle     "Resistance 3 (US disc BCUS98176, or EU disc BCES01118 - experimental)"
 ; UserDir: the folder under %USERPROFILE%\Saved Games for the settings backup
 #define UserDir       "Resistance 3"
 

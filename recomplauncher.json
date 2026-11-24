@@ -5,7 +5,7 @@
   "repo": "miroslavdanutalexandru-alt/Resistance3Port",
   "game": {
     "kind": "iso_or_folder",
-    "label": "Your own copy of Resistance 3, US disc BCUS98176, version 1.00: its disc image (.iso), or its folder with PS3_GAME in it (as RPCS3 uses). Other regions and patched versions don't work yet.",
+    "label": "Your own copy of Resistance 3, US disc BCUS98176 (or, experimental, the European disc BCES01118), version 1.00: its disc image (.iso), or its folder with PS3_GAME in it (as RPCS3 uses). Other regions and patched versions don't work yet.",
     "check": {
       "iso9660": "PS3_DISC.SFB",
       "file": "PS3_DISC.SFB"

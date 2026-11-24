@@ -144,6 +144,56 @@ function Fail($t) {
 $script:BtPort = $Port
 . (Join-Path $Port 'tools\installer\buildtools.ps1')
 $GameProfile = Import-GameProfile (Join-Path $Port 'tools\installer\game_profile.psd1')
+# Which program game\EBOOT.elf is: RPCS3's PPU hash (PPUModule.cpp: SHA-1 over every program header's type and
+# flags, and each loaded segment's address, size and bytes; the "PPU-..." in RPCS3's log and patch.yml), looked up
+# in the profile's Eboots list. The US and European 1.00 programs have different hashes but the same layout.
+$script:PpuHashCache = @{}
+function Get-PpuHash([string]$Elf) {
+    if (-not (Test-Path -LiteralPath $Elf)) { return $null }
+    $fi = Get-Item -LiteralPath $Elf
+    $key = "$($fi.FullName)|$($fi.Length)|$($fi.LastWriteTimeUtc.Ticks)"
+    if ($script:PpuHashCache.ContainsKey($key)) { return $script:PpuHashCache[$key] }
+    $d = [IO.File]::ReadAllBytes($fi.FullName)
+    if ($d.Length -lt 64 -or $d[0] -ne 0x7F -or $d[1] -ne 0x45 -or $d[4] -ne 2) { return $null }
+    $be = { param([int64]$o, [int]$n) [int64]$v = 0; for ($i = 0; $i -lt $n; $i++) { $v = ($v -shl 8) -bor $d[$o + $i] }; $v }
+    $phoff = & $be 0x20 8; $phent = & $be 0x36 2; $phnum = & $be 0x38 2
+    $sha = [Security.Cryptography.SHA1]::Create()
+    for ($i = 0; $i -lt $phnum; $i++) {
+        $o = $phoff + $i * $phent
+        [void]$sha.TransformBlock($d, $o, 8, $null, 0)                       # p_type, p_flags
+        if ((& $be $o 4) -eq 1 -and (& $be ($o + 40) 8) -ne 0) {               # PT_LOAD with p_memsz
+            [void]$sha.TransformBlock($d, $o + 16, 8, $null, 0)               # p_vaddr
+            [void]$sha.TransformBlock($d, $o + 40, 8, $null, 0)               # p_memsz
+            $off = & $be ($o + 8) 8; $fsz = & $be ($o + 32) 8
+            if ($fsz -gt 0) { [void]$sha.TransformBlock($d, $off, $fsz, $null, 0) }
+        }
+    }
+    [void]$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+    $h = ([BitConverter]::ToString($sha.Hash) -replace '-', '').ToLower()
+    $script:PpuHashCache[$key] = $h
+    return $h
+}
+function Get-EbootInfo([string]$Elf) {
+    $h = Get-PpuHash $Elf
+    $e = if ($h) { @($GameProfile.Eboots | Where-Object { $_.Ppu -eq $h }) | Select-Object -First 1 } else { $null }
+    [pscustomobject]@{ Hash = $h; Known = $e }
+}
+# The disc in gamefiles\ (PARAM.SFO's TITLE_ID), when it is one the port accepts; else the profile's (US) id.
+function Get-DiscId {
+    $sfoPath = Join-Path $Port 'gamefiles\PS3_GAME\PARAM.SFO'
+    if (Test-Path -LiteralPath $sfoPath) {
+        try { $id = "$((Read-Sfo ([IO.File]::ReadAllBytes($sfoPath))).TITLE_ID)"; if (Test-ProfileId $GameProfile $id) { return $id } } catch {}
+    }
+    return $TitleId
+}
+# The program the game code in recompiled\ was generated from (recompiled\.eboot_ppu, written after generating;
+# missing = generated before this record existed, which was always the US 1.00 program).
+$EbootRecord = 'recompiled\.eboot_ppu'
+function Get-GenEbootHash {
+    $p = Join-Path $Port $EbootRecord
+    if (Test-Path -LiteralPath $p) { return "$(Get-Content -LiteralPath $p -Raw)".Trim().ToLower() }
+    return ($GameProfile.Eboots | Where-Object { $_.Id -eq $TitleId -and $_.Status -eq 'ok' } | Select-Object -First 1).Ppu
+}
 function Refresh-Path {
     $m = [Environment]::GetEnvironmentVariable('Path', 'Machine'); $u = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:Path = "$m;$u;$env:LOCALAPPDATA\Microsoft\WinGet\Links;C:\Program Files\LLVM\bin;C:\Program Files\CMake\bin"
@@ -496,10 +546,11 @@ function Test-ThisPC([switch]$Full) {
 
     if ($haveGame) { Chk-Ok "Game files: gamefiles\" } else { Chk-Todo "Ask for your copy of the game ($TitleId) and copy it into gamefiles\ ($GameGB GB)." }
     $dec = $true
-    foreach ($n in $Sha1.Keys) { $p = Join-Path $Port "game\$n"; if (-not (Test-Path $p) -or (Sha1Of $p) -ne $Sha1[$n]) { $dec = $false } }
-    if ($dec) { Chk-Ok "Decrypted program file(s): game\ (version checked)" } else { Chk-Todo "Decrypt the game's program file(s) into game\ and check the version." }
+    $ebc = Get-EbootInfo (Join-Path $Port 'game\EBOOT.elf'); if (-not $ebc.Known -or $ebc.Known.Status -eq 'update') { $dec = $false }
+    if ($dec) { Chk-Ok "Decrypted program file(s): game\ (version checked: $($ebc.Known.Id) $($ebc.Known.Ver)$(if ($ebc.Known.Status -eq 'experimental') { ', experimental' }))" } else { Chk-Todo "Decrypt the game's program file(s) into game\ and check the version." }
     if (-not (Test-Path (Join-Path $Port $GenMarker))) { Chk-Todo "Generate the game code from your copy." }
     elseif (Test-GenStale $Port 'r3_regen.py' 'recompiled' 'r3_spu.py') { Chk-Todo "Generate the game code again (this version's code generator differs from the one that made it)." }
+    elseif ($ebc.Hash -and $ebc.Hash -ne (Get-GenEbootHash)) { Chk-Todo "Generate the game code again (game\EBOOT.elf is another disc or region than the code was made from)." }
     else { Chk-Ok "Game code generated" }
     if (Test-Path (Join-Path $Port 'Launcher.exe')) { Chk-Todo "Rebuild (only what changed)." } else { Chk-Todo "Build the port and the launcher (the first build takes about 1-3 hours, mostly depending on RAM: see docs\INSTALL.md)." }
 }
@@ -619,6 +670,11 @@ function Get-R3GenWork {
     elseif ($env:R3_REGEN) {
         $p.Why = 'forced'
         $p.Ppu = $p.Ppu -or ($env:R3_REGEN -ne 'spu'); $p.Spu = $p.Spu -or ($env:R3_REGEN -ne 'ppu')
+    }
+    else {
+        # another program than the one the code was generated from (the player switched discs / regions)
+        $cur = Get-PpuHash (Join-Path $Port 'game\EBOOT.elf')
+        if ($cur -and $cur -ne (Get-GenEbootHash)) { $p.Ppu = $p.Spu = $true; $p.Why = 'disc' }
     }
     $stages = @()
     if ($p.Ppu) { $stages += 'ppu_analyze', 'ppu_lift', 'ppu_emit', 'ppu_post', 'ppu_hooks', 'ppu_copy' }
@@ -764,18 +820,28 @@ if ((Test-Path -LiteralPath "$gf.copying") -or -not (Test-Path (Join-Path $usr '
     $err = Install-GameFiles $GameProfile $Game $gf $Port -Mode $GameCopyMode
     if ($err) { Fail $err }
 }
+$DiscId = Get-DiscId
 # the PS3's hard-drive cache folder the game expects to exist. The game-data folder (game\<id>) is
 # left to the game's own first-run install: an empty one made here reads as installed-but-corrupted.
-New-Item -ItemType Directory -Force -Path (Join-Path $gf "cache\$TitleId") | Out-Null
-$gd = Join-Path $gf "game\$TitleId"
+New-Item -ItemType Directory -Force -Path (Join-Path $gf "cache\$DiscId") | Out-Null
+$gd = Join-Path $gf "game\$DiscId"
 if ((Test-Path $gd) -and -not (Get-ChildItem $gd -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)) { Remove-Item $gd -Recurse -Force }
 Info "Game files: $gf"
+if ($DiscId -ne $TitleId) { Info "Disc: $DiscId ($(Get-RegionName $DiscId)), $($GameProfile.AltTitleIds[$DiscId]). Please report how it runs." }
 
 # ---------------------------------------------------------------- 3. decrypt
 Step "3/5  Decrypting the game program file"
 New-Item -ItemType Directory -Force -Path (Join-Path $Port 'game') | Out-Null
-$need = $false
-foreach ($n in $Sha1.Keys) { $p = Join-Path $Port "game\$n"; if (-not (Test-Path $p) -or (Sha1Of $p) -ne $Sha1[$n]) { $need = $true } }
+# Decrypted again when game\EBOOT.elf is missing or came from another EBOOT.BIN (game\EBOOT.src holds the SHA-1 of
+# the EBOOT.BIN it was decrypted from; without it, as before: the US 1.00 file is kept).
+$elf = Join-Path $Port 'game\EBOOT.elf'
+$srcRec = Join-Path $Port 'game\EBOOT.src'
+$binSha = Sha1Of (Join-Path $usr 'EBOOT.BIN')
+$need = -not (Test-Path -LiteralPath $elf)
+if (-not $need) {
+    if (Test-Path -LiteralPath $srcRec) { $need = "$(Get-Content -LiteralPath $srcRec -Raw)".Trim() -ne $binSha }
+    else { foreach ($n in $Sha1.Keys) { $p = Join-Path $Port "game\$n"; if (-not (Test-Path $p) -or (Sha1Of $p) -ne $Sha1[$n]) { $need = $true } } }
+}
 if ($need) {
     $kv = Join-Path $Port 'tools\key_vault.cpp'
     if (-not (Test-Path $kv)) {
@@ -785,13 +851,19 @@ if ($need) {
     }
     & $py tools\unself.py --keys $kv --out game "$usr\EBOOT.BIN" | Out-Host
     if ($LASTEXITCODE -ne 0) { Fail "Decrypting EBOOT.BIN failed." }
-    foreach ($n in $Sha1.Keys) {
-        if ((Sha1Of (Join-Path $Port "game\$n")) -ne $Sha1[$n]) {
-            Fail "game\$n is not the expected version. The port supports the unpatched US disc (BCUS98176 v1.00); a game update or another release won't match."
-        }
-    }
 }
-Info "EBOOT.elf: OK (BCUS98176 v1.00)"
+$eb = Get-EbootInfo $elf
+$supported = 'the unpatched disc, version 1.00: US BCUS98176, or (experimental) Europe BCES01118'
+if (-not $eb.Known) {
+    Fail "game\EBOOT.elf is not a known version of Resistance 3 (PPU hash $($eb.Hash)). The port supports $supported. A game update or another release won't match."
+}
+if ($eb.Known.Status -eq 'update') {
+    Fail "game\EBOOT.elf is the $($eb.Known.Region) game update $($eb.Known.Ver) ($($eb.Known.Id)), not the disc's program. The port supports $supported. Use the EBOOT.BIN from the disc (PS3_GAME\USRDIR), without updates."
+}
+[IO.File]::WriteAllText($srcRec, $binSha)
+if ($eb.Known.Id -ne $DiscId) { Info "Note: the program is from $($eb.Known.Id) but PARAM.SFO says $DiscId (a mixed copy?). Saves follow PARAM.SFO." }
+Info ("EBOOT.elf: OK ({0} v{1}, {2} disc{3}), PPU hash {4}" -f $eb.Known.Id, $eb.Known.Ver.TrimStart('0'), $eb.Known.Region,
+      $(if ($eb.Known.Status -eq 'experimental') { ', EXPERIMENTAL: not yet tested on a real copy' } else { '' }), $eb.Hash)
 
 # ---------------------------------------------------------------- 4. game code
 Step "4/5  Generating the game code from your copy"
@@ -807,6 +879,7 @@ if ($genPlan.Ppu -or $genPlan.Spu) {
                     else { Info "This version changes the code generator: generating the game code again (10-25 minutes)." } }
         'missing' { Info "Generating the game code again once, so it matches this version's code generator (10-25 minutes)." }
         'legacy'  { Info "The game code was generated by an earlier version Setup cannot compare with: generating it again once (10-25 minutes)." }
+        'disc'    { Info "game\EBOOT.elf is another program than the one the game code was generated from (another disc or region): generating the game code again (10-25 minutes)." }
         'forced'  { Info "R3_REGEN is set: generating the game code again$(if ($genOnly) { " ($genOnly only)" })." }
     }
     if ($genPlan.Legacy) { Info "(The code was generated by an earlier version of Setup; its record was translated - the PPU code is the same.)" }
@@ -820,6 +893,7 @@ if ($genPlan.Ppu -or $genPlan.Spu) {
     if ($code -ne 0) { Fail "Generating the game code failed (see the messages above)." }
     if ($genSnap.Count) { $g = Restore-GenTimes $Port $GenDirs $genSnap; Info ("Generated files: {0} changed, {1} unchanged." -f $g.Changed, $g.Kept) }
     Save-GenStamp $Port $GenScript -SpuScript $GenSpuScript
+    if ($genPlan.Ppu) { [IO.File]::WriteAllText((Join-Path $Port $EbootRecord), "$($eb.Hash)") }   # the program this code is from
 } else {
     Info "Already generated (set R3_REGEN=1 to force)."
     if ($genPlan.Legacy) { Save-GenStamp $Port $GenScript -SpuScript $GenSpuScript }   # the earlier version's record, in this version's format
