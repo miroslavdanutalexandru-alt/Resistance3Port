@@ -219,21 +219,37 @@ static uint32_t find_health(uint32_t handle)
 static float rdf(uint32_t a) { const uint32_t u = vm_read32(a); float f; memcpy(&f, &u, 4); return f; }
 static void wrf(uint32_t a, float f) { uint32_t u; memcpy(&u, &f, 4); vm_write32(a, u); }
 
-/* components made invulnerable here (byte +0x101 was 0): only those are given back */
-struct Inv { uint32_t comp, handle; };
-static Inv s_inv[8];
-static int s_ninv = 0;
+/* Byte +0x101 is shared with the game, which sets / clears it itself (func_00641CC4 from
+ * about 40 places: scripted sections, the hero's own state code at 0x00164A5C, ...).
+ * The cheat only owns it when it found it 0 and wrote the 1 itself, for this component
+ * (same address, vtable, owner handle, hero) in this level (r3_level_gen), and found
+ * valid on every check since. Found 1 without owning it: the game's, left alone (taken over only once
+ * the game has cleared it). Turning God mode off clears it only while still owned;
+ * a new level, another component or hero, or a check that fails drops ownership, and
+ * the byte is then left to the game. */
+extern "C" int r3_level_gen(void);   /* r3_pcextra.cpp: +1 when the game opens another level */
+struct Inv { uint32_t comp, handle, hero; int level; };
+static Inv s_inv[4];                 /* one per hero slot (god_hero cache index) */
+static void inv_drop(int k, const char* why)
+{
+    if (s_inv[k].comp)
+        fprintf(stderr, "[cheat] god mode: health 0x%08X no longer the cheat's (%s); left to the game\n", s_inv[k].comp, why);
+    s_inv[k] = {};
+}
 static void god_hero(uint32_t hero, uint32_t handle)
 {
     static struct { uint32_t hero, handle, comp; int miss; } cache[4];
     static int nf = 0, badhp = 0;
     int k = 0;
     while (k < 4 && cache[k].hero != hero) k++;
-    if (k == 4) { k = 0; for (int i = 1; i < 4; i++) if (!cache[i].hero) { k = i; break; } cache[k] = { hero, handle, 0, 0 }; }
-    if (cache[k].handle != handle) cache[k] = { hero, handle, 0, 0 };
+    if (k == 4) { k = 0; for (int i = 1; i < 4; i++) if (!cache[i].hero) { k = i; break; } cache[k] = { hero, handle, 0, 0 }; inv_drop(k, "other hero"); }
+    if (cache[k].handle != handle) { cache[k] = { hero, handle, 0, 0 }; inv_drop(k, "other hero"); }
+    const int level = r3_level_gen();
+    if (s_inv[k].comp && s_inv[k].level != level) inv_drop(k, "new level");
     uint32_t c = cache[k].comp;
     if (!c || !health_comp_ok(c, handle)) {
         c = 0;
+        inv_drop(k, "component gone");
         if (cache[k].miss-- <= 0) {               /* not every frame while there is none */
             c = find_health(handle);
             cache[k].miss = c ? 0 : 30;
@@ -244,13 +260,12 @@ static void god_hero(uint32_t hero, uint32_t handle)
         cache[k].comp = c;
         if (!c) return;
     }
+    if (s_inv[k].comp && (s_inv[k].comp != c || s_inv[k].handle != handle || s_inv[k].hero != hero)) inv_drop(k, "other component");
     if (!vm_read8(c + 0x101)) {
-        int i = 0; while (i < s_ninv && s_inv[i].comp != c) i++;
-        if (i == s_ninv) {
-            if (s_ninv == 8) { memmove(s_inv, s_inv + 1, sizeof s_inv - sizeof s_inv[0]); s_ninv--; }   /* oldest: a level left long ago */
-            s_inv[s_ninv++] = { c, handle };
+        /* 0: never set, or cleared by the game (also while the cheat owned it): set it and own it */
+        if (!s_inv[k].comp)
             fprintf(stderr, "[cheat] god mode: health 0x%08X (hero 0x%08X) not damageable\n", c, hero);
-        }
+        s_inv[k] = { c, handle, hero, level };
         vm_write8(c + 0x101, 1);
     }
     const float hp = rdf(c + 0xF8), mx = rdf(c + 0xF4);
@@ -262,14 +277,20 @@ static void god_hero(uint32_t hero, uint32_t handle)
 }
 static void god_restore(void)
 {
-    for (int i = 0; i < s_ninv; i++) {
-        const uint32_t c = s_inv[i].comp;
-        if (health_comp_ok(c, s_inv[i].handle) && vm_read8(c + 0x101) == 1) {
-            vm_write8(c + 0x101, 0);
-            fprintf(stderr, "[cheat] god mode off: health 0x%08X damageable again\n", c);
-        }
+    const int level = r3_level_gen();
+    for (int k = 0; k < 4; k++) {
+        const Inv& o = s_inv[k];
+        if (!o.comp) continue;
+        uint32_t moby = 0, handle = 0;
+        const bool same = o.level == level && health_comp_ok(o.comp, o.handle) && heap_ok(o.hero, 0x2000)
+                          && hero_moby(o.hero, &moby, &handle) && handle == o.handle;
+        if (same && vm_read8(o.comp + 0x101) == 1) {
+            vm_write8(o.comp + 0x101, 0);
+            fprintf(stderr, "[cheat] god mode off: health 0x%08X damageable again\n", o.comp);
+        } else if (!same)
+            fprintf(stderr, "[cheat] god mode off: health 0x%08X not checked again (level / hero changed); left to the game\n", o.comp);
+        s_inv[k] = {};
     }
-    s_ninv = 0;
 }
 
 /* Every gameplay frame, per hero (stubs.cpp r3_mouselook_pre); local = the hero has a
