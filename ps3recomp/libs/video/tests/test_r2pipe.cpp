@@ -324,6 +324,38 @@ static void test_preload_off_and_serial()
 	CHECK(r2pipe::pipe_serialize(0x10DE));
 	_putenv("PORT_PIPE_SERIAL=");
 
+	{
+		// Background creations wait for play-time ones (PORT_PIPE_SERIAL_PRIO) and for the quiet period after them
+		constexpr uint64_t ms = 1000000, blocked = ~0ull;
+		const r2pipe::serial_policy p = r2pipe::serial_policy_from_env();
+		CHECK(p.prio && p.max_active == 1 && p.quiet_ns == 1000 * ms && p.max_defer_ns == 10000 * ms);
+		CHECK(r2pipe::serial_fg_may_start(p, 0));
+		CHECK(!r2pipe::serial_fg_may_start(p, 1));
+		CHECK(r2pipe::serial_bg_wait_until(p, 1, 0, 50000 * ms, 0, 50000 * ms) == blocked);                 // busy
+		CHECK(r2pipe::serial_bg_wait_until(p, 0, 1, 50000 * ms, 0, 50000 * ms) == blocked);                 // render thread waits
+		CHECK(r2pipe::serial_bg_wait_until(p, 0, 0, 50000 * ms, 0, 50000 * ms) == 0);                       // no play-time creation yet
+		CHECK(r2pipe::serial_bg_wait_until(p, 0, 0, 50000 * ms, 49800 * ms, 50000 * ms) == 50800 * ms);     // quiet period
+		CHECK(r2pipe::serial_bg_wait_until(p, 0, 0, 50800 * ms, 49800 * ms, 50000 * ms) == 0);              // quiet period over
+		CHECK(r2pipe::serial_bg_wait_until(p, 0, 0, 50000 * ms, 49990 * ms, 40500 * ms) == 50500 * ms);     // max defer comes first
+		CHECK(r2pipe::serial_bg_wait_until(p, 0, 0, 50500 * ms, 50400 * ms, 40500 * ms) == 0);              // deferred long enough
+		CHECK(r2pipe::serial_bg_wait_until(p, 0, 1, 50500 * ms, 50400 * ms, 40500 * ms) == blocked);        // ...but never ahead of a waiter
+
+		_putenv("PORT_PIPE_SERIAL_PRIO=0");
+		_putenv("PORT_PIPE_SERIAL_MAX=99");
+		_putenv("PORT_PIPE_BG_QUIET_MS=0");
+		const r2pipe::serial_policy o = r2pipe::serial_policy_from_env();
+		CHECK(!o.prio && o.max_active == 16 && o.quiet_ns == 0);
+		CHECK(r2pipe::serial_bg_wait_until(o, 0, 3, 50000 * ms, 49990 * ms, 50000 * ms) == 0);  // old rule: one shared lock
+		CHECK(r2pipe::serial_bg_wait_until(o, 16, 0, 50000 * ms, 0, 50000 * ms) == blocked);
+		CHECK(r2pipe::serial_fg_may_start(o, 15));
+		_putenv("PORT_PIPE_SERIAL_PRIO=1");
+		const r2pipe::serial_policy q = r2pipe::serial_policy_from_env();
+		CHECK(r2pipe::serial_bg_wait_until(q, 0, 0, 50000 * ms, 49990 * ms, 50000 * ms) == 0);  // no quiet period
+		_putenv("PORT_PIPE_SERIAL_PRIO=");
+		_putenv("PORT_PIPE_SERIAL_MAX=");
+		_putenv("PORT_PIPE_BG_QUIET_MS=");
+	}
+
 	CHECK(r2pipe::foz_entry_name(0x0123456789ABCDEFull) == "foz_0123456789abcdef");
 	CHECK(r2pipe::foz_entry_name(1) == "foz_0000000000000001");
 	// A replay entry round-trips through the breadcrumb and the crash report like a cache file name
