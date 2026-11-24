@@ -44,6 +44,7 @@
 #include <initguid.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include "rsx_d3d12_compat.h"
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <stdio.h>
@@ -323,7 +324,7 @@ static struct {
     ID3D12CommandAllocator* alloc[2];
     ID3D12GraphicsCommandList* cl;
     ID3D12GraphicsCommandList1* cl1;     /* OMSetDepthBounds */
-    ID3D12GraphicsCommandList8* cl8;     /* OMSetFrontAndBackStencilRef */
+    rsx_d3d12_cl8* cl8;                  /* OMSetFrontAndBackStencilRef */
     ID3D12Fence* fence;
     HANDLE fence_event;
     u64  fence_val;                       /* last value signalled */

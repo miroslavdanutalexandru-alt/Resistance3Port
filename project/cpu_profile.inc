@@ -37,6 +37,10 @@
 #include <tlhelp32.h>
 #include <wchar.h>
 #include "port_cpu_sets.h"
+/* Windows SDKs before 10.0.22000 lack this flag (the value is from processthreadsapi.h 10.0.26100) */
+#ifndef PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION
+#define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
+#endif
 
 enum { PORT_CPU_OFF = 0, PORT_CPU_LOW, PORT_CPU_MID, PORT_CPU_HIGH };
 static int s_cpu_profile = PORT_CPU_OFF;
