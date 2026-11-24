@@ -181,6 +181,37 @@ static void test_disc(void)
     set("PS3_LANG_VOICE_FALLBACK", NULL);
 }
 
+/* Resistance 3 asks for English (20 + k) itself for Dutch and 9..15: those
+ * must keep the English tracks as they are. */
+static void test_title_english(void)
+{
+    set("PS3_LANG_VOICE_FALLBACK", NULL);
+    set("PS3_LANG_TITLE_ENGLISH", NULL);
+    CHECK(lf_voice_policy(6) == 2 && lf_voice_policy(13) == 2);
+    set("PS3_LANG_TITLE_ENGLISH", "6,9-15");
+    CHECK(lf_title_english(6) && lf_title_english(9) && lf_title_english(15));
+    CHECK(!lf_title_english(5) && !lf_title_english(8) && !lf_title_english(16) && !lf_title_english(18));
+    CHECK(lf_voice_policy(6) == 0 && lf_voice_policy(11) == 0);
+    CHECK(lf_voice_policy(18) == 1 && lf_voice_policy(17) == 2 && lf_voice_policy(19) == 2);
+    set("PS3_LANG_VOICE_FALLBACK", "2");
+    CHECK(lf_voice_policy(12) == 0 && lf_voice_policy(2) == 1);
+    set("PS3_LANG_VOICE_FALLBACK", NULL);
+    set("PS3_LANG_TITLE_ENGLISH", "none");
+    CHECK(!lf_title_english(6) && lf_voice_policy(6) == 2);
+    set("PS3_LANG_TITLE_ENGLISH", NULL);
+
+    uint8_t h[2048]; char s[256];
+    const uint32_t ids[] = { 0, 2, 22 };
+    const size_t at = make_bink(h, sizeof h, "BIKi", ids, 3);
+    put32(h + at - 12, 48000u | (0x1000u << 16));
+    put32(h + at - 8, 48000u | (0x3000u << 16));
+    lf_bink_describe(h, sizeof h, s, sizeof s);
+    CHECK(strcmp(s, "3 tracks, 48000 Hz: 0 2s 22") == 0);
+    h[0] = 'X';
+    lf_bink_describe(h, sizeof h, s, sizeof s);
+    CHECK(strcmp(s, "no audio") == 0);
+}
+
 static void test_env(void)
 {
     set("PS3_LANG_RESOLVED", NULL);
@@ -206,6 +237,7 @@ int main(void)
     test_voice_names();
     test_env();
     test_disc();
+    test_title_english();
     if (fails) { printf("test_lang_fallback: %d failure(s)\n", fails); return 1; }
     printf("test_lang_fallback: OK\n");
     return 0;

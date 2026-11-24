@@ -22,6 +22,10 @@
  * than switch to English mid-game (R2 c08_timer_fmv has only 0/20/100/110).
  * PS3_LANG_VOICE_FALLBACK: 0 = off, 1 = the above (default), 2 = also any single
  * movie / file missing the language (opt-in).
+ * Languages the title already maps to English itself (PS3_LANG_TITLE_ENGLISH,
+ * lf_title_english()) are left alone: the movie player asks for the
+ * English group (20 + k) for them (R3: 6, 9..15; R2: 8..11), so renaming it hid
+ * the voice.
  */
 #ifndef PS3RECOMP_LANG_FALLBACK_H
 #define PS3RECOMP_LANG_FALLBACK_H
@@ -54,12 +58,33 @@ static inline int lf_enabled(void) { return lf_mode() != 0; }
 
 static inline int lf_english_variant(int lang) { return lang == LF_LANG_ENGLISH_GB; }
 
+/* PS3_LANG_TITLE_ENGLISH: the system languages for which the title itself
+ * asks for the English voice tracks (a list such as "6,9-15"; unset or "none"
+ * = no such language). Renaming the English tracks for those would hide them
+ * from the game. The port sets its title's list at startup. */
+static inline int lf_title_english(int lang)
+{
+    const char* e = getenv("PS3_LANG_TITLE_ENGLISH");
+    if (!e || lang < 0 || lang > 19) return 0;
+    while (*e) {
+        if (*e < '0' || *e > '9') { e++; continue; }
+        char* end = NULL;
+        const long a = strtol(e, &end, 10);
+        long b = a;
+        e = end;
+        if (*e == '-' && e[1] >= '0' && e[1] <= '9') { b = strtol(e + 1, &end, 10); e = end; }
+        if (lang >= a && lang <= b) return 1;
+    }
+    return 0;
+}
+
 /* Whether speech missing in lang may be replaced by English: 1 yes, 0 no,
  * 2 only if the disc has no dub for lang anywhere (ask lf_disc_voice_lang()). */
 static inline int lf_voice_policy(int lang)
 {
     const int m = lf_mode();
     if (!m || lang < 0 || lang > 19 || lang == LF_LANG_ENGLISH_US) return 0;
+    if (lf_title_english(lang)) return 0;
     if (m == 2 || lf_english_variant(lang)) return 1;
     return 2;
 }
@@ -207,6 +232,27 @@ static inline void lf_bink_apply(const LfBinkPlan* plan, uint64_t pos, uint8_t* 
             const uint64_t o = (uint64_t)plan->off[i] + b;
             if (o >= pos && o < pos + n) buf[o - pos] = (uint8_t)(plan->val[i] >> (8 * b));
         }
+}
+
+/* The audio tracks of a .bik header as text for the log ("12 tracks, 48000 Hz:
+ * 0 1 2 21 22s ..."; "s" = a stereo track), "no audio" without any. */
+static inline void lf_bink_describe(const uint8_t* hdr, size_t len, char* out, size_t n)
+{
+    if (!out || !n) return;
+    out[0] = 0;
+    uint32_t ntr = 0;
+    const size_t ids = lf_bink_ids(hdr, len, &ntr);
+    if (!ids) { snprintf(out, n, "no audio"); return; }
+    const size_t fmt = ids - (size_t)ntr * 4;         /* u16 rate, u16 flags per track */
+    const unsigned rate = (unsigned)hdr[fmt] | ((unsigned)hdr[fmt + 1] << 8);
+    size_t w = (size_t)snprintf(out, n, "%u tracks, %u Hz:", (unsigned)ntr, rate);
+    for (uint32_t i = 0; i < ntr && w + 1 < n; i++) {
+        const unsigned flags = (unsigned)hdr[fmt + i * 4 + 2] | ((unsigned)hdr[fmt + i * 4 + 3] << 8);
+        const int r = snprintf(out + w, n - w, " %u%s", (unsigned)lf_rd32le(hdr + ids + i * 4),
+                               (flags & 0x2000) ? "s" : "");
+        if (r < 0) break;
+        w += (size_t)r;
+    }
 }
 
 static inline int lf_is_bink(const char* path)

@@ -51,7 +51,8 @@ def main():
             print((r.stdout + r.stderr)[-4000:])
             return 1
         env = {k: v for k, v in os.environ.items()
-               if k not in ("PS3_LANG_RESOLVED", "PS3_LANG_VOICE_FALLBACK")}
+               if k not in ("PS3_LANG_RESOLVED", "PS3_LANG_VOICE_FALLBACK",
+                             "PS3_LANG_TITLE_ENGLISH")}
         r = subprocess.run([exe], capture_output=True, text=True, env=env, cwd=td)
         sys.stdout.write(r.stdout + r.stderr)
         return r.returncode
