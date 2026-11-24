@@ -178,7 +178,7 @@ static wstring KnownFolder(REFKNOWNFOLDERID id) {
 
 // ---------------------------------------------------------------- game profile (tools\installer\game_profile.psd1)
 struct Profile {
-    wstring name, titleId, region, sizeLabel, saveFolder;
+    wstring name, titleId, region, sizeLabel, saveFolder, altLabel;
     double minBytes = 0, buildBytes = 0;
     Lines required;
 } g_prof;
@@ -202,6 +202,7 @@ static bool LoadProfile() {
         else if (key == L"RegionLabel") g_prof.region = quoted(v);
         else if (key == L"SizeLabel") g_prof.sizeLabel = quoted(v);
         else if (key == L"SaveFolder") g_prof.saveFolder = quoted(v);
+        else if (key == L"AltLabel") g_prof.altLabel = quoted(v);   // other discs accepted too (R3: the European one)
         else if (key == L"MinBytes") g_prof.minBytes = _wtof(v.c_str());
         else if (key == L"BuildBytes") g_prof.buildBytes = _wtof(v.c_str());
         else if (key == L"Required") {
@@ -1530,7 +1531,7 @@ static void UpdateGoButton() {
 static void ShowGameState() {
     if (HaveGameFiles()) SetWindowTextW(h_gameSt, (L"\x2713 Your game is already copied into " + P(L"gamefiles") + L". You don't need to pick it again.").c_str());
     else if (Exists(P(L"gamefiles.copying"))) SetWindowTextW(h_gameSt, L"The last copy of the game was interrupted. Pick the same ISO or folder again (it is filled in if Setup remembers it) and click Resume.");
-    else SetWindowTextW(h_gameSt, (L"Pick your own copy of " + g_prof.name + L" (" + g_prof.region + L" disc, " + g_prof.titleId + L", " + g_prof.sizeLabel +
+    else SetWindowTextW(h_gameSt, (L"Pick your own copy of " + g_prof.name + L" (" + g_prof.region + L" disc, " + g_prof.titleId + (g_prof.altLabel.empty() ? L"" : L"; " + g_prof.altLabel) + L", " + g_prof.sizeLabel +
                                    L"): a decrypted .iso, or the folder that contains PS3_GAME.").c_str());
 }
 static void CheckPickedGame(const wstring& path) {

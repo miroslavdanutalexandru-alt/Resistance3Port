@@ -515,6 +515,23 @@ if(SPU_SOURCES)
         COMPILE_DEFINITIONS R3_SPU_NATIVE_BUILT)
 endif()
 
+# The program the game code in RECOMP_DIR was generated from (RECOMP_DIR/.eboot_ppu, RPCS3's PPU hash, written by
+# Setup), for main.cpp's [boot] disc check (r3_disc.h). Code generated before the record existed: no check.
+if(EXISTS "${RECOMP_DIR}/.eboot_ppu")
+    file(READ "${RECOMP_DIR}/.eboot_ppu" _r3_gen_ppu)
+    string(STRIP "${_r3_gen_ppu}" _r3_gen_ppu)
+    string(TOLOWER "${_r3_gen_ppu}" _r3_gen_ppu)
+    if(_r3_gen_ppu MATCHES "^[0-9a-f]+$")
+        string(LENGTH "${_r3_gen_ppu}" _r3_gen_len)
+        if(_r3_gen_len EQUAL 40)
+            message(STATUS "Game code generated from PPU-${_r3_gen_ppu}")
+            set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/main.cpp" APPEND PROPERTY
+                COMPILE_DEFINITIONS "R3_GEN_PPU_HASH=\"${_r3_gen_ppu}\"")
+        endif()
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${RECOMP_DIR}/.eboot_ppu")
+endif()
+
 # app.rc carries the icon, the version block and the manifest, and needs a
 # resource compiler. Listing it as a source on a host that has none is not a
 # link error, it is a "no rule to make" for a file nothing can consume.

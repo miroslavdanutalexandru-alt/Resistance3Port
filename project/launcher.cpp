@@ -455,12 +455,15 @@ static void register_pc_options()
                                       {"Darker", "1.1"}, {"Darkest", "1.2"} }, 0);
     // cellSysutil.c sysutil_language: the PS3 system language the game reads
     add_option(SEC_PC, "language", "Game language",
-               "The console language the game is told. Auto follows Windows. A language your disc does not contain "
-               "falls back to the game's default (the US disc carries a few languages only).",
+               "The console language the game is told. Auto follows Windows. Resistance 3 has its text in all of these "
+               "and its speech in English, French, Italian, German, Spanish, Portuguese, Polish and Russian (the others "
+               "are subtitled). The US and European discs carry the same language files; a language your copy does "
+               "not contain falls back to English.",
                "PS3_LANG", { {"Auto  (Windows language)", ""}, {"English", "en"}, {"English (UK)", "en-gb"},
                              {"French", "fr"}, {"Spanish", "es"}, {"German", "de"}, {"Italian", "it"},
                              {"Portuguese (Brazil)", "pt-br"}, {"Portuguese", "pt"}, {"Dutch", "nl"},
-                             {"Russian", "ru"}, {"Polish", "pl"} }, 0);
+                             {"Russian", "ru"}, {"Polish", "pl"}, {"Danish", "da"}, {"Finnish", "fi"},
+                             {"Norwegian", "no"}, {"Swedish", "sv"} }, 0);
 }
 // Controls page
 static void register_input_options()

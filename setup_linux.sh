@@ -5,7 +5,7 @@
 #
 #   ./setup_linux.sh [--game <.iso or game folder>] [--jobs N] [--nopgo] [--regen] [--check-only]
 #                    [--ffmpeg-zip <zip>] [--accept-microsoft-license]
-#     --game         your disc copy of Resistance 3 (US, BCUS98176): a decrypted .iso or a folder with
+#     --game         your disc copy of Resistance 3 (US, BCUS98176; the European BCES01118 is experimental): a decrypted .iso or a folder with
 #                    PS3_GAME in it (the same kinds RPCS3 uses). Asked for when needed and not given.
 #     --jobs N       compile jobs (default 4); 16 GB RAM: 4 at most, 8 GB: 2
 #     --nopgo        build without the PGO profile (needed with LLVM older than 22)
@@ -191,7 +191,7 @@ game_present() {
 if ! game_present; then
     while [ -z "$GAME" ]; do
         [ -t 0 ] || fail "the game copy is missing: run with --game <your .iso or game folder>."
-        echo "   Where is your copy of $GAME_NAME (US disc, $TITLE_ID)? A decrypted .iso, or the folder with PS3_GAME"
+        echo "   Where is your copy of $GAME_NAME (US disc, $TITLE_ID; or the European disc BCES01118, experimental)? A decrypted .iso, or the folder with PS3_GAME"
         echo "   in it (for example RPCS3's games folder). You can drag it into this window."
         read -r -p "   Path: " GAME
         GAME="${GAME%\'}"; GAME="${GAME#\'}"; GAME="${GAME%\"}"; GAME="${GAME#\"}"; GAME="$(abs_path "$GAME")"
@@ -214,17 +214,30 @@ elif [ -n "$CHECK_ONLY" ]; then
     info "Game files: $GF (already copied)"
     echo; echo "Check finished (--check-only: nothing was changed)."; exit 0
 fi
-mkdir -p "$GF/cache/$TITLE_ID" "$GF/game/$TITLE_ID/USRDIR"
+DISC_ID="$("$PY" tools/linux/port_linux.py disc-id "$PROFILE" "$GF")"
+mkdir -p "$GF/cache/$DISC_ID" "$GF/game/$DISC_ID/USRDIR"
 info "Game files: $GF"
+[ "$DISC_ID" = "$TITLE_ID" ] || info "Disc: $DISC_ID (experimental, not yet tested on a real copy). Please report how it runs."
 
 # ---------------------------------------------------------------- 3. decrypt
 step "3/5  Decrypting the game program files"
 mkdir -p game
+# decrypted again when missing or made from another EBOOT.BIN (game/EBOOT.src: the SHA-1 of the one it came from)
+BIN_SHA1="$("$PY" tools/linux/port_linux.py hash sha1 "$GF/PS3_GAME/USRDIR/EBOOT.BIN")"
+US_BIN_SHA1=43bad7101e8e54b1f37f65674affef59bfb2ff53   # US 1.00 EBOOT.BIN (game_profile.psd1)
 need=''
-for e in "${ELF_SHA1[@]}"; do
-    n="${e%%=*}"; h="${e#*=}"
-    { [ -f "game/$n" ] && [ "$("$PY" tools/linux/port_linux.py hash sha1 "game/$n")" = "$h" ]; } || need=1
-done
+src_ok=''   # game/EBOOT.src is (re)written only for an ELF known to come from this EBOOT.BIN
+if [ -f game/EBOOT.src ]; then
+    { [ -f game/EBOOT.elf ] && [ "$(cat game/EBOOT.src)" = "$BIN_SHA1" ]; } || need=1
+elif [ "$BIN_SHA1" != "$US_BIN_SHA1" ]; then
+    need=1   # an old US ELF, but the copy's EBOOT.BIN is another one now
+else
+    for e in "${ELF_SHA1[@]}"; do
+        n="${e%%=*}"; h="${e#*=}"
+        { [ -f "game/$n" ] && [ "$("$PY" tools/linux/port_linux.py hash sha1 "game/$n")" = "$h" ]; } || need=1
+    done
+fi
+[ -n "$need" ] || src_ok=1   # the record matched, or the US EBOOT.BIN and its US ELF
 if [ -n "$need" ]; then
     if [ ! -f tools/key_vault.cpp ]; then
         info "Fetching the PS3 application keys from RPCS3's public source code..."
@@ -233,13 +246,12 @@ if [ -n "$need" ]; then
     args=()
     for s in "${SELF_FILES[@]}"; do args+=("$GF/PS3_GAME/USRDIR/$s"); done
     "$PY" tools/unself.py --keys tools/key_vault.cpp --out game "${args[@]}" || fail "decrypting ${SELF_FILES[*]} failed."
-    for e in "${ELF_SHA1[@]}"; do
-        n="${e%%=*}"; h="${e#*=}"
-        [ "$("$PY" tools/linux/port_linux.py hash sha1 "game/$n")" = "$h" ] \
-            || fail "game/$n is not the expected version. The port supports the unpatched disc ($TITLE_ID v1.00); a game update or another release won't match."
-    done
+    src_ok=1   # just decrypted from this EBOOT.BIN
 fi
-info "${ELF_SHA1[*]%%=*}: OK"
+EB_MSG="$("$PY" tools/linux/port_linux.py eboot-id "$PROFILE" game/EBOOT.elf)" || fail "$EB_MSG"
+EB_HASH="$("$PY" tools/linux/port_linux.py ppu-hash game/EBOOT.elf)"
+[ -z "$src_ok" ] || echo "$BIN_SHA1" > game/EBOOT.src
+info "EBOOT.elf: $EB_MSG"
 
 # ---------------------------------------------------------------- 4. game code
 step "4/5  Generating the game code from your copy"
@@ -250,6 +262,8 @@ gen_missing() { local m; for m in "${GEN_MARKERS[@]}"; do [ -f "$m" ] || return 
 if gen_missing; then why=new
 elif [ -n "$FORCE_REGEN" ]; then why=forced
 elif [ "$(cat "$STAMP" 2>/dev/null)" != "$GENHASH" ]; then why=changed
+elif [ "$("$PY" tools/linux/port_linux.py gen-eboot "$PROFILE" "$PORT")" != "$EB_HASH" ]; then
+    why=disc; info "game/EBOOT.elf is another program than the one the game code was generated from (another disc or region)."
 fi
 if [ -n "$why" ]; then
     info "Generating the game code (10-25 minutes)..."
@@ -263,6 +277,7 @@ if [ -n "$why" ]; then
     if [ -n "$SNAP" ]; then "$PY" tools/linux/port_linux.py gen-restore "$PORT" "$SNAP"; rm -f "$SNAP"; fi
     gen_missing && fail "the code generator did not write all of: ${GEN_MARKERS[*]}."
     echo "$GENHASH" > "$STAMP"
+    echo "$EB_HASH" > recompiled/.eboot_ppu   # the program this code is from (setup.ps1 reads the same record)
 else
     info "Already generated (--regen to force)."
 fi

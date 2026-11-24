@@ -12,6 +12,10 @@ not used on Windows.
     port_linux.py gen-hash   <port dir>
     port_linux.py gen-snapshot <port dir> <snapshot.json> <dir>...
     port_linux.py gen-restore  <port dir> <snapshot.json>
+    port_linux.py ppu-hash   <EBOOT.elf>                       RPCS3's PPU hash
+    port_linux.py eboot-id   <game_profile.psd1> <EBOOT.elf>   which known program it is
+    port_linux.py disc-id    <game_profile.psd1> <gamefiles dir>
+    port_linux.py gen-eboot  <game_profile.psd1> <port dir>    the program the generated code is from
 """
 import hashlib, json, os, re, shutil, struct, subprocess, sys, zipfile
 
@@ -40,9 +44,19 @@ def load_profile(path):
     if m:
         for k, v in re.findall(r"'([^']+)'\s*=\s*'([0-9a-fA-F]{40})'", m.group(1)):
             sha[k] = v.lower()
+    alt = {}
+    m = re.search(r'(?m)^\s*AltTitleIds\s*=\s*@\{(.*?)\}', t)
+    if m:
+        alt = dict(re.findall(r"'([^']+)'\s*=\s*'([^']*)'", m.group(1)))
+    eboots = []
+    m = re.search(r'(?ms)^\s*Eboots\s*=\s*@\((.*?)^\s*\)', t)
+    if m:
+        for e in re.findall(r'@\{([^}]*)\}', m.group(1)):
+            eboots.append(dict(re.findall(r"(\w+)\s*=\s*'([^']*)'", e)))
     p = {'GameName': s('GameName'), 'TitleId': s('TitleId'), 'RegionLabel': s('RegionLabel'),
          'AppVer': s('AppVer'), 'TitleMatch': s('TitleMatch', '$^'), 'Required': arr('Required'),
-         'Program': arr('Program'), 'Sha1': sha, 'MinBytes': num('MinBytes'), 'SizeLabel': s('SizeLabel')}
+         'Program': arr('Program'), 'Sha1': sha, 'MinBytes': num('MinBytes'), 'SizeLabel': s('SizeLabel'),
+         'AltTitleIds': alt, 'AltLabel': s('AltLabel'), 'Eboots': eboots}
     if not p['TitleId']:
         raise SystemExit('Bad game profile: %s' % path)
     return p
@@ -168,14 +182,20 @@ class Check:
     def __init__(self):
         self.status, self.code, self.problem, self.fix = 'ok', '', '', ''
         self.kind, self.root, self.base, self.bytes, self.notes = '', '', '', 0, []
+        self.titleid = ''
 
     def bad(self, status, code, problem, fix):
         if self.status != 'error':
             self.status, self.code, self.problem, self.fix = status, code, problem, fix
 
 
+def want_label(prof):
+    alt = '; ' + prof['AltLabel'] if prof.get('AltLabel') else ''
+    return '%s (%s disc, %s%s)' % (prof['GameName'], prof['RegionLabel'], prof['TitleId'], alt)
+
+
 def check_sfo(prof, c, sfo, where):
-    want = '%s (%s disc, %s)' % (prof['GameName'], prof['RegionLabel'], prof['TitleId'])
+    want = want_label(prof)
     if not sfo:
         c.bad('error', 'ENCRYPTED', "The game files can't be read: PARAM.SFO is not valid. This usually means an "
               "encrypted disc image.", ENC_FIX)
@@ -186,7 +206,11 @@ def check_sfo(prof, c, sfo, where):
         c.bad('error', 'UPDATE_FOLDER', 'This is a game update or game data folder (%s, from dev_hdd0/game), not the '
               'disc.' % tid, 'Pick the disc copy: the .iso, or the folder that contains PS3_GAME and PS3_DISC.SFB.')
         return False
+    c.titleid = tid
     if tid == prof['TitleId']:
+        return True
+    if tid in prof.get('AltTitleIds', {}):
+        c.notes.append('%s: %s.' % (tid, prof['AltTitleIds'][tid]))
         return True
     if tid.startswith('NP'):
         c.bad('error', 'PSN', 'This is the PlayStation Store version of %s (%s).' % (title, tid),
@@ -208,7 +232,7 @@ def check_program(prof, c, rel, head, sha1_fn):
         c.bad('error', 'ENCRYPTED', "%s can't be read (it does not start like a PS3 program file). This usually means "
               "an encrypted disc image." % rel, ENC_FIX)
         return
-    known = prof['Sha1'].get(rel)
+    known = prof['Sha1'].get(rel) if c.titleid in ('', prof['TitleId']) else None   # known for the main disc only
     if known and sha1_fn() != known:
         c.bad('warn', 'MODIFIED', '%s is different from the known file of %s version %s. The copy may be modified or a '
               'different release.' % (rel, prof['TitleId'], prof['AppVer']),
@@ -519,6 +543,66 @@ def cmd_ffmpeg(zpath, dest):
     return 0
 
 
+# ------------------------------------------------------------------ which program / disc (as setup.ps1 Get-EbootInfo)
+def ppu_hash(path):
+    """RPCS3's PPU hash of a decrypted EBOOT.elf (the "PPU-..." of its log and patch.yml), or None."""
+    try:
+        d = open(path, 'rb').read()
+    except OSError:
+        return None
+    if len(d) < 64 or d[:4] != b'\x7fELF' or d[4] != 2:
+        return None
+    phoff, = struct.unpack_from('>Q', d, 0x20)
+    phent, phnum = struct.unpack_from('>HH', d, 0x36)
+    h = hashlib.sha1()
+    for i in range(phnum):
+        o = phoff + i * phent
+        p_type, _flags, p_offset, p_vaddr, _paddr, p_filesz, p_memsz = struct.unpack_from('>IIQQQQQ', d, o)
+        h.update(d[o:o + 8])
+        if p_type == 1 and p_memsz:
+            h.update(d[o + 16:o + 24]); h.update(d[o + 40:o + 48]); h.update(d[p_offset:p_offset + p_filesz])
+    return h.hexdigest()
+
+
+def cmd_eboot_id(prof, elf):
+    """Prints what game/EBOOT.elf is; exit 0 = usable (ok / experimental), 1 = unknown, 3 = a game update."""
+    h = ppu_hash(elf)
+    e = next((x for x in prof.get('Eboots', []) if x.get('Ppu') == h), None) if h else None
+    supported = 'the unpatched disc, version 1.00: %s %s' % (prof['RegionLabel'], prof['TitleId'])
+    if prof.get('AltTitleIds'):
+        supported += ', or (experimental) ' + ', '.join(prof['AltTitleIds'])
+    if not e:
+        print('%s is not a known version of %s (PPU hash %s). The port supports %s. A game update or another '
+              'release won\'t match.' % (elf, prof['GameName'], h or 'unreadable', supported))
+        return 1
+    if e.get('Status') == 'update':
+        print('%s is the %s game update %s (%s), not the disc\'s program. The port supports %s.'
+              % (elf, e.get('Region'), e.get('Ver'), e.get('Id'), supported))
+        return 3
+    exp = ', EXPERIMENTAL: not yet tested on a real copy' if e.get('Status') == 'experimental' else ''
+    print('OK (%s v%s, %s disc%s), PPU hash %s' % (e.get('Id'), e.get('Ver', '').lstrip('0'), e.get('Region'), exp, h))
+    return 0
+
+
+def cmd_disc_id(prof, gf):
+    """The accepted title id in <gamefiles>/PS3_GAME/PARAM.SFO, else the profile's."""
+    try:
+        tid = str((read_sfo(open(os.path.join(gf, 'PS3_GAME', 'PARAM.SFO'), 'rb').read()) or {}).get('TITLE_ID', ''))
+    except OSError:
+        tid = ''
+    print(tid if tid in prof.get('AltTitleIds', {}) else prof['TitleId'])
+    return 0
+
+
+def cmd_gen_eboot(prof, port):
+    """The PPU hash the generated code is from (recompiled/.eboot_ppu; missing = the main disc's 1.00)."""
+    try:
+        print(open(os.path.join(port, 'recompiled', '.eboot_ppu')).read().strip().lower())
+    except OSError:
+        print(next((x['Ppu'] for x in prof.get('Eboots', []) if x.get('Id') == prof['TitleId'] and x.get('Status') == 'ok'), ''))
+    return 0
+
+
 # ------------------------------------------------------------------ generated code: generator hash and file dates
 GEN_EXT = ('.py', '.json', '.c', '.cpp', '.h', '.hpp', '.inc', '.txt')
 
@@ -598,6 +682,14 @@ def main(a):
             for b in iter(lambda: f.read(4 << 20), b''):
                 h.update(b)
         print(h.hexdigest()); return 0
+    if len(a) >= 2 and a[0] == 'ppu-hash':
+        print(ppu_hash(a[1]) or ''); return 0
+    if len(a) >= 3 and a[0] == 'eboot-id':
+        return cmd_eboot_id(load_profile(a[1]), a[2])
+    if len(a) >= 3 and a[0] == 'disc-id':
+        return cmd_disc_id(load_profile(a[1]), a[2])
+    if len(a) >= 3 and a[0] == 'gen-eboot':
+        return cmd_gen_eboot(load_profile(a[1]), a[2])
     if len(a) >= 2 and a[0] == 'gen-hash':
         return cmd_gen_hash(a[1])
     if len(a) >= 4 and a[0] == 'gen-snapshot':

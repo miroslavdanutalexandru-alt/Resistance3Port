@@ -425,10 +425,12 @@ static void lx_save_migrate()
         lx_copy_tree(old + "\\trophies", root + "\\trophies");
 }
 // before Play: back up when the saves changed since the newest backup; keep the newest N automatic ones
+static void lx_region_switch();
 static void lx_auto_backup()
 {
     lx_import_recover();
     lx_save_migrate();
+    lx_region_switch();
     const char* v = lx_val("savebackup");
     if (!strcmp(v, "0")) return;
     const int keep = *v ? atoi(v) : 10;
@@ -573,6 +575,82 @@ static std::string lx_local_id()
         if (pcx_title_match(e.name.c_str(), k_lx_ids)) return e.name.substr(0, 9);
     return k_lx_ids[0];
 }
+// Puts the save <src>\<from> into the save folder as <to> (another region's save: <to> is renamed to this copy's
+// title ID, and its PARAM.SFO's SAVEDATA_DIRECTORY with it). It is copied into savedata\.pcimport first; only a
+// complete copy replaces the slot (the old one is moved aside, then deleted; lx_import_recover finishes a swap a
+// crash cut short). An original that could not be put back is added to <stuck>.
+static bool lx_place_save(const std::string& src, const std::string& from, const std::string& to, std::string& stuck)
+{
+    const std::string sd = lx_save_dir(), stage = sd + "\\.pcimport";
+    CreateDirectoryA(stage.c_str(), NULL);
+    const std::string dst = sd + "\\" + to, tmp = stage + "\\" + to + ".tmp", old = stage + "\\" + to + ".old";
+    lx_delete_tree(tmp);
+    bool good = lx_copy_tree(src + "\\" + from, tmp);
+    if (good && to != from) {
+        std::vector<unsigned char> b;
+        size_t off = 0, len = 0;
+        if (lx_read_file(tmp + "\\PARAM.SFO", b) && pcx_sfo_find(b.data(), b.size(), "SAVEDATA_DIRECTORY", &off, &len) &&
+            len >= 9 && !memcmp(&b[off], from.data(), 9)) {
+            memcpy(&b[off], to.data(), 9);
+            FILE* f = fopen((tmp + "\\PARAM.SFO").c_str(), "r+b");
+            good = f && fwrite(b.data(), 1, b.size(), f) == b.size();
+            if (f && fclose(f)) good = false;
+        }
+    }
+    const bool had = GetFileAttributesA(dst.c_str()) != INVALID_FILE_ATTRIBUTES;
+    if (good && had) { lx_delete_tree(old); good = MoveFileExA(dst.c_str(), old.c_str(), 0) != 0; }
+    if (good && !MoveFileExA(tmp.c_str(), dst.c_str(), 0)) {
+        if (had && !MoveFileExA(old.c_str(), dst.c_str(), 0)) stuck += "  " + old + "\n";   // put the original back
+        good = false;
+    }
+    if (!good) { lx_delete_tree(tmp); return false; }
+    if (had) lx_delete_tree(old);
+    return true;
+}
+// Before Play: the game saves under its disc's title ID (BCUS98176 US, BCES01118 Europe), so after a switch to
+// another region's disc it would not see the saves made with the other one. When this copy's ID has no saves yet
+// but another region's are here, offer once (per ID) to copy them under this copy's ID; the originals stay, so
+// switching back finds them as they were. Answering No is remembered (gamedata\region_saves_<ID>.txt).
+static void lx_region_switch()
+{
+    const std::string local = lx_local_id(), sd = lx_save_dir();
+    std::vector<LxEntry> other;
+    for (auto& e : lx_list(sd, true)) {
+        if (!pcx_title_match(e.name.c_str(), k_lx_ids)) continue;
+        if (!_strnicmp(e.name.c_str(), local.c_str(), 9)) return;   // this copy already has saves
+        other.push_back(e);
+    }
+    if (other.empty()) return;
+    const std::string mark = lx_gamedata_root() + "\\region_saves_" + local + ".txt";
+    if (GetFileAttributesA(mark.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    struct Item { std::string from, to, title; ULONGLONG newest; };
+    std::vector<Item> items;
+    std::string list;
+    for (auto& e : other) {
+        char to[260];
+        if (!pcx_save_retarget(e.name.c_str(), k_lx_ids, local.c_str(), to, sizeof to)) continue;
+        bool dup = false;   // two other regions' saves of the same slot: the newer one
+        for (auto& o : items)
+            if (!_stricmp(o.to.c_str(), to)) { if (e.newest > o.newest) o = { e.name, to, e.title, e.newest }; dup = true; break; }
+        if (!dup) items.push_back({ e.name, to, e.title, e.newest });
+    }
+    if (items.empty()) return;
+    for (auto& it : items) list += "  " + (it.title.empty() ? it.from : it.title + "  (" + it.from + ")") + "  -> " + it.to + "\n";
+    const int ans = MessageBoxA(g_hw, ("Your game copy is " + local + ", but your saved games are from another region's "
+                                       "disc, and the game only sees the saves of its own disc.\n\nCopy them for " + local +
+                                       "?\n\n" + list + "\nThe originals stay as they are (the other disc still finds them).").c_str(),
+                                "Saved games from another disc", MB_YESNO | MB_ICONQUESTION);
+    if (FILE* f = fopen(mark.c_str(), "w")) { fprintf(f, "asked: %s\n", ans == IDYES ? "copied" : "no"); fclose(f); }
+    if (ans != IDYES) return;
+    lx_make_save_dir();
+    int ok = 0;
+    std::string stuck;
+    for (auto& it : items) if (lx_place_save(sd, it.from, it.to, stuck)) ok++;
+    RemoveDirectoryA((sd + "\\.pcimport").c_str());
+    if (ok < (int)items.size())
+        MessageBoxA(g_hw, (std::to_string(ok) + " of " + std::to_string(items.size()) + " saved games were copied. The originals are "
+                           "unchanged in\n" + sd).c_str(), "Saved games from another disc", MB_OK | MB_ICONWARNING);
+}
 static void lx_import_rpcs3()
 {
     const std::string pick = lx_pick_folder(L"Pick the RPCS3 folder (or its dev_hdd0 or savedata folder)");
@@ -642,34 +720,8 @@ static void lx_import_rpcs3()
     CreateDirectoryA(stage.c_str(), NULL);
     int ok = 0;
     std::string stuck;
-    for (auto& it : items) {
-        // copy into the staging folder first; only a complete copy replaces the slot (the old one is moved
-        // aside, then deleted; lx_import_recover finishes a swap a crash cut short)
-        const std::string dst = sd + "\\" + it.to, tmp = stage + "\\" + it.to + ".tmp", old = stage + "\\" + it.to + ".old";
-        lx_delete_tree(tmp);
-        bool good = lx_copy_tree(src + "\\" + it.from, tmp);
-        if (good && it.to != it.from) {
-            // another region's save: its PARAM.SFO names the folder too
-            std::vector<unsigned char> b;
-            size_t off = 0, len = 0;
-            if (lx_read_file(tmp + "\\PARAM.SFO", b) && pcx_sfo_find(b.data(), b.size(), "SAVEDATA_DIRECTORY", &off, &len) &&
-                len >= 9 && !memcmp(&b[off], it.from.data(), 9)) {
-                memcpy(&b[off], it.to.data(), 9);
-                FILE* f = fopen((tmp + "\\PARAM.SFO").c_str(), "r+b");
-                good = f && fwrite(b.data(), 1, b.size(), f) == b.size();
-                if (f && fclose(f)) good = false;
-            }
-        }
-        const bool had = GetFileAttributesA(dst.c_str()) != INVALID_FILE_ATTRIBUTES;
-        if (good && had) { lx_delete_tree(old); good = MoveFileExA(dst.c_str(), old.c_str(), 0) != 0; }
-        if (good && !MoveFileExA(tmp.c_str(), dst.c_str(), 0)) {
-            if (had && !MoveFileExA(old.c_str(), dst.c_str(), 0)) stuck += "  " + old + "\n";   // put the original back
-            good = false;
-        }
-        if (!good) { lx_delete_tree(tmp); continue; }
-        if (had) lx_delete_tree(old);
-        ok++;
-    }
+    for (auto& it : items)
+        if (lx_place_save(src, it.from, it.to, stuck)) ok++;
     RemoveDirectoryA(stage.c_str());
     if (!stuck.empty())
         MessageBoxA(g_hw, ("These saved games could not be put back after a failed copy. They are safe here (the "

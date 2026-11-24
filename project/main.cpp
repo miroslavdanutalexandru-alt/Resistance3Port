@@ -757,6 +757,7 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 #include "port_native_summary.h"
 #include "port_mem.h"         /* PORT_LARGE_PAGES: reported unavailable here, see main() */
 #include "r3_native_dof.h"   /* R3_NATIVE_DOF_DEFAULT for the [native] line */
+#include "r3_disc.h"         /* [boot] disc: which disc / program, unknown-program error */
 #endif
 
 extern "C" void vm_inline_refresh(void);
@@ -1076,6 +1077,13 @@ int main(int argc, char** argv)
     {
         char sfo[1100];
         snprintf(sfo, sizeof sfo, "%s/PS3_GAME/PARAM.SFO", ppu_vfs_root);
+        /* which disc (US BCUS98176 / Europe BCES01118) and program this is, and an error for an unknown one (r3_disc.h) */
+        {
+            char sfo_host[1200];
+            snprintf(sfo_host, sizeof sfo_host, "%s", sfo);
+            ps3_vfs_ps3game_fallback_ex(sfo_host, sizeof sfo_host, 1);
+            if (!r3_disc_check(argv[1], sfo_host)) ExitProcess(3);
+        }
         cellGame_init_from_paramsfo(sfo);
     }
 
