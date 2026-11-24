@@ -2238,7 +2238,8 @@ static int s_sched_on = -1, s_sched_ms = 1, s_sched_idle_ms = SPU_SCHED_IDLE_DEF
 static SPU_THREAD_LOCAL int t_sched_quiet;   /* PORT_SPU_SCHED_IDLE_MS streak (spu_sched.h) */
 static volatile long g_sched_ms_peak;          /* longest lost-reservation timeout this 10 s window */
 static __declspec(align(64)) volatile long long g_sched_lr_sleeps, g_sched_missed;
-/* PORT_SPU_SCHED_STATS (default on; 0 = off): how long the lost-reservation
+/* PORT_SPU_SCHED_STATS (opt-in, PORT_SPU_SCHED_STATS=1; it also turns on the [spuwait] /
+ * [spu-sched] 10 s lines): how long the lost-reservation
  * sleeps last, how many end on the timeout rather than a writer's wake, the
  * share per SPU image (the job queue workers, 403/406 in R3), and which line a
  * missed wake (a write that bypassed spu_coh_notify_write) was on -- appended
@@ -2275,7 +2276,7 @@ static void spu_sched_init(void)
 {
     s_sched_ms = spu_sched_parse_ms(getenv("PORT_SPU_SCHED_MS"));
     const int on = spu_sched_parse_bool(getenv("PORT_SPU_SCHED"), 1);
-    s_sched_stats = spu_sched_parse_bool(getenv("PORT_SPU_SCHED_STATS"), 1);
+    s_sched_stats = spu_sched_parse_bool(getenv("PORT_SPU_SCHED_STATS"), 0);
     s_sched_idle_ms = spu_sched_parse_idle_ms(getenv("PORT_SPU_SCHED_IDLE_MS"));
     fprintf(stderr, "[spu-sched] PORT_SPU_SCHED=%d (lost-reservation waits re-poll every %d ms, others %d ms), stats %d (PORT_SPU_SCHED_STATS), "
                     "idle backoff to %d ms (PORT_SPU_SCHED_IDLE_MS opt-in, 0 = off)\n",
@@ -2438,7 +2439,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
         if (spun_ok < 0) spun_ok = spu_ch_ready_ex(ctx, channel, 0);
         if (spin_here) spu_spin_note(spun_ok);
         if (spun_ok) _InterlockedIncrement64((volatile long long*)&g_sw_spin_ok);
-        spu_spinwait_report();
+        if (s_sched_stats) spu_spinwait_report();   /* PORT_SPU_SCHED_STATS */
     }
     const uint64_t pw1 = pw0 ? spu_host_ns() : 0;
     {

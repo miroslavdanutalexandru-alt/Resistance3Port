@@ -375,11 +375,11 @@ static long long fc_us(void);
 
 /* Present-interval statistics, every 5 s: VRR panels follow the present
  * cadence, so jitter (or hovering around the LFC threshold) pulses the
- * brightness. RSX_PRESENT_STATS=0 silences it. */
+ * brightness. Opt-in: RSX_PRESENT_STATS=1. */
 static void present_stats(void)
 {
     static int on = -1;
-    if (on < 0) { const char* e = getenv("RSX_PRESENT_STATS"); on = e ? atoi(e) : 1; }
+    if (on < 0) { const char* e = getenv("RSX_PRESENT_STATS"); on = e ? atoi(e) : 0; }
     if (!on) return;
     static long long last = 0, win = 0;
     static unsigned n = 0, b[6] = { 0 };   /* <12, 12-20, 20-28, 28-36, 36-50, >=50 ms */
@@ -624,7 +624,7 @@ static void vm_commit_range(uint8_t* p, size_t len)
             VirtualAlloc(q, 0x1000, MEM_COMMIT, PAGE_READWRITE);
     }
 }
-/* R3_AV_WHO (default 1): who reads/writes RSX-protected guest memory when the fault
+/* R3_AV_WHO (opt-in, R3_AV_WHO=1): who reads/writes RSX-protected guest memory when the fault
  * hook takes >= 1 ms (a render-target readback on the faulting thread). The first
  * 64 distinct (64 KB region, host PC) pairs are logged once as
  *   [av-who] guest 0x.. read 4.1 ms thread 'name' spu-job 422 | func_A+0x.. < func_B+0x.. ...
@@ -632,7 +632,7 @@ static void vm_commit_range(uint8_t* p, size_t len)
 static bool av_who_on(void)
 {
     static int on = -1;
-    if (on < 0) { const char* v = getenv("R3_AV_WHO"); on = !(v && v[0] == '0'); }
+    if (on < 0) { const char* v = getenv("R3_AV_WHO"); on = v && *v && v[0] != '0'; }
     return on != 0;
 }
 static int av_who_guest(uintptr_t pc, uint32_t* off)

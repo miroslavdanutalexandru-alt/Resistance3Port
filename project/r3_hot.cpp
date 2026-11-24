@@ -37,10 +37,10 @@
 //                        normally. Default 3. 0 = never mark (the build before this fence). Marks are never made
 //                        with R3_OCC_TIMEOUT_VISIBLE=0 or R3_OCC_TIMEOUT_PARTIAL=1 (their old behaviour exactly)
 //                        nor with R3_OCC_BLOCKING=1 / R3_OCC_WAIT_US=-1 and R3_OCC_SKIP=0 (the lifted wait, untouched).
-// [occ] lines (every ~5 s): sets read, ready at once, skipped, waited, timeouts, unproven.
-//   R3_OCC_LATE_LOG=1    DEFAULT: under R3_OCC_BLOCKING=1 the hook still counts (log only, then the lifted body):
+// [occ] lines (every ~5 s, only with R3_OCC_LATE_LOG=1): sets read, ready at once, skipped, waited, timeouts, unproven.
+//   R3_OCC_LATE_LOG=1    opt-in (default 0): the 5 s [occ] statistics; under R3_OCC_BLOCKING=1 the hook still counts (log only, then the lifted body):
 //                        sets whose last report was ready when the game asked vs late (the game's wait blocks),
-//                        and for ready sets how many reports cull (count <= the object's threshold). 0 = off.
+//                        and for ready sets how many reports cull (count <= the object's threshold).
 //   RSX_ZCULL_GUEST_WAIT=1  DEFAULT: when the set is late, name its last report to rsx::thread (r2rsx_occ_guest_wait),
 //                        which submits the command buffer holding that report's query at once instead of waiting for
 //                        RSX_ZCULL_CRIT_FLUSH_US / a natural submit. Report values are untouched (exact). 0 = off.
@@ -94,7 +94,7 @@ int g_occ_markon = 0;     /* marks are made: visible timeout/skip writes, fence 
 std::atomic<long long> g_occ_calls{0}, g_occ_ready{0}, g_occ_skipped{0}, g_occ_waited{0}, g_occ_timeouts{0}, g_occ_wait_ns{0};
 std::atomic<long long> g_occ_unproven{0}, g_occ_marked{0}, g_occ_cleared{0};
 std::atomic<long long> g_occ_rep_vis{0}, g_occ_rep_hid{0};   /* R3_OCC_LATE_LOG: reports of ready sets, visible / culled */
-int g_occ_latelog = 1;    /* R3_OCC_LATE_LOG (default 1): count sets also under R3_OCC_BLOCKING=1 */
+int g_occ_latelog = 0;    /* R3_OCC_LATE_LOG (default 0): 5 s [occ] statistics, culled-report counts */
 int g_occ_gw = 1;         /* RSX_ZCULL_GUEST_WAIT (default 1): name the awaited report to rsx::thread */
 int g_sp_on = 0, g_sp_need = 2;   /* RSX_OCC_SPEC_VISIBLE, RSX_OCC_SPEC_NEED (see sp_update_mark) */
 int g_sp_mark = 0;                /* global unproven period: every set read is written visible */
@@ -152,7 +152,7 @@ void occ_report()
     if (g_occ_us < 0 && !g_occ_skip) {
         /* R3_OCC_BLOCKING=1: the game's own wait reads every result (nothing is visible for being late) */
         fprintf(stderr, "[occ] 5 s: sets %lld, last report ready when the game asked %lld (%.1f%%), late (game's own wait blocks "
-                        "on the RSX) %lld; reports of ready sets: visible %lld, culled %lld (%.1f%%) (R3_OCC_LATE_LOG=0 off)\n",
+                        "on the RSX) %lld; reports of ready sets: visible %lld, culled %lld (%.1f%%) (R3_OCC_LATE_LOG=1)\n",
                 c - lc, r - lr, c - lc ? 100.0 * (double)(r - lr) / (double)(c - lc) : 0.0, w - lw, rv - lrv, rh - lrh,
                 (rv - lrv) + (rh - lrh) ? 100.0 * (double)(rh - lrh) / (double)((rv - lrv) + (rh - lrh)) : 0.0);
         lc = c; lr = r; lw = w; lrv = rv; lrh = rh;
@@ -527,7 +527,7 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
         g_occ_fence = env_int("R3_OCC_FENCE_FLIPS", 3);
         if (g_occ_fence < 0) g_occ_fence = 0;
         g_occ_markon = g_occ_vis && !g_occ_partial && g_occ_fence > 0;
-        g_occ_latelog = env_int("R3_OCC_LATE_LOG", 1) != 0;
+        g_occ_latelog = env_int("R3_OCC_LATE_LOG", 0) != 0;
         g_occ_gw = env_int("RSX_ZCULL_GUEST_WAIT", 1) != 0;
         g_sp_need = env_int("RSX_OCC_SPEC_NEED", 2);
         if (g_sp_need < 1) g_sp_need = 1;
@@ -585,9 +585,11 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
     if (!span_ok(rep, 8)) return 0;
 
     g_occ_calls.fetch_add(1, std::memory_order_relaxed);
-    const unsigned long long now = GetTickCount64();
-    unsigned long long nx = g_occ_next.load(std::memory_order_relaxed);
-    if (now >= nx && g_occ_next.compare_exchange_strong(nx, now + 5000)) occ_report();
+    if (g_occ_latelog) {   /* R3_OCC_LATE_LOG: [occ] statistics every 5 s */
+        const unsigned long long now = GetTickCount64();
+        unsigned long long nx = g_occ_next.load(std::memory_order_relaxed);
+        if (now >= nx && g_occ_next.compare_exchange_strong(nx, now + 5000)) occ_report();
+    }
 
     const volatile uint64_t* ts = (const volatile uint64_t*)(vm_base + rep);
     if (lifted_only) {
@@ -612,7 +614,7 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
            game's own wait have to block on the RSX (late)? For ready sets, how many reports cull (count <= thr). */
         if (*ts) {
             g_occ_ready.fetch_add(1, std::memory_order_relaxed);
-            if (span_ok(obj, 0x24) && span_ok(list, 2 * (uint64_t)count)) {
+            if (g_occ_latelog && span_ok(obj, 0x24) && span_ok(list, 2 * (uint64_t)count)) {
                 const uint32_t base = ld_be32(0x012D6F74), thr = ld_be32(obj + 0x20);
                 long long hid = 0, vis = 0;
                 for (uint32_t i = 0; i < count; i++) {

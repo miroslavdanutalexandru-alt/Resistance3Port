@@ -54,6 +54,14 @@ static int r2_diag(void)
     return d;
 }
 
+/* [fps] 5 s pacing lines: opt-in, PORT_FPS_LOG=1 */
+static int port_fps_log(void)
+{
+    static int d = -1;
+    if (d < 0) { const char* e = getenv("PORT_FPS_LOG"); d = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    return d;
+}
+
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 
@@ -253,7 +261,7 @@ extern "C" void port_joblist_reset(uint32_t list)
  * a = 0x20000 | (tag & 0xFFFF), b = tag. */
 #include "ps3emu/ps3_ftrace.h"
 #define PORT_HITCH_IMPLEMENTATION
-#include "ps3emu/port_hitch.h"   /* [hitch] frame hitch logger (PORT_HITCH_LOG=0 off) */
+#include "ps3emu/port_hitch.h"   /* [hitch] frame hitch logger (opt-in: PORT_HITCH_LOG=1) */
 extern "C" unsigned long long port_ftw_now(void) { return PS3_FT_ON() ? ps3_ft_now() : 0ull; }
 extern "C" void port_ftw_span(unsigned tag, unsigned long long t0, ppu_context* ctx)
 {
@@ -456,7 +464,7 @@ extern "C" int port_frame_wait(uint64_t target, uint32_t last_ea)
         if (s_next > now + target) s_next = now + target;   /* target shrank (menu -> game) */
     }
     /* frame pacing stats, every 5 s: frames, mean and worst frame time */
-    { static uint64_t t0 = 0, prev = 0, worst = 0; static unsigned n = 0; static double sum = 0;
+    if (port_fps_log()) { static uint64_t t0 = 0, prev = 0, worst = 0; static unsigned n = 0; static double sum = 0;
       const uint64_t now = ppu_timebase_now();
       if (prev) { const uint64_t d = now - prev; sum += (double)d; n++; if (d > worst) worst = d; }
       prev = now;
@@ -1376,6 +1384,7 @@ extern "C" double r2_frame_period(double f1)
         if (k == ns && ns < 8) { seen[ns++] = f1; fprintf(stderr, "[fps] limiter period %.5f\n", f1); }
     }
     if (!host) {
+        if (port_fps_log()) {
         static uint64_t t0 = 0; static unsigned n = 0;
         const uint64_t now = ppu_timebase_now();
         if (!t0) t0 = now;
@@ -1383,6 +1392,7 @@ extern "C" double r2_frame_period(double f1)
         if (now - t0 >= 5ull * 79800000ull) {
             port_log_async(1, "[fps] 5 s: %.1f fps (target 30)\n", n * 79800000.0 / (double)(now - t0));
             t0 = now; n = 0;
+        }
         }
         port_hitchcatch_frame(g_port_frame_no, hitch_discard);
         port_hitch_frame(30.0, hitch_discard);
@@ -1434,7 +1444,7 @@ extern "C" double r2_frame_period(double f1)
         ppu_gcm_pump();   /* uncapped: no wait, but keep handlers flowing */
     }
 
-    { static uint64_t t0 = 0; static unsigned n = 0;
+    if (port_fps_log()) { static uint64_t t0 = 0; static unsigned n = 0;
       if (!t0) t0 = now;
       n++;
       if (now - t0 >= 5ull * 79800000ull) {

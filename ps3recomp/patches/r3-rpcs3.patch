@@ -20931,14 +20931,14 @@ index 0000000..9d4aa00
 +			if (t - t0 >= 10000)
 +			{
 +				const double s = static_cast<double>(t - t0) / 1000.0;
-+				if (f.want_on || on_frames)
++				if ((f.want_on || on_frames) && r2fgdiag::cfg().level >= 1) // R3_FG_DIAG=1: 10 s status line
 +					fglog("DLSS-G %ux: on %.0f%% of frames | rendered %.1f fps -> presented %.1f fps | Reflex limit %s%s%s%s",
 +						n, rendered ? 100.0 * on_frames / rendered : 0.0, rendered / s, static_cast<double>(shown + (rendered - on_frames)) / s,
 +						f.reflex_limit == ~0u ? "none" : (std::to_string(f.reflex_limit) + " us").c_str(),
 +						f.sc_immediate ? " | IMMEDIATE (no vsync)" : "",
 +						f.reason.empty() ? "" : " | last pause: ", f.reason.c_str());
 +				char rs[256];
-+				if (r2fgdiag::summary10(rs, sizeof(rs))) fglog("%s", rs);
++				if (r2fgdiag::summary10(rs, sizeof(rs)) && r2fgdiag::cfg().level >= 1) fglog("%s", rs);
 +				t0 = t; rendered = on_frames = 0; shown = 0;
 +			}
 +		}
@@ -26771,7 +26771,7 @@ index 0000000..2ac2877
 +
 +	bool log_enabled()
 +	{
-+		static const bool on = r2memo::env_switch("R2_PIPE_LOG", true);
++		static const bool on = r2memo::env_switch("R2_PIPE_LOG", false); // opt-in: R2_PIPE_LOG=1
 +		return on;
 +	}
 +
@@ -51809,7 +51809,7 @@ index 0000000..14eda1e
 +		char buf[896];
 +		if (st().report(now, buf, sizeof(buf)))
 +		{
-+			std::printf("%s\n", buf);
++			{ static const bool lg = env_switch("RSX_ADS_RB_LOG", false); if (lg) std::printf("%s\n", buf); } // [ads-rb] 5 s stats: opt-in
 +			std::fflush(stdout);
 +		}
 +	}
@@ -53509,7 +53509,7 @@ index 0000000..deb2c09
 +
 +// R3PORT: RSX readback attribution and the texture-miss readback avoidance (shared by the R2 and R3 ports).
 +//
-+// RSX_RB_ATTRIB (default 1): every surface readback (imp_flush) is recorded with the operation that caused it (texture miss,
++// RSX_RB_ATTRIB (opt-in, RSX_RB_ATTRIB=1): every surface readback (imp_flush) is recorded with the operation that caused it (texture miss,
 +//   blit, present, CPU/SPU access fault, other) and the time that operation spent while it flushed (GPU submit + wait +
 +//   copy). Every 5 s: "[rb-attr]" with the cost per cause and the top surfaces (base, size, format, count, MB, wait).
 +// RSX_RT_GPU_REINTERPRET (default 1): a texture that misses the cache and overlaps render targets (e.g. an FP16 surface
@@ -53619,7 +53619,7 @@ index 0000000..deb2c09
 +		static const config c = []
 +		{
 +			config r;
-+			r.attrib = env_on("RSX_RB_ATTRIB", true);
++			r.attrib = env_on("RSX_RB_ATTRIB", false); // diagnostics only: opt-in
 +			r.reint = env_on("RSX_RT_GPU_REINTERPRET", true);
 +			r.check = r.reint ? std::max(0L, env_int("RSX_RT_GPU_REINTERPRET_CHECK", 8)) : 0;
 +			r.check_every = r.reint ? std::max(0L, env_int("RSX_RT_GPU_REINTERPRET_CHECK_EVERY", 600)) : 0;
@@ -53731,7 +53731,7 @@ index 0000000..deb2c09
 +
 +		void maybe_report(uint64_t now)
 +		{
-+			char buf[2048];
++			if (!cfg().attrib) return; char buf[2048]; // RSX_RB_ATTRIB off: no [rb-attr] line
 +			{
 +				std::lock_guard lock(m_mutex);
 +				if (!m_last_ns) { m_last_ns = now; return; }
@@ -53839,7 +53839,7 @@ index 0000000..1adf867
 +++ b/rpcs3/Emu/RSX/port_texdiag.h
 @@ -0,0 +1,152 @@
 +#pragma once
-+// R2PORT: [texcache] diagnostic (RSX_TEXDIAG, default on; RSX_TEXDIAG=0 off). Cheap always-on counters for
++// R2PORT: [texcache] diagnostic (RSX_TEXDIAG, opt-in: RSX_TEXDIAG=1). Cheap counters (off: one load) for
 +// texture uploads, re-uploads of the same address, sampler derivations and guest write faults on cached
 +// texture memory, printed as one [texcache] line every 10 s (only when something happened). Hot paths do a
 +// few relaxed atomic adds; the re-upload table is a 4096-slot direct-mapped atomic<u64> array. Answers
@@ -53870,7 +53870,7 @@ index 0000000..1adf867
 +
 +	inline bool enabled()
 +	{
-+		static const bool on = [] { const char* e = std::getenv("RSX_TEXDIAG"); return !(e && *e == '0'); }();
++		static const bool on = [] { const char* e = std::getenv("RSX_TEXDIAG"); return e && *e && *e != '0'; }();
 +		return on;
 +	}
 +

@@ -1581,11 +1581,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                        if (catchup < 0) catchup = 0; if (catchup > 20) catchup = 20; }
     /* audio_adapt.h: PORT_AUDIO_DRIFT (default 1) smooth clock-drift steering of the guest block clock;
      * PORT_AUDIO_ADAPTIVE (default 1) raises the target after a bad 10 s window, up to
-     * PORT_AUDIO_BUFFER_MAX_MS (default 300); PORT_AUDIO_UNDERRUN_LOG (default 1) the 10 s underrun line */
+     * PORT_AUDIO_BUFFER_MAX_MS (default 300); PORT_AUDIO_UNDERRUN_LOG the 10 s underrun line (default: only a window with underruns; 1 = every
+     * 10 s, also with PORT_AUDIO_LOG set; 0 = never) */
     int drift_on, adapt_on, ulog_on; unsigned adapt_max_ms;
     { const char* e = getenv("PORT_AUDIO_DRIFT"); drift_on = !(e && *e == '0');
       e = getenv("PORT_AUDIO_ADAPTIVE"); adapt_on = !(e && *e == '0');
-      e = getenv("PORT_AUDIO_UNDERRUN_LOG"); ulog_on = !(e && *e == '0');
+      e = getenv("PORT_AUDIO_UNDERRUN_LOG"); ulog_on = !(e && *e) ? 1 : *e == '0' ? 0 : 2;
       e = getenv("PORT_AUDIO_BUFFER_MAX_MS"); adapt_max_ms = (e && *e) ? (unsigned)atoi(e) : 300;
       if (adapt_max_ms > 500) adapt_max_ms = 500;
       if (adapt_max_ms < audio_buffer_ms()) adapt_max_ms = audio_buffer_ms(); }
@@ -1642,7 +1643,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     ULONGLONG aw_t0 = GetTickCount64();
     unsigned sess_underruns = 0, win_dry0 = s_dev_dry_total;
     static float ao_buf[4096 * 2];
-    int ao_log_ms = 5000;
+    int ao_log_ms = 0;   /* opt-in: PORT_AUDIO_LOG */
     { const char* e = getenv("PORT_AUDIO_LOG"); const char* p = getenv("R2_RSX_PROF");
       if (e && *e) ao_log_ms = atoi(e) == 0 ? 0 : (atoi(e) == 1 ? 1000 : atoi(e) < 100 ? 1000 : atoi(e));
       else if (p && *p && atoi(p)) ao_log_ms = 1000; }
@@ -1672,7 +1673,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
       else if (late_us > 0) late_ms = (late_us + 999) / 1000;
       else late_ms = (stretch_on || ao) ? 22 : 0;
       if (late_ms < 0) late_ms = 0; if (late_ms > 40) late_ms = 40;
-      e = getenv("PORT_AUDIO_LOG"); health_log = !(e && *e && atoi(e) == 0); }
+      e = getenv("PORT_AUDIO_LOG"); health_log = e && *e && atoi(e) != 0; }
     double tempo = 1.0;
     static float hop[AS_HS * 2];
     long long wait_q0 = 0;                 /* QPC: this tick started waiting for a late block */
@@ -2054,8 +2055,8 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             if (ao) {
                 audio_out_push(ao, s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
                 audio_out_tick(ao, qdev);
-                /* [audio] every 5 s (1 s with PORT_AUDIO_LOG=1 or
-                 * R2_RSX_PROF=1, PORT_AUDIO_LOG=<ms> any period, 0 off).
+                /* [audio] opt-in: every 1 s with PORT_AUDIO_LOG=1 or
+                 * R2_RSX_PROF=1, PORT_AUDIO_LOG=<ms> any period (e.g. 5000), unset/0 off).
                  * Good: buffer min well above 0, tempo avg ~1.00, underruns 0,
                  * device dry 0. */
                 const ULONGLONG tn = GetTickCount64();
@@ -2081,7 +2082,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                     memset(&acc_log, 0, sizeof acc_log);
                 }
                 if (win_due) {
-                    /* PORT_AUDIO_UNDERRUN_LOG (default 1): underruns every 10 s with session totals;
+                    /* PORT_AUDIO_UNDERRUN_LOG: underruns per 10 s with session totals (see above);
                      * PORT_AUDIO_ADAPTIVE: a bad window raises the target (audio_adapt.h) */
                     const AudioOutStats w = acc_win;
                     const double spct = w.ticks ? 100.0 * w.stretch_ticks / w.ticks : 0.0;
@@ -2091,7 +2092,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                     const int parked = audio_host_paused();
                     const unsigned old_ms = adapt.cur_ms;
                     const unsigned nt = parked ? 0u : audio_adapt_window(&adapt, ur, spct);
-                    if (health_log && ulog_on)
+                    if (ulog_on == 2 || (ulog_on == 1 && (ur || health_log)))
                         fprintf(stderr, "[audio] underruns %u in last 10 s (stage %u, device dry %u, silence %.0f ms) | stretched %.0f%% "
                                 "(min tempo %.2f) | buffer min %.0f ms (target %u) | session: %u underruns | clock drift %+.0f ppm%c",
                                 ur, w.underruns, dry_win, w.silence_ms, spct, w.ticks ? w.tempo_min : 1.0,
@@ -2389,7 +2390,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     {   /* PORT_DIALOGUE_DIAG: how this port reaches the stereo host output
          * (cutscene speech sits in the centre channel of the 8-ch movie port). */
         const char* e = getenv("PORT_DIALOGUE_DIAG");
-        if (!(e && e[0] == '0')) {
+        if (e && *e && e[0] != '0') {   /* opt-in */
             const char* sp = getenv("PORT_SPEAKERS");
             if (nch == CELL_AUDIO_PORT_8CH)
                 printf("[dialogue] audio port %d: 8 ch -> host stereo: L/R + C x0.707 + LFE x%s + Ls/Rs x0.5 "

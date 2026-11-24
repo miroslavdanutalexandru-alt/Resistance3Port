@@ -606,7 +606,7 @@ int64_t sys_fs_open(ppu_context* ctx)
         const int lang = lf_system_language();
         int pol = lf_voice_policy(lang);
         static int diag = -1;
-        if (diag < 0) { const char* e = getenv("PORT_DIALOGUE_DIAG"); diag = !(e && e[0] == '0'); }
+        if (diag < 0) { const char* e = getenv("PORT_DIALOGUE_DIAG"); diag = e && *e && e[0] != '0'; }
         uint8_t hdr[2048];
         size_t got = 0;
         if (pol || diag) {
@@ -631,7 +631,7 @@ int64_t sys_fs_open(ppu_context* ctx)
                                              "playing the English one (PS3_LANG_VOICE_FALLBACK=0 off)\n", host_path, lang);
             }
         }
-        /* PORT_DIALOGUE_DIAG (default on, 0 = off): per movie open, the language,
+        /* PORT_DIALOGUE_DIAG (opt-in, PORT_DIALOGUE_DIAG=1): per movie open, the language,
          * the audio tracks on disc and the voice-track rename, so a log tells
          * why a cutscene plays without dialogue. */
         static int diag_lines;
