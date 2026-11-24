@@ -282,7 +282,7 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Page | Option | Values (default first or marked) | Environment variable |
 |---|---|---|---|
 | Display › Screen | Display mode | Borderless, Exclusive fullscreen, Windowed | `RSX_DISPLAY` |
-| Display › Screen | Window size | 1280x720 … 3840x2160 (**1920x1080**) | `RSX_WINDOW` |
+| Display › Screen | Window size | 1280x720 … 3840x2160, 5120x2160 (ultrawide) (**1920x1080**) | `RSX_WINDOW` |
 | Display › Frame rate | Frame rate | 30, 40, 45, **60**, 72, 90, 120, 144, 165, 240, Match display, Just under refresh (G-Sync / FreeSync), Uncapped | `R2_FPS` (`30`, `<fps>`, `refresh`, `vrr`, `0`). Above about 75 fps left-stick movement misbehaves (the game's movement code is tied to the frame rate), so 90 and up are labelled *may break movement*; 40 / 45 suit 40 Hz handheld and 90 Hz screens. |
 | Display › Frame rate | VSync | **Off**, On, Adaptive (FIFO relaxed), Auto (On when capped at or under the refresh) | `RSX_VSYNC` |
 | Display › Screen | Monitor | **Primary**, Monitor 1…n | `RSX_MONITOR` |
