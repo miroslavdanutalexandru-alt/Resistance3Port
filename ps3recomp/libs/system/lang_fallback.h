@@ -23,8 +23,9 @@
  * PS3_LANG_VOICE_FALLBACK: 0 = off, 1 = the above (default), 2 = also any single
  * movie / file missing the language (opt-in).
  * Languages the title already maps to English itself (PS3_LANG_TITLE_ENGLISH,
- * lf_title_english()) are left alone: Resistance 3's movie player asks for the
- * English group (20 + k) for Dutch and ids 9..15, so renaming it hid the voice.
+ * lf_title_english()) are left alone: the movie player asks for the
+ * English group (20 + k) for them (R3: 6, 9..15; R2: 8..11), so renaming it hid
+ * the voice.
  */
 #ifndef PS3RECOMP_LANG_FALLBACK_H
 #define PS3RECOMP_LANG_FALLBACK_H
