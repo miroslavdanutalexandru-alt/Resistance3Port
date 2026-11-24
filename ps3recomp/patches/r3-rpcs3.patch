@@ -650,7 +650,7 @@ index 3b3c9a0..2dfbe81 100644
 +endif()
 diff --git a/README.port.md b/README.port.md
 new file mode 100644
-index 0000000..1f97921
+index 0000000..2a256ca
 --- /dev/null
 +++ b/README.port.md
 @@ -0,0 +1,109 @@
@@ -720,7 +720,7 @@ index 0000000..1f97921
 +| `VK/VKTextureCache.cpp` (`upload_image_from_cpu`) | `r2gx::texpack_upload()` before `vk::upload_image`, behind one `bool` test. |
 +| `CMakeLists.txt` | `VKR2Gfx.cpp` added to `rpcs3_rsx`. |
 +| `VK/VKPipelineCompiler.cpp/.h`, `VK/VKGSRender.cpp`, `port_r2memo.h` | Round 10: `R2_VK_PIPE_CACHE` (default on) seeds the shared `VkPipelineCache` from `shaders_cache/vk_pipeline_cache.bin` (checked against vendor/device/pipelineCacheUUID, `pipe_cache_header_ok`) and writes it back after the preload and in `destroy_pipe_compiler`; the driver only skips back-end compilation, pipelines are identical. Pipelines linked after the preload are logged as disk-cache misses. |
-+| `VK/VKPipelineCompiler.cpp/.h`, `VK/VKProgramPipeline.cpp/.h`, `VK/vkutils/device.cpp/.h`, `VK/VKGSRender.cpp`, `VK/VKR2Pipe.cpp/.h`, `VK/VKR2Fossilize.cpp/.h`, `rsx_cache.h`, `Program/ProgramStateCache.h`, `VK/VKProgramBuffer.h`, `VK/VKPresent.cpp`, `VK/VKRenderPass.cpp`, `VK/vkutils/descriptors.cpp`, `port_r2pipe.h`, `CMakeLists.txt` (+ `../fossilize`, Valve Fossilize, MIT) | Pipeline stutter round. `R2_VK_GPL` (default on when the device has `VK_EXT_graphics_pipeline_library` with `graphicsPipelineLibraryFastLinking`): a pipeline first needed during play is fast-linked from vertex-input / pre-rasterization / fragment-shader / fragment-output libraries (each cached by the exact bytes of its inputs) and the optimised monolithic pipeline (same create info as upstream) is compiled on the compiler thread when idle and swapped in atomically; program layouts use `INDEPENDENT_SETS`; the start-up preload stays monolithic. `R2_PRELOAD_ASYNC` (default 1 in the async shader mode, 0 otherwise): every shader is compiled before the first frame but only the `R2_PRELOAD_BOOT` (384) earliest-recorded pipelines are linked; `R2_PRELOAD_THREADS` (default cores/4, 1-4) low-priority threads link the rest during play; `0` = upstream blocking preload. `R2_FOSSILIZE`: `record` appends every pipeline (with its shaders, layouts, render pass) to `shaders_cache/<r2|r3>_pipelines.foz`; default `auto` replays that file, if present, on background threads into the shared `VkPipelineCache` after the RPCS3 preload (`replay` = also log when missing, `0` = off, `R2_FOSSILIZE_DB` = other path). `R2_PIPE_LOG` (default on): `[pipe]` line every 5 s with render-thread waits on shader/pipeline work and a >2 ms histogram, plus the render thread's time inside `vkCreate*Pipelines` and waiting for the `PORT_PIPE_SERIAL` queue (`driver` / `lock-wait`). With `PORT_PIPE_SERIAL` (AMD) the optimised pipelines and preload threads yield to play-time pipelines (`PORT_PIPE_SERIAL_PRIO`, `PORT_PIPE_BG_QUIET_MS`; `VK/VKR2Preload.cpp`, `port_r2pipe.h` `serial_policy`). Upstream's per-thread `m_cache_miss_flag` is `thread_local`. |
++| `VK/VKPipelineCompiler.cpp/.h`, `VK/VKProgramPipeline.cpp/.h`, `VK/vkutils/device.cpp/.h`, `VK/VKGSRender.cpp`, `VK/VKR2Pipe.cpp/.h`, `VK/VKR2Fossilize.cpp/.h`, `rsx_cache.h`, `Program/ProgramStateCache.h`, `VK/VKProgramBuffer.h`, `VK/VKPresent.cpp`, `VK/VKRenderPass.cpp`, `VK/vkutils/descriptors.cpp`, `port_r2pipe.h`, `CMakeLists.txt` (+ `../fossilize`, Valve Fossilize, MIT) | Pipeline stutter round. `R2_VK_GPL` (default on when the device has `VK_EXT_graphics_pipeline_library` with `graphicsPipelineLibraryFastLinking`): a pipeline first needed during play is fast-linked from vertex-input / pre-rasterization / fragment-shader / fragment-output libraries (each cached by the exact bytes of its inputs) and the optimised monolithic pipeline (same create info as upstream) is compiled on the compiler thread when idle and swapped in atomically; program layouts use `INDEPENDENT_SETS`; the start-up preload stays monolithic. `R2_PRELOAD_ASYNC` (default 1 in the async shader mode, 0 otherwise): every shader is compiled before the first frame but only the `R2_PRELOAD_BOOT` (384) earliest-recorded pipelines are linked; `R2_PRELOAD_THREADS` (default cores/4, 1-4) low-priority threads link the rest during play; `0` = upstream blocking preload. `R2_FOSSILIZE`: `record` appends every pipeline (with its shaders, layouts, render pass) to `shaders_cache/<r2|r3>_pipelines.foz`; default `auto` replays that file, if present, on background threads into the shared `VkPipelineCache` after the RPCS3 preload (`replay` = also log when missing, `0` = off, `R2_FOSSILIZE_DB` = other path). `R2_PIPE_LOG` (default on): `[pipe]` line every 5 s with render-thread waits on shader/pipeline work and a >2 ms histogram, plus the render thread's time inside `vkCreate*Pipelines` and waiting for the `PORT_PIPE_SERIAL` queue (`driver` / `lock-wait`). With `PORT_PIPE_SERIAL` (AMD) the optimised pipelines and preload threads yield to play-time pipelines (`PORT_PIPE_SERIAL_PRIO`, `PORT_PIPE_BG_QUIET_MS` for the optimised ones only; `VK/VKR2Preload.cpp`, `port_r2pipe.h` `serial_policy`). Upstream's per-thread `m_cache_miss_flag` is `thread_local`. |
 +| `rpcs3/Emu/RSX/Common/texture_cache.h` (`upload_texture`) | Upstream fixes: `R2_TEX_UN3D_DEPTH` (default on, `0` = upstream). The unnormalized 3D/cubemap depth scale divides by the register depth instead of `attributes.depth`, which upstream still holds 0 at that point (infinite R scale). Same change as RPCS3 PR #19779 (unmerged); restores the R2 water ripples (RPCS3 issue #18250). |
 +| `rpcs3/Emu/RSX/RSXThread.cpp` (flip), `RSXZCULL.cpp/.h` (`clear`) | Upstream fixes: `R2_ZCULL_FLIP_CLEAR` A/B for RPCS3 issue #18148 (missing objects with an uncapped frame rate). Unset/`1` = upstream flip-time ZCULL clear; `keep` = drain unclaimed reports but keep the running query (`clear(..., discard_active=false)`); `0` = no flip clear (query leak risk). Opt-in only. |
 +| `RSXFIFO.cpp/.h`, `RSXOffload.cpp` | Renderer-thread round: `R2_FIFO_INLINE` (default on, `0` = upstream): `FIFO_control::fetch_u32_fast` inlines the cache-hit path of `fetch_u32` in `read_unsafe` and in `read`'s first-argument fetch; misses still call `fetch_u32`. `R2_DMA_INLINE_MAX=<bytes>` (default 65536, `0` = upstream 3584): `dma_manager::copy` copies inline up to this size instead of queueing to the Offloader (pushing into an empty queue costs a kernel wake). |
@@ -26687,10 +26687,10 @@ index 0000000..92d7162
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Preload.cpp b/rpcs3/Emu/RSX/VK/VKR2Preload.cpp
 new file mode 100644
-index 0000000..8f21341
+index 0000000..4fde84e
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Preload.cpp
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,598 @@
 +// R2PORT (GitHub issue #10): breadcrumb, quarantine and SEH guard of the shader preload (see port_r2preload.h).
 +
 +#include "Emu/RSX/port_r2preload.h"
@@ -27023,7 +27023,7 @@ index 0000000..8f21341
 +			std::printf("[r2rsx] pipelines: created one at a time (%s; PORT_PIPE_SERIAL=0 disables)\n",
 +				vendor_id == 0x1002 ? "AMD GPU" : "PORT_PIPE_SERIAL=1");
 +			if (g_policy.prio)
-+				std::printf("[r2rsx] pipelines: play-time pipelines go first, background (optimised / preload) ones wait %llu ms after "
++				std::printf("[r2rsx] pipelines: play-time pipelines go first, background ones (optimised, preload) wait for them; optimised ones also wait %llu ms after "
 +					"the last play-time one (PORT_PIPE_SERIAL_PRIO=0: one shared queue; PORT_PIPE_BG_QUIET_MS, PORT_PIPE_BG_MAX_DEFER_MS %llu)\n",
 +					static_cast<unsigned long long>(g_policy.quiet_ns / 1000000), static_cast<unsigned long long>(g_policy.max_defer_ns / 1000000));
 +			else
@@ -27183,10 +27183,11 @@ index 0000000..8f21341
 +			{
 +				// Optimised pipelines check the quiet period before they start (background_hold_us, so their compiler
 +				// thread keeps serving draw-blocking jobs) and here wait at most 100 ms of it: enough to keep them out of
-+				// the gaps between the render thread's library / link calls of a burst. Preload / replay threads wait
-+				// for all of it here.
++				// the gaps between the render thread's library / link calls of a burst. Preload / replay threads only
++				// yield to waiting creations: a preload link owns a null program-cache placeholder the render thread's
++				// draw skips on, so holding it back for the quiet period would drop geometry (serial_gate_quiet_ns).
 +				::r2pipe::serial_policy pol = g_policy;
-+				if (!t_name) pol.quiet_ns = std::min<uint64_t>(pol.quiet_ns, 100000000ull);
++				pol.quiet_ns = ::r2pipe::serial_gate_quiet_ns(g_policy, t_name != nullptr);
 +				for (;;)
 +				{
 +					const uint64_t until = ::r2pipe::serial_bg_wait_until(pol, g_gate_active, g_gate_fg_waiting, gate_now_ns(), g_gate_last_fg, t0);
@@ -52494,10 +52495,10 @@ index 0000000..6083c33
 +}
 diff --git a/rpcs3/Emu/RSX/port_r2pipe.h b/rpcs3/Emu/RSX/port_r2pipe.h
 new file mode 100644
-index 0000000..c18f7b8
+index 0000000..9e31d58
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/port_r2pipe.h
-@@ -0,0 +1,487 @@
+@@ -0,0 +1,496 @@
 +#pragma once
 +
 +// R2PORT pipeline-stutter work (pure logic, unit tested offline in scratch\enginetest via
@@ -52699,9 +52700,10 @@ index 0000000..c18f7b8
 +
 +	// How the serialised creations share the driver (only while pipe_serialize). Background creations (the optimised
 +	// pipelines swapped in after a GPL fast link, preload and Fossilize replay threads) wait while any other creation
-+	// waits for its turn, and do not start until the render thread made no play-time pipeline for bg_quiet_ms
-+	// (a burst of cache misses then fast-links without queuing behind 100-250 ms optimised compiles on AMD); after
-+	// bg_max_defer_ms a background creation starts anyway once nothing else waits.
++	// waits for its turn. Optimised pipelines also do not start until the render thread made no play-time pipeline
++	// for bg_quiet_ms (a burst of cache misses then fast-links without queuing behind 100-250 ms optimised compiles on
++	// AMD); after bg_max_defer_ms one starts anyway once nothing else waits. Preload / replay links skip the quiet
++	// period (serial_gate_quiet_ns): the draw that needs a pipeline being preloaded is skipped until it is linked.
 +	//  PORT_PIPE_SERIAL_PRIO=0: one plain lock for every creation (old rule, the render thread queues behind them)
 +	//  PORT_PIPE_BG_QUIET_MS (default 1000, 0 = no quiet period), PORT_PIPE_BG_MAX_DEFER_MS (default 10000)
 +	//  PORT_PIPE_SERIAL_MAX=N (default 1, [1, 16]): creations allowed at once (test only: >1 brings back the
@@ -52728,6 +52730,14 @@ index 0000000..c18f7b8
 +	inline bool serial_fg_may_start(const serial_policy& p, int active)
 +	{
 +		return active < p.max_active;
++	}
++
++	// Quiet period a background creation waits for inside the driver gate: none for preload / replay links (they own a
++	// program-cache placeholder whose draw is skipped meanwhile), at most 100 ms for optimised pipelines (their
++	// compiler thread checks the full period before it takes the job; this only keeps them out of a burst's gaps)
++	inline uint64_t serial_gate_quiet_ns(const serial_policy& p, bool preload_link)
++	{
++		return preload_link ? 0 : std::min<uint64_t>(p.quiet_ns, 100000000ull);
 +	}
 +
 +	// A background creation may start. last_fg_ns: when the render thread last finished a play-time creation (0 =

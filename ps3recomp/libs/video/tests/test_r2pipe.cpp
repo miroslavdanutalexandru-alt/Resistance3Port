@@ -340,6 +340,18 @@ static void test_preload_off_and_serial()
 		CHECK(r2pipe::serial_bg_wait_until(p, 0, 0, 50500 * ms, 50400 * ms, 40500 * ms) == 0);              // deferred long enough
 		CHECK(r2pipe::serial_bg_wait_until(p, 0, 1, 50500 * ms, 50400 * ms, 40500 * ms) == blocked);        // ...but never ahead of a waiter
 
+		// Preload / replay links (own a program-cache placeholder): no quiet period, they only yield to waiters
+		r2pipe::serial_policy pre = p;
+		pre.quiet_ns = r2pipe::serial_gate_quiet_ns(p, true);
+		CHECK(pre.quiet_ns == 0);
+		CHECK(r2pipe::serial_bg_wait_until(pre, 0, 0, 50000 * ms, 49999 * ms, 50000 * ms) == 0);
+		CHECK(r2pipe::serial_bg_wait_until(pre, 0, 1, 50000 * ms, 49999 * ms, 50000 * ms) == blocked);
+		// Optimised pipelines: at most 100 ms of it inside the gate
+		CHECK(r2pipe::serial_gate_quiet_ns(p, false) == 100 * ms);
+		r2pipe::serial_policy short_quiet = p;
+		short_quiet.quiet_ns = 30 * ms;
+		CHECK(r2pipe::serial_gate_quiet_ns(short_quiet, false) == 30 * ms);
+
 		_putenv("PORT_PIPE_SERIAL_PRIO=0");
 		_putenv("PORT_PIPE_SERIAL_MAX=99");
 		_putenv("PORT_PIPE_BG_QUIET_MS=0");
