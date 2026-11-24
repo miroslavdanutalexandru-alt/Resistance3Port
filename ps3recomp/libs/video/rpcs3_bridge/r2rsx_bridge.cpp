@@ -194,6 +194,14 @@ namespace
 			const int a = std::atoi(e);
 			if (a >= 0 && a <= 16) g_cfg.video.anisotropic_level_override.set(static_cast<u32>(a));
 		}
+		// RSX_ADAPTER: the Vulkan GPU by its exact name (as listed in logs\rpcs3_rsx.log, "Found Vulkan-compatible GPU"),
+		// over rpcs3_config.yml's Video/Vulkan/Adapter. Unset = the first discrete GPU. Lets a hybrid laptop run on the
+		// iGPU (AMD-only rendering bugs) without editing the yml.
+		if (const char* e = env("RSX_ADAPTER"))
+		{
+			g_cfg.video.vk.adapter.set(e);
+			std::printf("[r2rsx] Vulkan adapter: '%s' (RSX_ADAPTER)\n", e);
+		}
 		// FSR 3.1 / DLAA (RSX_FSR=1/2, VK/VKR2Upscaler.cpp) replace the game's 2x MSAA: it needs single-sample scene targets.
 		if (const char* e = env("RSX_FSR"); e && std::atoi(e) > 0)
 			g_cfg.video.antialiasing_level.set(msaa_level::none);
