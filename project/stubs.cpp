@@ -2986,26 +2986,17 @@ static int r3_gfx_number(uint32_t v, double& d)
 static std::atomic<int> s_r3_reticle{ -1 }, s_r3_hitmarker{ -1 };
 static int r3_env_on(const char* name) { const char* e = getenv(name); return !(e && (!strcmp(e, "0") || !_stricmp(e, "off"))); }
 /* Per HUD movie (split screen has two): want = the game's last explicit ShowReticule (1) / HideReticule (0),
- * hidden = we turned the reticle off. LRU table; an entry not seen for R3_HUD_STALE_MS forgets want
- * (the movie may have been destroyed and its address reused by a new HUD), so it is never force-shown.
- * Hiding is always safe, so turning the crosshair off works for unknown entries too. */
-struct R3HudEnt { uint32_t menu; uint8_t want, hidden; uint64_t seen; };
-enum { R3_HUD_SLOTS = 8, R3_HUD_STALE_MS = 5000, R3_HUD_TOGGLE_KEEP_MS = 120000 };
+ * hidden = we turned the reticle off. LRU table. hud.swf is loaded per level, so an entry from another level
+ * (r3_level_gen, r3_pcextra.cpp: +1 when another level's level_cached.psarc opens) is a destroyed movie whose
+ * address may be reused: it starts over (want unknown), so it is never force-shown. Pauses (game or port, any
+ * length) don't age entries. Hiding is always safe, so turning the crosshair off works for unknown entries too. */
+extern "C" int r3_level_gen(void);
+struct R3HudEnt { uint32_t menu; uint8_t want, hidden; int gen; uint64_t use; };
+enum { R3_HUD_SLOTS = 8 };
 static R3HudEnt s_r3_huds[R3_HUD_SLOTS];
+static uint64_t s_r3_hud_use;
 static std::mutex s_r3_hud_mu;
-static uint64_t r3_hud_now_ms()
-{
-    return (uint64_t)GetTickCount64();
-}
-extern "C" void r3_hud_reticle_set(int on)
-{
-    s_r3_reticle = on ? 1 : 0;
-    /* a live toggle (often from a pause menu, while the HUD gets no calls) keeps recently active HUDs fresh */
-    std::lock_guard<std::mutex> lk(s_r3_hud_mu);
-    const uint64_t now = r3_hud_now_ms();
-    for (auto& x : s_r3_huds)
-        if (x.menu && now - x.seen < R3_HUD_TOGGLE_KEEP_MS) x.seen = now;
-}
+extern "C" void r3_hud_reticle_set(int on) { s_r3_reticle = on ? 1 : 0; }
 extern "C" void r3_hud_hitmarker_set(int on) { s_r3_hitmarker = on ? 1 : 0; }
 static void r3_hud_reticle_filter(ppu_context* ctx)
 {
@@ -3020,18 +3011,19 @@ static void r3_hud_reticle_filter(ppu_context* ctx)
     const char* to = NULL;
     {
         std::lock_guard<std::mutex> lk(s_r3_hud_mu);
-        const uint64_t now = r3_hud_now_ms();
+        const int gen = r3_level_gen();
+        const uint64_t use = ++s_r3_hud_use;
         auto hud = [&]() -> R3HudEnt* {
             R3HudEnt* lru = NULL;
             for (auto& x : s_r3_huds) {
                 if (x.menu == menu) {
-                    if (now - x.seen > R3_HUD_STALE_MS) { x.want = 0; x.hidden = 0; }
-                    x.seen = now;
+                    if (x.gen != gen) { x.want = 0; x.hidden = 0; x.gen = gen; }
+                    x.use = use;
                     return &x;
                 }
-                if (!lru || (lru->menu && (!x.menu || x.seen < lru->seen))) lru = &x;
+                if (!lru || (lru->menu && (!x.menu || x.use < lru->use))) lru = &x;
             }
-            *lru = R3HudEnt{ menu, 0, 0, now };
+            *lru = R3HudEnt{ menu, 0, 0, gen, use };
             return lru;
         };
         if (!strcmp(n, "ShowReticule")) {
