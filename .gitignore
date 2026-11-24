@@ -68,6 +68,9 @@ logs_build_*.txt
 
 # Setup.exe is attached to the GitHub release, not committed
 /Setup.exe
+# Inno Setup's uninstaller, left in the folder by the installer
+/unins[0-9][0-9][0-9].dat
+/unins[0-9][0-9][0-9].exe
 # build tools Setup put into this folder (portable mode) and the list of what it installed
 /tools_cache/
 /scratch/RSXFIFOCommands*.pdf
