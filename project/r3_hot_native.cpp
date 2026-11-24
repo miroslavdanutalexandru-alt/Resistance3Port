@@ -36,7 +36,7 @@
 //   R3_HOT_NATIVE=0           all off: the lifted code runs, exactly as before
 //   R3_HOT_MEMCPY=0  R3_HOT_MEMSET=0  R3_HOT_STRCMP=0  R3_HOT_STRCPY=0
 //   R3_HOT_MEMCMP=0           one routine off (under R3_HOT_NATIVE=1)
-//   R3_HOT_LOG=0              no [hot] lines (default: one block every ~10 s)
+//   R3_HOT_LOG=1              one [hot] block every ~10 s (default 0: none)
 //   R3_HOT_SAMPLE=<n>         time 1 call in n per thread (default 4096): the
 //                             lifted body, then the native one on the same
 //                             inputs (every replacement is idempotent), and
@@ -212,7 +212,7 @@ int env_int(const char* n, int def)
 std::atomic<int> g_init{0};
 std::atomic<unsigned> g_on{0};   /* bit per routine; a sampled mismatch clears it */
 unsigned g_sample = 4096;
-int g_log = 1;
+int g_log = 0;
 
 struct Stat {
     std::atomic<long long> calls{0}, native{0}, bytes{0}, samples{0}, cyc_orig{0}, cyc_nat{0}, mismatch{0}, races{0};
@@ -238,7 +238,7 @@ void init_once()
         for (int i = 0; i < H_N; i++) if (env_int(k_env[i], 1)) on |= 1u << i;
     const int s = env_int("R3_HOT_SAMPLE", 4096);
     g_sample = s <= 0 ? 0 : (unsigned)s;
-    g_log = env_int("R3_HOT_LOG", 1);
+    g_log = env_int("R3_HOT_LOG", 0);
     LARGE_INTEGER f, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q);
     g_qpf = f.QuadPart; g_qpc0 = q.QuadPart; g_tsc0 = __rdtsc();
     g_next_log.store(GetTickCount64() + 10000);

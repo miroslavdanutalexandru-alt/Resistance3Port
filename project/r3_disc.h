@@ -11,7 +11,9 @@
  * R3_GEN_PPU_HASH (from recompiled/.eboot_ppu, which Setup writes after generating the game code; see
  * CMakeLists.txt) is the program this build's game code was generated from. Running it on another program would
  * run code that does not match the program's data, so that is an error too.
- * R3_SKIP_EBOOTCHECK=1 skips the dialogs (the [boot] line is still logged). */
+ * R3_SKIP_EBOOTCHECK=1 skips the dialogs (the [boot] line is still logged).
+ * The hash is cached in r3_eboot_hash.cache next to the exe, keyed by EBOOT.elf's size and modification time, so a
+ * normal start does not read and hash the whole program again. */
 #pragma once
 #include <stdio.h>
 #include <stdlib.h>
@@ -73,12 +75,43 @@ static inline unsigned char* r3_read_file_(const char* path, size_t* n)
     return b;
 }
 
+/* r3_ppu_hash of the file at elf_path, from r3_eboot_hash.cache when its size and modification time still match. */
+static void r3_eboot_hash_(const char* elf_path, char hash[41])
+{
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    char cache[MAX_PATH + 32] = "";
+    unsigned long long sz = 0, mt = 0;
+    if (GetFileAttributesExA(elf_path, GetFileExInfoStandard, &fa)) {
+        sz = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+        mt = ((unsigned long long)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime;
+        DWORD k = GetModuleFileNameA(NULL, cache, MAX_PATH);
+        char* sl = (k && k < MAX_PATH) ? strrchr(cache, '\\') : nullptr;
+        if (sl) strcpy(sl + 1, "r3_eboot_hash.cache"); else cache[0] = 0;
+    }
+    if (cache[0]) {
+        if (FILE* f = fopen(cache, "r")) {
+            unsigned long long csz = 0, cmt = 0; char h[41] = "";
+            const bool hit = fscanf(f, "%llu %llu %40s", &csz, &cmt, h) == 3 && csz == sz && cmt == mt && strlen(h) == 40;
+            fclose(f);
+            if (hit) { memcpy(hash, h, 41); return; }
+        }
+    }
+#endif
+    size_t n = 0;
+    if (unsigned char* d = r3_read_file_(elf_path, &n)) { r3_ppu_hash(d, n, hash); free(d); }
+#ifdef _WIN32
+    if (cache[0] && hash[0])
+        if (FILE* f = fopen(cache, "w")) { fprintf(f, "%llu %llu %s\n", sz, mt, hash); fclose(f); }
+#endif
+}
+
 /* Logs the disc and program; returns 1 to go on, 0 when the player chose to quit. */
 static int r3_disc_check(const char* elf_path, const char* sfo_path)
 {
     char hash[41] = "", title[32] = "", ver[16] = "";
     size_t n = 0;
-    if (unsigned char* d = r3_read_file_(elf_path, &n)) { r3_ppu_hash(d, n, hash); free(d); }
+    r3_eboot_hash_(elf_path, hash);
     if (unsigned char* s = r3_read_file_(sfo_path, &n)) {
         pcx_sfo_get(s, n, "TITLE_ID", title, sizeof title);
         pcx_sfo_get(s, n, "APP_VER", ver, sizeof ver);

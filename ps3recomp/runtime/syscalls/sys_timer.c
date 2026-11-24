@@ -348,6 +348,11 @@ static int ps3_usleep_watch_wait(void* ctx, uint64_t usec, int* early)
         if (!InterlockedExchange(&s->armed, 0)) WaitForSingleObject(s->ev, 0);
         InterlockedDecrement(&s_watch_n);
     }
+    /* [usleep-watch] 10 s statistics: opt-in, PS3_USLEEP_WATCH_LOG=1 (or R3_JOBWAIT_WHO=1) */
+    static int s_wst_log = -1;
+    if (s_wst_log < 0) { const char* e = getenv("PS3_USLEEP_WATCH_LOG"); const char* w = getenv("R3_JOBWAIT_WHO");
+                         s_wst_log = (e && *e && *e != '0') || (w && *w && *w != '0'); }
+    if (!s_wst_log) return 1;
     LARGE_INTEGER now, f; QueryPerformanceCounter(&now);
     if (now.QuadPart >= s_wst_next) {
         QueryPerformanceFrequency(&f);

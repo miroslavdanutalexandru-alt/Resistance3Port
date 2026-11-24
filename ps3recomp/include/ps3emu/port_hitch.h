@@ -1,9 +1,9 @@
 /*
- * ps3recomp - frame hitch logger (PORT_HITCH_LOG, default on; PORT_HITCH_LOG=0 turns it off).
+ * ps3recomp - frame hitch logger (PORT_HITCH_LOG, default off; PORT_HITCH_LOG=1 turns it on).
  *
  * Hot paths (game, RSX, render, mixer threads) add the time they spent in a few
  * known-blocking places to per-category accumulators: one rdtsc pair and one
- * interlocked add, no lock, no I/O. Once per game frame the frame limiter
+ * interlocked add, no lock, no I/O (off: one load and branch). Once per game frame the frame limiter
  * (project/stubs.cpp, r2_frame_period) calls port_hitch_frame(), which takes the
  * accumulators and prints a single [hitch] line for a frame over PORT_HITCH_MS
  * (default 25 ms, raised to 1.5x the last 5 s p50 unless PORT_HITCH_ADAPT=0; at most
@@ -57,16 +57,16 @@ typedef struct port_hitch_state {
     volatile long    cnt[PH_COUNT];   /* events since the last frame                    */
     volatile double  tsc_per_ns;      /* calibrated by port_hitch_frame (0: not yet)    */
     volatile unsigned long main_tid;  /* host thread id of the game's frame loop        */
-    volatile int     off;             /* PORT_HITCH_LOG=0                               */
+    volatile int     off;             /* 1 unless PORT_HITCH_LOG is set (non-zero)      */
     /* main thread only: guest waits (usleep / lwmutex / lwcond) by guest call site, QPC ticks */
     uint32_t         lr[PORT_HITCH_LR_SLOTS];
     int64_t          lr_qpc[PORT_HITCH_LR_SLOTS];
 } port_hitch_state;
 
 #ifdef __cplusplus
-__declspec(selectany) port_hitch_state g_port_hitch = {};
+__declspec(selectany) port_hitch_state g_port_hitch = { {}, {}, {}, 0.0, 0, 1 };
 #else
-__declspec(selectany) port_hitch_state g_port_hitch = { { 0 } };
+__declspec(selectany) port_hitch_state g_port_hitch = { { 0 }, { 0 }, { 0 }, 0.0, 0, 1 };
 #endif
 
 /* PORT_HITCH_RSX_SPLIT (default off; 1 = rsx::thread flip intervals over 25 ms, <ms> >= 5 = that threshold): a
@@ -94,7 +94,7 @@ static __inline uint64_t port_hitch_t0(void) { return __rdtsc(); }
 
 static __inline void port_hitch_add_ticks(int cat, int64_t d)
 {
-    if (d <= 0) return;
+    if (d <= 0 || g_port_hitch.off) return;
     _InterlockedExchangeAdd64((volatile long long*)&g_port_hitch.acc[cat], d);
     _InterlockedIncrement(&g_port_hitch.cnt[cat]);
     if (g_port_hsplit.on) {
@@ -115,6 +115,7 @@ static __inline void port_hitch_end(int cat, uint64_t t0)
  * gap starts a new wait (the event count). */
 static __inline void port_hitch_poll_step(int cat, uint64_t* last)
 {
+    if (g_port_hitch.off) return;
     const uint64_t now = __rdtsc();
     const double k = g_port_hitch.tsc_per_ns;
     const int64_t d = (int64_t)(now - *last);
@@ -138,6 +139,7 @@ static __inline void port_hitch_add_ns(int cat, uint64_t ns)
 /* Longest-interval categories (PH_RSX): keeps the max only. */
 static __inline void port_hitch_max_ticks(int cat, int64_t d)
 {
+    if (g_port_hitch.off) return;
     if (d > g_port_hitch.mx[cat]) g_port_hitch.mx[cat] = d;
     _InterlockedIncrement(&g_port_hitch.cnt[cat]);
 }
@@ -177,8 +179,8 @@ static __inline void port_hitch_guest_wait(uint32_t lr, int64_t qpc)
 }
 
 /* ------------------------------------------------------------------------- */
-/* rsx::thread CPU time by category (PORT_RSX_CPU_PROF, default 1 frame in 8; 1 = every frame;
- * N = 1 in N; 0 = off; also off with PORT_HITCH_LOG=0).
+/* rsx::thread CPU time by category, only with PORT_HITCH_LOG=1 (PORT_RSX_CPU_PROF: unset = 1 frame in 8;
+ * 1 = every frame; N = 1 in N; 0 = off).
  * Exclusive time: the thread is always in exactly one category. Scopes (port_rcpu_scope) switch the current one
  * and restore the previous on exit; everything outside a scope is RC_FIFO (command decode / method handlers,
  * which also holds the FIFO-empty and semaphore-acquire waits: the summary subtracts PH_FIFOIDLE and PH_LABEL
@@ -286,7 +288,8 @@ static __inline void port_rcpu_bind(void)
 #if defined(_M_X64) || defined(__x86_64__)
     const char* e = getenv("PORT_RSX_CPU_PROF");
     const char* h = getenv("PORT_HITCH_LOG");
-    if ((e && *e == '0') || (h && *h == '0')) return;
+    if (!(h && *h && *h != '0')) return;   /* needs PORT_HITCH_LOG=1: the split is printed by its 5 s summary */
+    if (e && *e == '0') return;            /* PORT_RSX_CPU_PROF=0: split off */
     const char* d = getenv("PORT_RSX_CPU_DETAIL");
     g_port_rcpu.detail = d && *d && *d != '0';
     /* unset: 1 frame in 8 (two rdtsc per scope cost ~0.4 ms per sampled frame at 2400 draws); 1: every frame;
@@ -745,7 +748,7 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
     if (!init) {
         init = 1;
         const char* e = getenv("PORT_HITCH_LOG");
-        on = !(e && *e == '0');
+        on = e && *e && *e != '0';
         g_port_hitch.off = !on;
         if (const char* m = getenv("PORT_HITCH_MS")) { const double v = atof(m); if (v >= 5.0) thr_ms = v; }
         if (const char* m = getenv("PORT_HITCH_LINES")) { const int v = atoi(m); lines_cap = v < 0 ? 0u : v > 1000 ? 1000u : (unsigned)v; }
@@ -757,7 +760,7 @@ extern "C" void port_hitch_frame(double target_fps, int discard)
         g_port_hitch.main_tid = GetCurrentThreadId();
         win.reserve(1024);
         if (on) fprintf(stderr, "[hitch] logger on: frames over %.0f ms (or 2x the %.1f fps target, or 1.5x the last 5 s p50) are listed "
-                                "with a breakdown, at most %u per 5 s; 5 s summary p50/p99/max (PORT_HITCH_LOG=0 off, PORT_HITCH_MS=<ms>, "
+                                "with a breakdown, at most %u per 5 s; 5 s summary p50/p99/max (PORT_HITCH_LOG=1 on, PORT_HITCH_MS=<ms>, "
                                 "PORT_HITCH_LINES=<n>, PORT_HITCH_ADAPT=0)\n", thr_ms, target_fps, lines_cap);
         ws = ps3_waitstat_self();
         g_port_hsplit.fn = on ? port_hitch_rsx_split : NULL;
