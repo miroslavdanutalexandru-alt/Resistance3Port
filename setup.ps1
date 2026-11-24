@@ -837,10 +837,14 @@ New-Item -ItemType Directory -Force -Path (Join-Path $Port 'game') | Out-Null
 $elf = Join-Path $Port 'game\EBOOT.elf'
 $srcRec = Join-Path $Port 'game\EBOOT.src'
 $binSha = Sha1Of (Join-Path $usr 'EBOOT.BIN')
+$UsBinSha1 = '43bad7101e8e54b1f37f65674affef59bfb2ff53'   # US 1.00 EBOOT.BIN (game_profile.psd1)
 $need = -not (Test-Path -LiteralPath $elf)
+$srcOk = $false   # game\EBOOT.src is (re)written only for an ELF known to come from this EBOOT.BIN
 if (-not $need) {
     if (Test-Path -LiteralPath $srcRec) { $need = "$(Get-Content -LiteralPath $srcRec -Raw)".Trim() -ne $binSha }
+    elseif ($binSha -ne $UsBinSha1) { $need = $true }   # the old US ELF, but the copy's EBOOT.BIN is another one now
     else { foreach ($n in $Sha1.Keys) { $p = Join-Path $Port "game\$n"; if (-not (Test-Path $p) -or (Sha1Of $p) -ne $Sha1[$n]) { $need = $true } } }
+    $srcOk = -not $need   # the record matched, or the US EBOOT.BIN and its US ELF
 }
 if ($need) {
     $kv = Join-Path $Port 'tools\key_vault.cpp'
@@ -851,6 +855,7 @@ if ($need) {
     }
     & $py tools\unself.py --keys $kv --out game "$usr\EBOOT.BIN" | Out-Host
     if ($LASTEXITCODE -ne 0) { Fail "Decrypting EBOOT.BIN failed." }
+    $srcOk = $true   # just decrypted from this EBOOT.BIN
 }
 $eb = Get-EbootInfo $elf
 $supported = 'the unpatched disc, version 1.00: US BCUS98176, or (experimental) Europe BCES01118'
@@ -860,7 +865,7 @@ if (-not $eb.Known) {
 if ($eb.Known.Status -eq 'update') {
     Fail "game\EBOOT.elf is the $($eb.Known.Region) game update $($eb.Known.Ver) ($($eb.Known.Id)), not the disc's program. The port supports $supported. Use the EBOOT.BIN from the disc (PS3_GAME\USRDIR), without updates."
 }
-[IO.File]::WriteAllText($srcRec, $binSha)
+if ($srcOk) { [IO.File]::WriteAllText($srcRec, $binSha) }
 if ($eb.Known.Id -ne $DiscId) { Info "Note: the program is from $($eb.Known.Id) but PARAM.SFO says $DiscId (a mixed copy?). Saves follow PARAM.SFO." }
 Info ("EBOOT.elf: OK ({0} v{1}, {2} disc{3}), PPU hash {4}" -f $eb.Known.Id, $eb.Known.Ver.TrimStart('0'), $eb.Known.Region,
       $(if ($eb.Known.Status -eq 'experimental') { ', EXPERIMENTAL: not yet tested on a real copy' } else { '' }), $eb.Hash)

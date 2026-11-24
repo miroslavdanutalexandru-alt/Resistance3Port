@@ -224,15 +224,20 @@ step "3/5  Decrypting the game program files"
 mkdir -p game
 # decrypted again when missing or made from another EBOOT.BIN (game/EBOOT.src: the SHA-1 of the one it came from)
 BIN_SHA1="$("$PY" tools/linux/port_linux.py hash sha1 "$GF/PS3_GAME/USRDIR/EBOOT.BIN")"
+US_BIN_SHA1=43bad7101e8e54b1f37f65674affef59bfb2ff53   # US 1.00 EBOOT.BIN (game_profile.psd1)
 need=''
+src_ok=''   # game/EBOOT.src is (re)written only for an ELF known to come from this EBOOT.BIN
 if [ -f game/EBOOT.src ]; then
     { [ -f game/EBOOT.elf ] && [ "$(cat game/EBOOT.src)" = "$BIN_SHA1" ]; } || need=1
+elif [ "$BIN_SHA1" != "$US_BIN_SHA1" ]; then
+    need=1   # an old US ELF, but the copy's EBOOT.BIN is another one now
 else
     for e in "${ELF_SHA1[@]}"; do
         n="${e%%=*}"; h="${e#*=}"
         { [ -f "game/$n" ] && [ "$("$PY" tools/linux/port_linux.py hash sha1 "game/$n")" = "$h" ]; } || need=1
     done
 fi
+[ -n "$need" ] || src_ok=1   # the record matched, or the US EBOOT.BIN and its US ELF
 if [ -n "$need" ]; then
     if [ ! -f tools/key_vault.cpp ]; then
         info "Fetching the PS3 application keys from RPCS3's public source code..."
@@ -241,10 +246,11 @@ if [ -n "$need" ]; then
     args=()
     for s in "${SELF_FILES[@]}"; do args+=("$GF/PS3_GAME/USRDIR/$s"); done
     "$PY" tools/unself.py --keys tools/key_vault.cpp --out game "${args[@]}" || fail "decrypting ${SELF_FILES[*]} failed."
+    src_ok=1   # just decrypted from this EBOOT.BIN
 fi
 EB_MSG="$("$PY" tools/linux/port_linux.py eboot-id "$PROFILE" game/EBOOT.elf)" || fail "$EB_MSG"
 EB_HASH="$("$PY" tools/linux/port_linux.py ppu-hash game/EBOOT.elf)"
-echo "$BIN_SHA1" > game/EBOOT.src
+[ -z "$src_ok" ] || echo "$BIN_SHA1" > game/EBOOT.src
 info "EBOOT.elf: $EB_MSG"
 
 # ---------------------------------------------------------------- 4. game code
