@@ -76,6 +76,9 @@ extern volatile unsigned long long g_r2_look_ms;             /* stubs.cpp: on-fo
 extern uint8_t* vm_base;
 void r2pf_toast(const char* title, const char* text, char badge);
 void r2pf_hint(const char* title, const char* text, unsigned ms);
+int r3_cheat_set(int which, int on);                         /* r3_cheats.cpp: new state, -1 bench / -2 online */
+void r3_cheats_init_env(void);
+extern volatile int g_r3_cheat_ammo;                         /* r3_cheats.cpp */
 int r2pf_overlay_get(void);
 void r2pf_overlay_set(int on);
 void r2rsx_prof_enable(int on);
@@ -752,6 +755,17 @@ static void live_mono(const std::string& v) { cellaudio_set_pc_mix(-1, v == "1")
 static void live_uiscale(const std::string& v) { posd_ui_scale_set(v.c_str()); }
 extern "C" void r2pf_overlay_graph_set(int on);                        /* r3_pcfeat.cpp */
 static void live_ovgraph(const std::string& v) { r2pf_overlay_graph_set(v != "0"); }
+/* cheats (r3_cheats.cpp): 0 God mode, 1 Infinite ammo, 2 Infinite grenades */
+static int s_cheat_keys = 0;
+static void cheat_row(int which, const std::string& v)
+{
+    const int on = r3_cheat_set(which, v == "1");
+    if (on < 0 && v == "1") r2pf_hint("Cheat", on == -2 ? "Cheats are off while online (PORT_ONLINE)" : "Cheats are off in a benchmark run", 2500);
+}
+static void live_cheat_god(const std::string& v) { cheat_row(0, v); }
+static void live_cheat_ammo(const std::string& v) { cheat_row(1, v); }
+static void live_cheat_gren(const std::string& v) { cheat_row(2, v); }
+static void live_cheat_keys(const std::string& v) { s_cheat_keys = v == "1"; }
 static void opt_add(const wchar_t* title, const wchar_t* help, const char* ini, const char* env, int restart,
                     std::vector<XChoice> ch, const char* def, void (*live)(const std::string&))
 {
@@ -881,6 +895,17 @@ static void opts_init(void)
               {L"200%", "200"} }, "", live_uiscale);
     opt_add(L"Frame-time graph", L"A graph of the last 120 frame times under the F3 performance overlay.", "ovgraph",
             "PORT_OVERLAY_GRAPH", 0, { {L"On", ""}, {L"Off", "0"} }, "", live_ovgraph);
+    /* cheats: single player only, never online / in a benchmark run; trophies off once one has been on */
+    r3_cheats_init_env();
+    const std::vector<XChoice> offon = { {L"Off", ""}, {L"On", "1"} };
+    opt_add(L"Cheat: God mode", L"Single-player cheat: your health stays full and enemies can't hurt you. Enemies are not affected. "
+            L"Trophies are off until the game is restarted.", "cheat_god", "PORT_CHEAT_GODMODE", 0, offon, "", live_cheat_god);
+    opt_add(L"Cheat: Infinite ammo", L"Single-player cheat: your weapons never run out. Trophies are off until the game is restarted.",
+            "cheat_ammo", "PORT_CHEAT_AMMO", 0, offon, "", live_cheat_ammo);
+    opt_add(L"Cheat: Infinite grenades", L"Single-player cheat: your grenade count never drops. Trophies are off until the game is restarted.",
+            "cheat_grenades", "PORT_CHEAT_GRENADES", 0, offon, "", live_cheat_gren);
+    opt_add(L"Cheat hotkeys", L"Ctrl+F1 toggles God mode, Ctrl+F2 Infinite ammo and grenades (not while F1 / F2 is bound in controls.txt).",
+            "cheat_keys", "PORT_CHEAT_KEYS", 0, offon, "", live_cheat_keys);
 }
 enum { PG_MAIN, PG_KEYS, PG_PAD };
 static int s_open = 0, s_page = PG_MAIN, s_sel = 0, s_top = 0, s_capture = 0, s_release = 0;
@@ -1369,6 +1394,52 @@ static void init_once(void)
 }
 static int s_want_pause = 0;
 extern "C" int r2x_want_pause(void) { return s_want_pause; }
+/* controls.txt binds this key to something (a game action, or a port key such as mouse_release_key):
+ * then Ctrl+<key> would press that too, so the cheat key is not used. */
+static bool cheat_key_bound(const char* key)
+{
+    std::vector<std::string> lines;
+    read_lines("controls.txt", lines);
+    for (std::string l : lines) {
+        const size_t h = l.find('#'); if (h != std::string::npos) l = l.substr(0, h);
+        const size_t eq = l.find('='); if (eq == std::string::npos) continue;
+        char k[64] = {}, v[64] = {};
+        if (sscanf(l.substr(0, eq).c_str(), " %63s", k) != 1) continue;
+        sscanf(l.substr(eq + 1).c_str(), " %63s", v);
+        const size_t kl = strlen(k);
+        if (!_stricmp(k, key) || (kl > 4 && !_stricmp(k + kl - 4, "_key") && !_stricmp(v, key))) return true;
+    }
+    return false;
+}
+/* the F9 row of a cheat follows a hotkey toggle (shown and saved like a menu change) */
+static void cheat_row_sync(const char* ini, int on)
+{
+    const int i = pcx_opt_find(ini);
+    if (i < 0) return;
+    XOpt& o = s_opts[i];
+    for (size_t k = 0; k < o.ch.size(); k++)
+        if (o.ch[k].value == (on ? "1" : "")) { o.sel = o.run = (int)k; ini_set(o.ini, o.ch[k].value); bat_set(o.env, o.ch[k].value); }
+}
+/* Ctrl+F1 God mode, Ctrl+F2 Infinite ammo and grenades (r3_cheats.cpp); only with the Cheat hotkeys row on */
+static void cheat_key(int which, const char* key)
+{
+    const char* name = which ? "Infinite ammo and grenades" : "God mode";
+    char t[128];
+    if (cheat_key_bound(key)) {
+        snprintf(t, sizeof t, "Ctrl+%s does nothing: %s is bound in controls.txt", key, key);
+        r2pf_hint("Cheat", t, 3500);
+        LOG("cheat: Ctrl+%s ignored, %s is bound in controls.txt", key, key);
+        return;
+    }
+    const int on = which ? r3_cheat_set(1, !g_r3_cheat_ammo) : r3_cheat_set(0, -1);
+    if (on < 0) { r2pf_hint("Cheat", on == -2 ? "Cheats are off while online (PORT_ONLINE)" : "Cheats are off in a benchmark run", 2500); return; }
+    if (which) r3_cheat_set(2, on);
+    if (which) { cheat_row_sync("cheat_ammo", on); cheat_row_sync("cheat_grenades", on); }
+    else cheat_row_sync("cheat_god", on);
+    snprintf(t, sizeof t, "%s %s (trophies off until you restart the game)", name, on ? "ON" : "OFF");
+    r2pf_hint("Cheat", t, 3500);
+    LOG("cheat: %s %s", name, on ? "on" : "off");
+}
 extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
 {
     HWND hwnd = (HWND)hwnd_;
@@ -1382,6 +1453,17 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
     { static int was = 0; const int d = focused && (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
       if (d && !was && !s_open && !other_prompt && !s_photo_on) r2x_open_menu();
       was = d; }
+    /* cheat hotkeys (opt-in): plain Ctrl (no Shift / Alt), not in photo mode, the port's menus or another
+       prompt (r3_cheats.cpp refuses in a benchmark run and online) */
+    { const int ctrl = focused && s_cheat_keys && (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0
+                       && !(GetAsyncKeyState(VK_SHIFT) & 0x8000) && !(GetAsyncKeyState(VK_MENU) & 0x8000);
+      static int was1 = 0, was2 = 0;
+      const int d1 = ctrl && (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+      const int d2 = ctrl && (GetAsyncKeyState(VK_F2) & 0x8000) != 0;
+      const int ok = !s_open && !s_release && !other_prompt && !s_photo_on;
+      if (d1 && !was1 && ok) cheat_key(0, "F1");
+      if (d2 && !was2 && ok) cheat_key(1, "F2");
+      was1 = d1; was2 = d2; }
     if (s_open) menu_tick(focused);
     else if (s_release) {                        /* hold the game's input until the closing key is let go */
         if (!(read_input(focused) & (IN_YES | IN_NO | IN_F10))) { s_release = 0; g_port_ui_modal = 0; }

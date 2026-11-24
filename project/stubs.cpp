@@ -1840,13 +1840,15 @@ static void r3ml_follow_game(uint32_t hero, uint32_t sp)
     ml_follow_axis(ml_rdf(slot + 0x1C), ml_rdf(sp + 0x220), &s_r3ml_sx, &cand[0], &run[0], "yaw");
     ml_follow_axis(ml_rdf(slot + 0x18), ml_rdf(sp + 0x224), &s_r3ml_sy, &cand[1], &run[1], "pitch");
 }
+extern "C" void r3_cheats_hero(uint32_t hero, int local);   /* r3_cheats.cpp */
 extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
 {
     (void)ctx;
     s_r3ml_hero = 0;
     if (hero) { g_r2_look_ms = GetTickCount64();   /* gameplay is running (PORT_MENU_FPS) */
                 r3_note_layout();
-                aim_assist_apply(hero, sp); }
+                aim_assist_apply(hero, sp);
+                r3_cheats_hero(hero, r3_hero_input(hero) != 0); }
     if (!g_ml_mode || !hero) return;
     r3ml_load();
     const int dbg = r3ml_dbg();

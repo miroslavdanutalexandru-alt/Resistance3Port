@@ -339,6 +339,8 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Interface & Notifications › Movies | Skip unwatched movies | **On**, Off | `R3_CUTSCENE_SKIP_ALL` (`0` = off: only movies already seen; needs Hold to skip movies) |
 | Interface & Notifications › Movies | Show cutscene skip hint | **Auto**, On, Off | `PORT_SKIP_HINT` (unset = Auto: shown when Skip unwatched movies is on, since every story movie can then be skipped; `1` = on; `0` = off; `R3_SKIP_HINT` also read) |
 | Advanced › Start-up | Skip intro movies | **On**, Off | `SKIP_INTRO` |
+| Advanced › Cheats (single player) | God mode / Infinite ammo / Infinite grenades | **Off**, On | `PORT_CHEAT_GODMODE`, `PORT_CHEAT_AMMO`, `PORT_CHEAT_GRENADES` (`1` = on; also F9 rows; never online (`PORT_ONLINE`) or in a benchmark run; trophies are off from the first use until the game is restarted) |
+| Advanced › Cheats (single player) | Cheat hotkeys | **Off**, On | `PORT_CHEAT_KEYS` (`1`: Ctrl+F1 toggles God mode, Ctrl+F2 Infinite ammo and grenades; ignored if that F key is bound in `controls.txt`) |
 | Advanced › Mods and textures | Mods folder | **Off**, On | `R2_MODS` (`1` / `<folder>`) |
 | Advanced › Mods and textures | Texture pack / Dump textures / HD UI pack | **Off**, On (Dump: also Menus / HUD only) | `RSX_TEXPACK`, `RSX_TEXDUMP` (`1` / `ui` / `<folder>`), `RSX_HD_UI` (`1` / `<folder>`) |
 | Advanced › Saves | Save location | **Game folder**, Saved Games\Resistance 3, a picked folder | `PS3_GAMEDATA_ROOT` |
