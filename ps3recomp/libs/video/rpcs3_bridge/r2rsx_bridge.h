@@ -38,6 +38,12 @@ uint32_t r2rsx_get_flip_status(void);               /* 0 = DONE */
 void r2rsx_set_flip_status(uint32_t status);
 uint64_t r2rsx_last_flip_time(void);
 uint64_t r2rsx_flips_executed(void);   /* UINT64_MAX when the RPCS3 renderer is not up */
+/* R3_OCC_NOWAIT catch-up fence (see r2rsx_bridge.cpp) */
+uint64_t r2rsx_occ_nw_arm(void);
+int r2rsx_occ_nw_passed(uint64_t seq0);
+void r2rsx_occ_nw_disarm(void);
+/* RSX_STALL_DIAG: 1 once per stall when may_report (GET unchanged for stall_ms, PUT elsewhere) with a one-line report in out; 0 otherwise / no renderer. */
+int r2rsx_stall_poll(unsigned stall_ms, int may_report, char* out, unsigned cap);
 uint64_t r2rsx_vblank_count(void);
 uint32_t r2rsx_current_display_buffer(void);
 

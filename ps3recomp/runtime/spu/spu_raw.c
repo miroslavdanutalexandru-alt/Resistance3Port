@@ -112,6 +112,20 @@ unsigned long spu_raw_host_tid(unsigned n)
 }
 #endif
 
+/* Resistance port (RSX_STALL_DIAG): one line about raw SPU n for a stall report. pc is where the
+ * lifted code last synced it (a channel wait or an indirect branch), not an exact sample. */
+int spu_raw_dbg_line(unsigned n, char* out, unsigned cap)
+{
+    if (!out || !cap) return 0;
+    if (n >= SPU_RAW_COUNT || !s_spu[n].used || !s_spu[n].ctx)
+        return snprintf(out, cap, "rawSPU%u not in use", n);
+    const spu_context* c = s_spu[n].ctx;
+    return snprintf(out, cap, "rawSPU%u %s img=%d pc=0x%05X lr=0x%05X status=0x%X stop=0x%X in-mbox %u out-mbox %u r3=0x%08X",
+                    n, s_spu[n].started ? "thread up" : "thread down", c->image_id, (unsigned)(c->pc & SPU_LS_MASK),
+                    (unsigned)(c->gpr[0]._u32[0] & SPU_LS_MASK), c->status, c->stop_code,
+                    c->ch_in_mbox.count, c->ch_out_mbox.count, c->gpr[3]._u32[0]);
+}
+
 /* Resistance port: a PPU stop request (RUNCNTL = 0) must actually stop the SPU.
  * It used to only flip the status word: the host thread kept running the old
  * program, so when the game reloads raw SPU 1's program on a death/checkpoint

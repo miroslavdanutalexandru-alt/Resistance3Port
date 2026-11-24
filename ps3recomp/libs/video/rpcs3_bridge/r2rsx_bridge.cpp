@@ -19,6 +19,8 @@
 #include "Emu/RSX/Core/RSXRendererFactory.h"
 #include "Emu/RSX/port_prof.h"
 #include "Emu/RSX/port_texdiag.h" // R2PORT: [texcache]
+#include "Emu/RSX/port_rsx_stall.h" // R3PORT: RSX_STALL_DIAG
+#include "Emu/RSX/gcm_printing.h"
 #include "../../../include/ps3emu/port_hitch.h" // R2PORT: [hitch] logger
 #include "util/logs.hpp"
 #include "util/fixed_typemap.hpp"
@@ -1458,6 +1460,34 @@ extern "C" uint32_t r2rsx_occ_spec_pending(void)
 	return n;
 }
 
+// PORT: R3_OCC_NOWAIT catch-up fence (RSXZCULL.h guest_wait_state nw_*), ported from R2. The guest answered occlusion
+// sets without consuming their reports; they can still land after the game zeroed and reused the slots. arm() asks
+// rsx::thread to report FIFO-idle passes and returns the pass count now (UINT64_MAX when the renderer is not up).
+// passed(seq0) = 1 once two idle passes followed (the second one saw every command the guest had put before arm()
+// executed, so every report issued before it is claimed) and every claim up to that pass is written; 0 not yet; -1 not up.
+extern "C" uint64_t r2rsx_occ_nw_arm(void)
+{
+	if (!s_up) return UINT64_MAX;
+	auto& gw = rsx::reports::g_guest_wait;
+	gw.nw_want.store(1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	return gw.nw_idle_seq.load(std::memory_order_acquire);
+}
+
+extern "C" int r2rsx_occ_nw_passed(uint64_t seq0)
+{
+	if (!s_up) return -1;
+	auto& gw = rsx::reports::g_guest_wait;
+	if (gw.nw_idle_seq.load(std::memory_order_acquire) < seq0 + 2) return 0;
+	const u64 need = gw.nw_idle_claims.load(std::memory_order_relaxed);
+	return gw.nw_done.load(std::memory_order_acquire) >= need ? 1 : 0;
+}
+
+extern "C" void r2rsx_occ_nw_disarm(void)
+{
+	if (s_up) rsx::reports::g_guest_wait.nw_want.store(0, std::memory_order_relaxed);
+}
+
 extern "C" uint32_t r2rsx_current_display_buffer(void)
 {
 	return s_up ? s_render->get_context()->current_display_buffer : 0;
@@ -1508,6 +1538,109 @@ extern "C" void r2rsx_set_zcull(uint32_t index, uint32_t offset, uint32_t width,
 	z.sRef = sRef;
 	z.sMask = sMask;
 	z.bound = bound != 0;
+}
+
+// R3PORT RSX_STALL_DIAG (ported from R2, report #153831: "GPU sit and spin timeout", GET fixed while PUT moved on).
+// Called every ~250 ms from the port's watchdog thread. Returns 1 once per logged stall (may_report = 0: paused or out
+// of reports) -- GET unchanged for stall_ms with PUT elsewhere -- with a one-line report in out: the puller's position
+// and state (parked on a jump-to-self / in a semaphore acquire), the decoded command at it and the words around it,
+// and the last semaphore and its value. Racy reads, never writes.
+namespace
+{
+	void r2_stall_decode(u32 cmd, std::string& o)
+	{
+		if (cmd == 0) { o += "NOP"; return; }
+		if ((cmd & 0xe0000003) == 0x20000000) { fmt::append(o, "JUMP(old) -> 0x%x", cmd & 0x1ffffffc); return; }
+		if ((cmd & 3) == 1) { fmt::append(o, "JUMP -> 0x%x", cmd & ~3u); return; }
+		if ((cmd & 3) == 2) { fmt::append(o, "CALL -> 0x%x", cmd & ~3u); return; }
+		if ((cmd & 0xffff0003) == 0x00020000) { o += "RET"; return; }
+		const u32 reg = cmd & 0xfffc;
+		const u32 count = (cmd >> 18) & 0x7ff;
+		std::string tmp;
+		const auto [prefix, name] = rsx::get_method_name(reg >> 2, tmp);
+		fmt::append(o, "%s%s 0x%04x x%u%s", prefix.empty() ? tmp : std::string(prefix), std::string(name), reg, count, (cmd & 0x40000000) ? " non-inc" : "");
+	}
+
+	bool r2_stall_read_io(u32 io, u32& v)
+	{
+		const u32 ea = s_render->iomap_table.get_addr(io);
+		if (ea == umax) return false;
+		v = vm::_ref<be_t<u32>>(ea);
+		return true;
+	}
+}
+
+extern "C" int r2rsx_stall_poll(unsigned stall_ms, int may_report, char* out, unsigned cap)
+{
+	static u32 s_get = umax;
+	static u64 s_since = 0;
+	static bool s_told = false;
+	if (!s_up || !s_render->ctrl || !s_render->fifo_ctrl || !out || cap < 2) return 0;
+	const u32 get = s_render->ctrl->get;
+	const u32 put = s_render->ctrl->put;
+	const u64 now = GetTickCount64();
+	if (get != s_get || get == put)
+	{
+		if (s_told && get != s_get) std::fprintf(stderr, "[rsx-stall] GET moves again (0x%x -> 0x%x) after %.1f s\n", s_get, get, (now - s_since) / 1000.0);
+		s_get = get; s_since = now; s_told = false;
+		return 0;
+	}
+	if (s_told || now - s_since < stall_ms) return 0;
+	if (!may_report)
+	{
+		// paused or out of reports: not logged, so no "moves again" either; a stall still there afterwards counts from now
+		s_since = now;
+		return 0;
+	}
+	s_told = true;
+
+	auto* f = s_render->fifo_ctrl.get();
+	const u32 pos = f->get_pos();
+	std::string o;
+	fmt::append(o, "[rsx-stall] GET 0x%x unchanged for %.1f s, PUT 0x%x, REF 0x%x | puller at 0x%x, last word 0x%08x (", get, (now - s_since) / 1000.0,
+		put, static_cast<u32>(s_render->ctrl->ref), pos, f->last_cmd());
+	r2_stall_decode(f->last_cmd(), o);
+	o += ")";
+	if (const u32 mw = f->r2_memwatch_addr())
+	{
+		u32 w = 0;
+		const bool ok = r2_stall_read_io(mw, w);
+		fmt::append(o, " | parked on a jump-to-self at 0x%x (word 0x%08x, now %s)", mw, f->r2_memwatch_cmp(),
+			!ok ? "unmapped" : w == f->r2_memwatch_cmp() ? "unchanged: waits for the guest to patch it" : fmt::format("0x%08x", w).c_str());
+	}
+	if (const u64 since = port_rsx_stall::sem_since.load(std::memory_order_acquire))
+	{
+		const u32 a = port_rsx_stall::sem_addr.load(std::memory_order_relaxed);
+		fmt::append(o, " | in a semaphore acquire at 0x%x for %llu ms: wants 0x%08x, holds 0x%08x", a,
+			static_cast<unsigned long long>((get_system_time() - since) / 1000), port_rsx_stall::sem_arg.load(std::memory_order_relaxed),
+			static_cast<u32>(vm::_ref<be_t<u32>>(a)));
+	}
+	else
+	{
+		o += " | not in a semaphore acquire";
+	}
+	if (const u32 la = s_render->last_sema_addr)
+	{
+		fmt::append(o, " | last acquire 0x%x at io 0x%x, holds 0x%08x", la, s_render->last_sema_cmd, static_cast<u32>(vm::_ref<be_t<u32>>(la)));
+	}
+	fmt::append(o, " | %llu acquire timeouts, cache 0x%x+%u, deferred labels %s", static_cast<unsigned long long>(port_rsx_stall::sem_tdr_n.load()),
+		f->r2_cache_addr(), f->r2_cache_size(), s_render->r2_has_deferred_labels() ? "yes" : "none");
+	// the words at GET and at the puller (they differ when GET is a published cache end)
+	for (const u32 at : {get, pos})
+	{
+		fmt::append(o, " | words at %s 0x%x:", at == get ? "GET" : "puller", at);
+		for (u32 i = 0; i < 8; i++)
+		{
+			u32 w = 0;
+			if (!r2_stall_read_io(at + i * 4, w)) { o += " (unmapped)"; break; }
+			fmt::append(o, " %08x", w);
+		}
+		u32 w0 = 0;
+		if (r2_stall_read_io(at, w0)) { o += " = "; r2_stall_decode(w0, o); }
+		if (pos == get) break;
+	}
+	std::snprintf(out, cap, "%s", o.c_str());
+	return 1;
 }
 
 extern "C" void r2rsx_wait_get(uint32_t put, unsigned max_ms)

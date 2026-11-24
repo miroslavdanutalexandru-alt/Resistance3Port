@@ -1795,12 +1795,44 @@ extern "C" volatile unsigned long long g_pad_release_until;   /* cellPad.c */
 extern "C" volatile long g_pad_getdata_n;                      /* cellPad.c */
 extern "C" volatile long g_fs_guest_reads;                     /* ppu_fs.cpp */
 static void noflip_file_only(const char* s) { if (s_dbg_out) fputs(s, s_dbg_out); }
+/* RSX_STALL_DIAG_MS=<ms> (default 3000; 0 = off; ported from R2): polled from the noflip watchdog thread. When the
+ * RSX's GET has not moved for that long while PUT is elsewhere (R2 report #153831: the game's "GPU sit and spin
+ * timeout"), say once per stall in run.log what the puller sits on -- decoded command at GET, a jump-to-self park or
+ * a semaphore acquire with the label's value -- and the raw SPUs' state. At most 8 reports, none while paused. */
+extern "C" int r2rsx_stall_poll(unsigned stall_ms, int may_report, char* out, unsigned cap);   /* rpcs3_bridge */
+extern "C" int spu_raw_dbg_line(unsigned n, char* out, unsigned cap);                         /* spu_raw.c */
+static char s_rsx_stall_last[2048];
+static void rsx_stall_raw_spus(void (*out)(const char*))
+{
+    char l[256];
+    for (unsigned n = 0; n < 2; n++) {
+        char s[200];
+        spu_raw_dbg_line(n, s, sizeof s);
+        snprintf(l, sizeof l, "[rsx-stall] %s%c", s, 10);
+        out(l);
+    }
+}
+static void rsx_stall_err(const char* s) { fputs(s, stderr); }
+static void rsx_stall_poll_once(unsigned stall_ms)
+{
+    static unsigned reports = 0;
+    char buf[2048];
+    /* only a logged stall is used up and gets a "GET moves again" line, so both stay within the cap */
+    if (!stall_ms || !r2rsx_stall_poll(stall_ms, !g_r2pc_paused && reports < 8, buf, sizeof buf)) return;
+    reports++;
+    snprintf(s_rsx_stall_last, sizeof s_rsx_stall_last, "%s", buf);
+    fprintf(stderr, "%s (RSX_STALL_DIAG_MS=0 off)%c", buf, 10);
+    rsx_stall_raw_spus(rsx_stall_err);
+    fflush(stderr);
+}
 static DWORD WINAPI noflip_watchdog(LPVOID)
 {
     static const unsigned secs = [] { const char* e = getenv("PORT_NOFLIP_WATCHDOG"); return (e && *e) ? (unsigned)atoi(e) : 5u; }();
     static const unsigned nudge_ms = [] { const char* e = getenv("PORT_NOFLIP_NUDGE"); const int v = (e && *e) ? atoi(e) : 500;
                                           return v <= 0 ? 0u : (unsigned)(v > 5000 ? 5000 : v); }();
-    if (!secs) return 0;
+    static const unsigned stall_ms = [] { const char* e = getenv("RSX_STALL_DIAG_MS"); const int v = (e && *e) ? atoi(e) : 3000;
+                                          return v <= 0 ? 0u : (unsigned)(v < 500 ? 500 : v); }();
+    if (!secs && !stall_ms) return 0;
     diag_thread_register();
     SetThreadDescription(GetCurrentThread(), L"noflip watchdog");
     HMODULE self = NULL;
@@ -1813,6 +1845,8 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
     int reported = 0;
     for (;;) {
         Sleep(250);
+        rsx_stall_poll_once(stall_ms);
+        if (!secs) continue;
         const unsigned f = cellGcm_flip_request_count();
         const ULONGLONG now = GetTickCount64();
         if (f != last || f < 200 || g_r2pc_paused) {
@@ -1879,6 +1913,8 @@ static DWORD WINAPI noflip_watchdog(LPVOID)
             s_dbg_file_only = 1;
             dump_threads("noflip #2 (1 s later)", self);
             spu_dbg_dump_all(noflip_file_only);
+            rsx_stall_raw_spus(noflip_file_only);
+            if (s_rsx_stall_last[0]) { noflip_file_only("last RSX stall report:\n"); noflip_file_only(s_rsx_stall_last); noflip_file_only("\n"); }
             s_dbg_file_only = 0;
             fclose(s_dbg_out); s_dbg_out = NULL;
             dumps++;

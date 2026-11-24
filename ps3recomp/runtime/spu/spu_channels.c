@@ -5122,13 +5122,36 @@ static void spu_indirect_branch_full(spu_context* ctx)
                       if (InterlockedIncrement(&nn) <= 8)
                           fprintf(stderr, "[jobmod-unlifted] pc=0x%05X: no C0DEC0DE header below\n", jpc);
                   } }
+                /* SPU_UNLIFTED_SCOPED (default 1, ported from R2 6673bc5): a
+                 * lifted caller reached this code through a call (r0 = its
+                 * return point), so interpret only the callee and hand back
+                 * when it returns there with the caller's stack pointer; the
+                 * lifted caller's drain then resumes compiled code. Without it
+                 * the whole rest of the job runs interpreted (R2's "mesh" job:
+                 * 33-143 ms per run). 0 = old behaviour. */
+                static int s_scoped = -1;
+                if (s_scoped < 0) { const char* e = getenv("SPU_UNLIFTED_SCOPED"); s_scoped = e ? atoi(e) : 1; }
+                const uint32_t ulr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                const int scoped = s_scoped && ulr != jpc && ulr >= 0x4000u && ulr < 0x3E000u;
                 uji_busy = 1;
-                g_spu_interp_norejoin = 1; g_spu_interp_stop_sp = 0xFFFFFFFFu; g_spu_interp_maxsteps = 0;
+                g_spu_interp_norejoin = 1; g_spu_interp_stop_sp = scoped ? ctx->gpr[1]._u32[0] : 0xFFFFFFFFu;
+                g_spu_interp_maxsteps = 0;
                 g_spu_interp_nowall = 1; g_spu_interp_jobonly = 1;
-                const uint32_t uji_lr = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+                const uint32_t uji_lr = ulr;
                 const uint32_t uji_drain_ret = ctx->drain_ret_pc & SPU_LS_MASK;
-                spu_interp_run_until(ctx, jpc, 0);
+                const uint32_t ures = spu_interp_run_until(ctx, jpc, scoped ? ulr : 0);
+                if (scoped) {
+                    static volatile LONG n_sc = 0, n_ret = 0;
+                    const LONG sc_n = InterlockedIncrement(&n_sc);
+                    const int back = (ures & SPU_LS_MASK) == ulr;
+                    const LONG ret_n = back ? InterlockedIncrement(&n_ret) : n_ret;
+                    if (sc_n <= 8 || (sc_n & (sc_n - 1)) == 0)
+                        fprintf(stderr, "[spu] unlifted call 0x%05X %s (lr=0x%05X, scoped #%ld, %ld returned to lifted caller)\n",
+                                jpc, back ? "returned to lifted caller" : "left via job manager",
+                                ulr, (long)sc_n, (long)ret_n);
+                }
                 g_spu_interp_norejoin = 0; g_spu_interp_nowall = 0; g_spu_interp_jobonly = 0;
+                g_spu_interp_stop_sp = 0xFFFFFFFFu;   /* as the unscoped path left it */
                 uji_busy = 0;
                 /* Resistance 3: job 403 (igjob_00D7A480) calls a callback from
                  * its table at LS 0x14C2C + 4*state (bisl at 0xF8F0, r3 = 0x14C60)
