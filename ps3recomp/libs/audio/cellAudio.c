@@ -2012,8 +2012,8 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 if (tempo < s_ah.tempo_min) s_ah.tempo_min = tempo;
             }
             s_ah.ticks++;
-            /* [audio] health, always on (PORT_AUDIO_LOG=0 off): every 10 s
-             * when anything went wrong, else once a minute */
+            /* [audio] health (fallback path): at most every 10 s, when anything went wrong
+             * (PORT_AUDIO_UNDERRUN_LOG=0 off, =1 every 10 s); with PORT_AUDIO_LOG also once a minute */
             { const ULONGLONG tn = GetTickCount64();
               if (tn - ah_t0 >= 10000) {
                   const int bad = s_ah.concealed || s_ah.reprimes || s_ah.dev_dry || s_ah.resyncs ||
@@ -2021,7 +2021,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                   const int was_suspended = wait_suspended;
                   /* the wait is only worth its slip if it catches blocks */
                   wait_suspended = !was_suspended && s_ah.waits >= 100 && s_ah.caught * 10 < s_ah.waits;
-                  if (health_log && !ao && (bad || tn - ah_quiet0 >= 60000)) {
+                  if (!ao && ulog_on && (bad || ulog_on == 2 || (health_log && tn - ah_quiet0 >= 60000))) {
                       fprintf(stderr, "[audio] underruns %u in last 10 s (device dry %u, buffer refilled %u) | "
                               "guest blocks late: %u concealed, %u rescued | waits %u (caught %u, gave up %u, slip %.0f ms)%s | "
                               "stretched %.0f%% of the time (min tempo %.2f) | host buffer avg %.0f ms, min %.0f ms (target %u) | "

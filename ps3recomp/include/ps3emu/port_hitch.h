@@ -179,8 +179,8 @@ static __inline void port_hitch_guest_wait(uint32_t lr, int64_t qpc)
 }
 
 /* ------------------------------------------------------------------------- */
-/* rsx::thread CPU time by category (PORT_RSX_CPU_PROF, default off; on with PORT_HITCH_LOG=1
- * (1 frame in 8) or PORT_RSX_CPU_PROF=1 (every frame) / N (1 in N)).
+/* rsx::thread CPU time by category, only with PORT_HITCH_LOG=1 (PORT_RSX_CPU_PROF: unset = 1 frame in 8;
+ * 1 = every frame; N = 1 in N; 0 = off).
  * Exclusive time: the thread is always in exactly one category. Scopes (port_rcpu_scope) switch the current one
  * and restore the previous on exit; everything outside a scope is RC_FIFO (command decode / method handlers,
  * which also holds the FIFO-empty and semaphore-acquire waits: the summary subtracts PH_FIFOIDLE and PH_LABEL
@@ -288,7 +288,8 @@ static __inline void port_rcpu_bind(void)
 #if defined(_M_X64) || defined(__x86_64__)
     const char* e = getenv("PORT_RSX_CPU_PROF");
     const char* h = getenv("PORT_HITCH_LOG");
-    if (!(e && *e && *e != '0') && !(h && *h && *h != '0')) return;   /* opt-in */
+    if (!(h && *h && *h != '0')) return;   /* needs PORT_HITCH_LOG=1: the split is printed by its 5 s summary */
+    if (e && *e == '0') return;            /* PORT_RSX_CPU_PROF=0: split off */
     const char* d = getenv("PORT_RSX_CPU_DETAIL");
     g_port_rcpu.detail = d && *d && *d != '0';
     /* unset: 1 frame in 8 (two rdtsc per scope cost ~0.4 ms per sampled frame at 2400 draws); 1: every frame;
