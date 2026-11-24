@@ -24,6 +24,7 @@ Usage:
 import argparse, glob, hashlib, json, os, struct, subprocess, sys
 sys.path.insert(0, os.path.dirname(__file__))
 from wrap_spu_elf import wrap
+import spu_code_ptrs
 
 ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 LIFTER = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ps3recomp', 'tools', 'spu_lifter.py')
@@ -133,6 +134,9 @@ def switch_table_targets(raw, base=BASE):
 
 
 
+CODE_PTRS_REPORT = []
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -222,6 +226,23 @@ def main():
         # indirect-call/branch targets that static discovery cannot see.
         obs = [a for a in observed.get(sha, {}).get("%X" % BASE, []) if BASE + 0x30 <= a < BASE + len(raw)]
         inside = sorted(set(inside), key=lambda a: int(a, 0))
+        # Code pointers (tools/spu_code_ptrs.py; SPU_LIFT_CODE_PTRS=0 disables):
+        # functions named only by an address in data (.ctors lists, pointer
+        # tables) or built with ila/il/ilhu+iohl and called through bisl/bi.
+        # Without an entry the call ran in the SPU interpreter (R2 mesh job:
+        # its empty static constructor at LS 0x49D8, 33-143 ms per run).
+        # Inside a function they only split it (observed entries, no new merge
+        # group); targets in gaps become --gap-funcs up to the end of their code.
+        cp_gaps = []
+        if spu_code_ptrs.enabled():
+            cp = spu_code_ptrs.discover_elf(elf, base=BASE, lo=BASE + 0x30, hi=CODE_END.get(name))
+            seeded = {int(a, 0) for a in inside} | set(obs)
+            obs = sorted(set(obs) | set(cp["observed"]))
+            cp_gaps = [g for g in cp["gap_runs"] if g[0] not in seeded]   # already --extra-funcs seeds
+            new = [a for a in cp["new"] if a not in seeded]
+            if new:
+                print(f"  {name}: code-ptrs +{len(new)} entries: " + ",".join("0x%X" % a for a in new))
+                CODE_PTRS_REPORT.extend("%s 0x%X" % (name, a) for a in new)
         if inside:
             cmd += ["--extra-funcs", ",".join(inside)]
         if args.full:
@@ -236,13 +257,22 @@ def main():
             fd = os.path.join(OUTDIR, "_full"); os.makedirs(fd, exist_ok=True)
             lst = os.path.join(fd, name + ".obs.txt"); open(lst, "w").write(",".join(hex(a) for a in allobs))
             cmd += ["--observed-entries", "@" + lst]
-            if fr["gaps"]:
-                gl = os.path.join(fd, name + ".gaps.txt"); open(gl, "w").write(",".join("%X:%X" % g for g in fr["gaps"]))
+            if cp_gaps and fr["gaps"]:
+                # end code-pointer gap runs at the sweep's gap functions too
+                stops = [g0 for g0, _ in fr["gaps"]]
+                cp2 = spu_code_ptrs.discover_elf(elf, base=BASE, lo=BASE + 0x30, hi=CODE_END.get(name), stops=stops)
+                cp_gaps = [g for g in cp2["gap_runs"] if g[0] not in seeded]
+            gaps = sorted(set(fr["gaps"]) | set(cp_gaps))
+            if gaps:
+                gl = os.path.join(fd, name + ".gaps.txt"); open(gl, "w").write(spu_code_ptrs.gap_arg(gaps))
                 cmd += ["--gap-funcs", "@" + gl]
             st = fr["stats"]
             print(f"  {name}: full +{st['new_splits']} entries, +{st['gaps']} gap funcs (0x{st['gap_bytes']:X} bytes)")
-        elif obs:
-            cmd += ["--observed-entries", ",".join(hex(a) for a in obs)]
+        else:
+            if obs:
+                cmd += ["--observed-entries", ",".join(hex(a) for a in obs)]
+            if cp_gaps:
+                cmd += ["--gap-funcs", spu_code_ptrs.gap_arg(cp_gaps)]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             print(f"  FAIL {name}\n{r.stderr}", file=sys.stderr)
@@ -265,6 +295,10 @@ def main():
 
     if os.path.exists(tmp_elf):
         os.remove(tmp_elf)
+    with open(os.path.join(OUTDIR, "jobmods_code_ptrs.txt"), "w") as f:
+        f.write("".join(x + "\n" for x in CODE_PTRS_REPORT))
+    print(f"code-ptrs: {len(CODE_PTRS_REPORT)} entry point(s) beyond function detection"
+          + ("" if spu_code_ptrs.enabled() else " (SPU_LIFT_CODE_PTRS=0)"))
     with open(os.path.join(OUTDIR, "jobmods_manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
     emit_register(manifest, register_c, args.symbol_prefix)

@@ -136,15 +136,29 @@ def lift_cmd(tk, pe, out, n, base, entry_extra=(), lo=None, hi=None, pic=False, 
     if pic: cmd.append('--pic')
     if hi: cmd += ['--code-end', hex(hi)]
     if entry_extra: cmd += ['--extra-funcs', ','.join(hex(a) for a in sorted(set(entry_extra)))]
+    observed, gaps = set(), set()
     if FULL:
         from spu_full_entries import discover_elf
         r = discover_elf(open(pe, 'rb').read(), base=base, lo=lo, hi=hi, rel=rel, extra=list(entry_extra))
-        if r['observed']:
-            f = pe + '.observed.txt'; open(f, 'w').write(','.join(hex(a) for a in sorted(r['observed'])))
-            cmd += ['--observed-entries', '@' + f]
-        if r['gaps']:
-            f = pe + '.gaps.txt'; open(f, 'w').write(','.join('%X:%X' % g for g in r['gaps']))
-            cmd += ['--gap-funcs', '@' + f]
+        observed |= set(r['observed']); gaps |= set(r['gaps'])
+    # Code pointers (tools/spu_code_ptrs.py; SPU_LIFT_CODE_PTRS=0 disables):
+    # functions named only by an address in data (.ctors lists, pointer tables)
+    # or an ila/il/ilhu+iohl immediate called through bisl/bi. The --full gap
+    # sweep needs 3+ instructions and an anchor, so tiny stubs slip through it.
+    import spu_code_ptrs
+    if spu_code_ptrs.enabled():
+        cp = spu_code_ptrs.discover_elf(open(pe, 'rb').read(), base=base, lo=lo, hi=hi,
+                                        stops=[g0 for g0, _ in gaps])   # don't run over --full gap funcs
+        new = sorted(a for a in cp['new'] if a not in observed and a not in entry_extra and not any(s0 <= a < e0 for s0, e0 in gaps))
+        observed |= set(cp['observed']); gaps |= set(cp['gap_runs'])
+        if new:
+            open(pe + '.codeptrs.txt', 'w').write(','.join(hex(a) for a in new))
+    if observed:
+        f = pe + '.observed.txt'; open(f, 'w').write(','.join(hex(a) for a in sorted(observed)))
+        cmd += ['--observed-entries', '@' + f]
+    if gaps:
+        f = pe + '.gaps.txt'; open(f, 'w').write(','.join('%X:%X' % g for g in sorted(gaps)))
+        cmd += ['--gap-funcs', '@' + f]
     return cmd
 
 
@@ -320,6 +334,12 @@ def spu(port, tk, eboot, work, spudir=None):
             if i % 25 == 0: print('  [%d/%d] %s' % (i + 1, len(jobs), nm), flush=True)
             progress('spu_lift', i + 1, len(jobs))
     spans = {nm: code_span(pe, base, size) for nm, _, pe, base, size in jobs if size}
+    cpr = []
+    for nm, _, pe, _, _ in jobs:
+        if os.path.exists(pe + '.codeptrs.txt'):
+            cpr += ['%s %s' % (nm, a) for a in open(pe + '.codeptrs.txt').read().split(',')]
+    open(os.path.join(work, 'code_ptrs_report.txt'), 'w').write(''.join(x + '\n' for x in cpr))
+    print('[spu] code-ptrs: %d entry point(s) beyond function detection' % len(cpr), flush=True)
     for lst in (igjobs, igpics, wwspics):
         for x in lst: x[2] = spans[x[0]]
     IGKERNEL['span'] = spans['igkernel']
