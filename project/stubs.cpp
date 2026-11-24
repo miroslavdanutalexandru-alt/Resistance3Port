@@ -2975,8 +2975,88 @@ static int r3_gfx_number(uint32_t v, double& d)
     if (r3_gfx_string(v, s)) { d = atof(s.c_str()); return 1; }
     return 0;
 }
+/* Resistance 3 port: hide the game's own crosshair (R3_RETICLE=0) and hit markers (R3_HITMARKER=0).
+ * hud.swf draws both: hud.Reticule (four lines ret_0..3 around the centre, plus a centre dot with
+ * PlayStation Move) shown by ShowReticule(instant), hidden by HideReticule(instant) and placed /
+ * tinted every frame by SetReticule(radius, type); SetReticuleHit(kill) attaches the reticule_hit
+ * marker. The game calls them through the GFx invoke (func_0032D788), so the method name is swapped
+ * there: ShowReticule -> HideReticule while the crosshair is off (the game's own show / hide state is
+ * kept, so turning it back on shows it again at the next SetReticule), SetReticuleHit -> ResetReticule
+ * (an empty function in hud.swf). Weapon scopes (hud_*.swf) are separate and stay. */
+static std::atomic<int> s_r3_reticle{ -1 }, s_r3_hitmarker{ -1 };
+static int r3_env_on(const char* name) { const char* e = getenv(name); return !(e && (!strcmp(e, "0") || !_stricmp(e, "off"))); }
+/* Per HUD movie (split screen has two): want = the game's last explicit ShowReticule (1) / HideReticule (0),
+ * hidden = we turned the reticle off. LRU table. hud.swf is loaded per level, so an entry from another level
+ * (r3_level_gen, r3_pcextra.cpp: +1 when another level's level_cached.psarc opens) is a destroyed movie whose
+ * address may be reused: it starts over (want unknown), so it is never force-shown. Pauses (game or port, any
+ * length) don't age entries. Hiding is always safe, so turning the crosshair off works for unknown entries too. */
+extern "C" int r3_level_gen(void);
+struct R3HudEnt { uint32_t menu; uint8_t want, hidden; int gen; uint64_t use; };
+enum { R3_HUD_SLOTS = 8 };
+static R3HudEnt s_r3_huds[R3_HUD_SLOTS];
+static uint64_t s_r3_hud_use;
+static std::mutex s_r3_hud_mu;
+extern "C" void r3_hud_reticle_set(int on) { s_r3_reticle = on ? 1 : 0; }
+extern "C" void r3_hud_hitmarker_set(int on) { s_r3_hitmarker = on ? 1 : 0; }
+static void r3_hud_reticle_filter(ppu_context* ctx)
+{
+    const uint32_t name = (uint32_t)ctx->gpr[4], menu = (uint32_t)ctx->gpr[3];
+    if (!vm_base || !name || name >= 0xF0000000u) return;
+    const char* n = (const char*)vm_base + name;
+    if (n[0] != 'S' && n[0] != 'H') return;
+    int ret = s_r3_reticle, hit = s_r3_hitmarker;
+    if (ret < 0) { int e = -1; s_r3_reticle.compare_exchange_strong(e, r3_env_on("R3_RETICLE")); ret = s_r3_reticle; }
+    if (hit < 0) { int e = -1; s_r3_hitmarker.compare_exchange_strong(e, r3_env_on("R3_HITMARKER")); hit = s_r3_hitmarker; }
+    static uint32_t s_names;   /* "HideReticule", "ShowReticule", "ResetReticule" in guest memory */
+    const char* to = NULL;
+    {
+        std::lock_guard<std::mutex> lk(s_r3_hud_mu);
+        const int gen = r3_level_gen();
+        const uint64_t use = ++s_r3_hud_use;
+        auto hud = [&]() -> R3HudEnt* {
+            R3HudEnt* lru = NULL;
+            for (auto& x : s_r3_huds) {
+                if (x.menu == menu) {
+                    if (x.gen != gen) { x.want = 0; x.hidden = 0; x.gen = gen; }
+                    x.use = use;
+                    return &x;
+                }
+                if (!lru || (lru->menu && (!x.menu || x.use < lru->use))) lru = &x;
+            }
+            *lru = R3HudEnt{ menu, 0, 0, gen, use };
+            return lru;
+        };
+        if (!strcmp(n, "ShowReticule")) {
+            R3HudEnt* h = hud(); h->want = 1;
+            if (!ret) { to = "HideReticule"; h->hidden = 1; } else h->hidden = 0;
+        } else if (!strcmp(n, "HideReticule")) {
+            R3HudEnt* h = hud(); h->want = 0; h->hidden = 0;
+        } else if (!strcmp(n, "SetReticule")) {
+            R3HudEnt* h = hud();
+            if (!ret && !h->hidden) { to = "HideReticule"; h->hidden = 1; }      /* turned off (hiding is always safe) */
+            else if (ret && h->hidden) {
+                h->hidden = 0;
+                if (h->want) to = "ShowReticule";                                /* turned back on and the game wants it */
+            }
+        } else if (!strcmp(n, "SetReticuleHit")) {
+            if (!hit) to = "ResetReticule";
+        }
+        if (!to) return;
+        if (!s_names) {
+            const uint32_t b = ps3_hle_heap_alloc(48);
+            if (!b) return;
+            memcpy(vm_base + b, "HideReticule\0\0\0\0ShowReticule\0\0\0\0ResetReticule\0\0", 48);
+            s_names = b;
+        }
+    }
+    ctx->gpr[4] = s_names + (to[0] == 'H' ? 0 : to[0] == 'S' ? 16 : 32);
+    static std::atomic<int> s_logged{ 0 };
+    if (s_logged.fetch_add(1) < 4)
+        fprintf(stderr, "[hud] %s -> %s (R3_RETICLE=%d R3_HITMARKER=%d)%c", n, to, ret, hit, 10);
+}
 extern "C" uint32_t r3_hud_msg_patch(ppu_context* ctx, uint32_t save[8])
 {
+    r3_hud_reticle_filter(ctx);
     static int en = -1;
     if (en < 0) { const char* e = getenv("R2_KEY_PROMPTS"); en = e ? atoi(e) : 1; }
     const uint32_t name = (uint32_t)ctx->gpr[4], args = (uint32_t)ctx->gpr[5];

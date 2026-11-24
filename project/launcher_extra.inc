@@ -205,6 +205,13 @@ static void register_extra_options()
                "Shifts colours so they are easier to tell apart (daltonization of the final image).",
                LX_ENV("COLORBLIND"), { {"Off", ""}, {"Protanopia  (red)", "1"}, {"Deuteranopia  (green)", "2"},
                                        {"Tritanopia  (blue)", "3"} }, 0, {}, "rpcs3");
+    add_option(SEC_X_FX, "reticle", "Game crosshair",
+               "The game's own crosshair (the lines around the screen centre). Off hides it; weapon scopes are not affected. "
+               "Also in game: F9 / PC CONTROLS & HUD.",
+               LX_ENV("RETICLE"), { {"On", ""}, {"Off", "0"} }, 0);
+    add_option(SEC_X_FX, "hitmarker", "Hit markers",
+               "The marker the game draws over the crosshair when a shot hits. Also in game: F9 / PC CONTROLS & HUD.",
+               LX_ENV("HITMARKER"), { {"On", ""}, {"Off", "0"} }, 0);
     add_option(SEC_X_FX, "crosshair", "Extra crosshair",
                "A small dot or cross at the screen centre while on foot, for when the game's reticle is hard to see.",
                LX_ENV("CROSSHAIR"), { {"Off", ""}, {"Dot", "dot"}, {"Cross", "cross"} }, 0);
