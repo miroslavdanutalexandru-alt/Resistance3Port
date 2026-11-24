@@ -6248,10 +6248,21 @@ index 8452579..c6e60f6 100644
  
  				auto convert = [](u32 input) -> u16
 diff --git a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
-index 7cb1137..0c52afa 100644
+index 7cb1137..2558ecb 100644
 --- a/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
 +++ b/rpcs3/Emu/RSX/NV47/HW/nv406e.cpp
-@@ -11,6 +11,59 @@ namespace rsx
+@@ -3,14 +3,70 @@
+ #include "nv47_sync.hpp"
+ 
+ #include "Emu/RSX/RSXThread.h"
++#include "Emu/RSX/port_rsx_stall.h"
+ #include "Emu/system_config.h"
+ 
++#include <cstdio>
++
+ #include "context_accessors.define.h"
+ 
+ namespace rsx
  {
  	namespace nv406e
  	{
@@ -6311,7 +6322,7 @@ index 7cb1137..0c52afa 100644
  		void set_reference(context* ctx, u32 /*reg*/, u32 arg)
  		{
  			RSX(ctx)->sync();
-@@ -18,6 +71,7 @@ namespace rsx
+@@ -18,6 +74,7 @@ namespace rsx
  			// Write ref+get (get will be written again with the same value at command end)
  			auto& dma = *vm::_ptr<RsxDmaControl>(RSX(ctx)->dma_address);
  			//dma.get.store(RSX(ctx)->fifo_ctrl->get_pos() + 4);
@@ -6319,7 +6330,7 @@ index 7cb1137..0c52afa 100644
  			dma.ref.store(arg);
  		}
  
-@@ -38,8 +92,25 @@ namespace rsx
+@@ -38,8 +95,25 @@ namespace rsx
  			RSX(ctx)->last_sema_cmd = RSX(ctx)->fifo_ctrl->get_pos() - 4;
  			RSX(ctx)->last_sema_addr = addr;
  
@@ -6345,7 +6356,7 @@ index 7cb1137..0c52afa 100644
  				// Flip semaphore doesnt need wake-up delay
  				if (addr != ctx->fw.label_addr + 0x10)
  				{
-@@ -49,13 +120,20 @@ namespace rsx
+@@ -49,13 +123,26 @@ namespace rsx
  
  				return;
  			}
@@ -6367,10 +6378,16 @@ index 7cb1137..0c52afa 100644
 +			// R3_SEMFIX_MS: shorter bound when the expected value is the one an SPU job stores to this label
 +			const u64 r3_cap = g_semfix_base ? semfix_wait_cap_us(addr, arg) : 0;
 +			u64 r3_next_wake = 0, r3_next_prog = 250'000, r3_next_zsync = 0;
++
++			// RSX_STALL_DIAG: published for r2rsx_stall_poll; cleared on every exit below
++			port_rsx_stall::sem_addr.store(addr, std::memory_order_relaxed);
++			port_rsx_stall::sem_arg.store(arg, std::memory_order_relaxed);
++			port_rsx_stall::sem_since.store(start, std::memory_order_release);
++			struct r3_stall_clear { ~r3_stall_clear() { port_rsx_stall::sem_since.store(0, std::memory_order_release); } } r3_stall_clear_on_exit;
  
  			while (sema != arg)
  			{
-@@ -71,6 +149,46 @@ namespace rsx
+@@ -71,6 +158,46 @@ namespace rsx
  					break;
  				}
  
@@ -6417,15 +6434,23 @@ index 7cb1137..0c52afa 100644
  				if (const auto tdr = static_cast<u64>(g_cfg.video.driver_recovery_timeout))
  				{
  					const u64 current = get_system_time();
-@@ -89,6 +207,7 @@ namespace rsx
+@@ -89,6 +216,15 @@ namespace rsx
  					{
  						// If longer than driver timeout force exit
  						rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
++						// RSX_STALL_DIAG: say it in run.log too (first 20); the puller goes on without the value
++						if (const u64 n = ++port_rsx_stall::sem_tdr_n; n <= 20)
++						{
++							std::fprintf(stderr, "[rsx-stall] semaphore acquire at 0x%x (io GET 0x%x) timed out after %llu ms: wanted 0x%08x, holds 0x%08x; "
++								"continuing past it (Driver Recovery Timeout, #%llu)\n", addr, RSX(ctx)->fifo_ctrl->get_pos(),
++								static_cast<unsigned long long>((current - r3_wait_begin) / 1000), arg, static_cast<u32>(sema),
++								static_cast<unsigned long long>(n));
++						}
 +						r3_timed_out = 1;
  						break;
  					}
  				}
-@@ -106,6 +225,14 @@ namespace rsx
+@@ -106,6 +242,14 @@ namespace rsx
  				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
  			}
  
@@ -8954,7 +8979,7 @@ index 107f5b2..d235284 100644
  				if (state & cpu_flag::again)
  				{
 diff --git a/rpcs3/Emu/RSX/RSXFIFO.h b/rpcs3/Emu/RSX/RSXFIFO.h
-index d0611bc..59fb48d 100644
+index d0611bc..cb85c1f 100644
 --- a/rpcs3/Emu/RSX/RSXFIFO.h
 +++ b/rpcs3/Emu/RSX/RSXFIFO.h
 @@ -1,5 +1,7 @@
@@ -8998,7 +9023,7 @@ index d0611bc..59fb48d 100644
  		public:
  			FIFO_control(rsx::thread* pctrl);
  			~FIFO_control() = default;
-@@ -174,11 +190,19 @@ namespace rsx
+@@ -174,11 +190,24 @@ namespace rsx
  			u32 translate_address(u32 addr) const;
  
  			std::pair<bool, u32> fetch_u32(u32 addr);
@@ -9008,6 +9033,11 @@ index d0611bc..59fb48d 100644
  
  			u32 get_pos() const { return m_fifo_pos; }
  			u32 last_cmd() const { return m_cmd; }
++			// R3PORT RSX_STALL_DIAG (port_rsx_stall.h): racy reads from the watchdog thread, diagnostics only
++			u32 r2_memwatch_addr() const { return m_memwatch_addr; }
++			u32 r2_memwatch_cmp() const { return m_memwatch_cmp; }
++			u32 r2_cache_addr() const { return m_cache_addr; }
++			u32 r2_cache_size() const { return m_cache_size; }
  			void sync_get() const;
 +			// R2PORT (RPCS3 PR #20055): GET when the puller blocks on a semaphore acquire (the end of the fetched words)
 +			// R3PORT R3_FIFO_WAIT_GET_MS (port_wait_get.h): true = the cache end is still owed, see sync_get_for_wait_late
@@ -9197,7 +9227,7 @@ index 0de96bb..e600356 100644
  
  	template<typename T>
 diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
-index a572df4..d582c2d 100644
+index a572df4..8e879e2 100644
 --- a/rpcs3/Emu/RSX/RSXThread.cpp
 +++ b/rpcs3/Emu/RSX/RSXThread.cpp
 @@ -1,6 +1,9 @@
@@ -9338,7 +9368,7 @@ index a572df4..d582c2d 100644
  
  				// Give other contexts their turn
  				if (m_context_count > 1) [[unlikely]]
-@@ -907,15 +961,36 @@ namespace rsx
+@@ -907,15 +961,50 @@ namespace rsx
  				}
  
  				// Update other sub-units
@@ -9349,6 +9379,20 @@ index a572df4..d582c2d 100644
 +					r2_zcull_idle_flush(); // R2PORT: RSX_ZCULL_IDLE_FLUSH
 +					r2_zcull_crit_flush(); // R2PORT: RSX_ZCULL_CRIT_FLUSH_US
 +					zcull_ctrl->r3_guest_wait_poll(this); // PORT: RSX_ZCULL_GUEST_WAIT
++					if (auto& gw = rsx::reports::g_guest_wait; gw.nw_want.load(std::memory_order_relaxed)) [[unlikely]]
++					{
++						// PORT: R3_OCC_NOWAIT catch-up fence: every command up to put has run, so every report is claimed.
++						// Not the state alone (nop is set by mid-stream NOPs) and not GET alone (sync_get publishes the
++						// fetched cache end): the puller's own position is at PUT and the last fetch found nothing to run.
++						const auto st = performance_counters.state;
++						const auto ch = m_ctx ? m_ctx->fifo.ctrl : nullptr;
++						if (ch && st != FIFO::state::running && is_fifo_idle(m_ctx) && fifo_ctrl->get_pos() == (ch->put & ~3u))
++						{
++							if (zcull_ctrl->has_pending()) zcull_ctrl->r2_hint_newest(this);
++							gw.nw_idle_claims.store(gw.nw_claims.load(std::memory_order_relaxed), std::memory_order_relaxed);
++							gw.nw_idle_seq.fetch_add(1, std::memory_order_release);
++						}
++					}
 +				}
 +				{
 +					r2prof::scope_x r2hk(r2prof::hk_labels_ns);
@@ -9376,7 +9420,7 @@ index a572df4..d582c2d 100644
  			run_FIFO();
  		}
  	}
-@@ -929,6 +1004,7 @@ namespace rsx
+@@ -929,6 +1018,7 @@ namespace rsx
  
  		// Retire the queued reports, then stop calling into the renderer's host queries
  		zcull_ctrl->sync(this);
@@ -9384,7 +9428,7 @@ index a572df4..d582c2d 100644
  		zcull_ctrl->set_provider(nullptr);
  
  		// Deregister violation handler
-@@ -987,6 +1063,7 @@ namespace rsx
+@@ -987,6 +1077,7 @@ namespace rsx
  
  		// Queries still in flight complete as "always visible"
  		zcull_ctrl->set_provider(nullptr);
@@ -9392,7 +9436,7 @@ index a572df4..d582c2d 100644
  
  		// Pending evaluations use the old backend's queries and cannot be handed to the new one. They pass as well.
  		for_each_context([this](context* ctx)
-@@ -1141,7 +1218,7 @@ namespace rsx
+@@ -1141,7 +1232,7 @@ namespace rsx
  				fifo_ctrl->sync_get();
  			}
  
@@ -9401,7 +9445,7 @@ index a572df4..d582c2d 100644
  			{
  				performance_counters.idle_time += now - performance_counters.FIFO_idle_timestamp;
  			}
-@@ -1173,6 +1250,7 @@ namespace rsx
+@@ -1173,6 +1264,7 @@ namespace rsx
  		m_ctx = ctx;
  		load_fifo_channel(ctx->fifo);
  
@@ -9409,7 +9453,7 @@ index a572df4..d582c2d 100644
  		if (performance_counters.state != FIFO::state::running)
  		{
  			performance_counters.FIFO_idle_timestamp = now;
-@@ -1557,6 +1635,7 @@ namespace rsx
+@@ -1557,6 +1649,7 @@ namespace rsx
  			}
  		}
  
@@ -9417,7 +9461,7 @@ index a572df4..d582c2d 100644
  		rsx::reservation_lock<true> lock(sink, 16);
  		vm::_ptr<atomic_t<CellGcmReportData>>(sink)->store({timestamp(), value, 0});
  	}
-@@ -1621,6 +1700,8 @@ namespace rsx
+@@ -1621,6 +1714,8 @@ namespace rsx
  			zcull_ctrl->sync(this);
  		}
  
@@ -9426,7 +9470,7 @@ index a572df4..d582c2d 100644
  		// Fragment constants may have been updated
  		m_ctx->graphics_state |= rsx::pipeline_state::fragment_constants_dirty;
  
-@@ -1638,6 +1719,209 @@ namespace rsx
+@@ -1638,6 +1733,209 @@ namespace rsx
  		m_renderer->on_sync_hint(hint, payload);
  	}
  
@@ -9636,7 +9680,7 @@ index a572df4..d582c2d 100644
  	bool thread::is_fifo_idle(const context* ctx) const
  	{
  		const auto channel = ctx->fifo.ctrl;
-@@ -1761,8 +2045,42 @@ namespace rsx
+@@ -1761,8 +2059,42 @@ namespace rsx
  
  		if (kill_itself)
  		{
@@ -9681,7 +9725,7 @@ index a572df4..d582c2d 100644
  		}
  
  		// Error. Should reset the queue
-@@ -1770,6 +2088,7 @@ namespace rsx
+@@ -1770,6 +2102,7 @@ namespace rsx
  		fifo_ret_addr = saved_fifo_ret;
  		std::this_thread::sleep_for(2ms);
  		fifo_ctrl->abort();
@@ -9689,7 +9733,7 @@ index a572df4..d582c2d 100644
  
  		if (std::exchange(m_ctx->in_begin_end, false) && !REGS(m_ctx)->current_draw_clause.empty())
  		{
-@@ -2095,7 +2414,7 @@ namespace rsx
+@@ -2095,7 +2428,7 @@ namespace rsx
  		switch (request_code)
  		{
  		case rsx::mm_backend_ctrl::cmd_mm_flush:
@@ -9698,7 +9742,7 @@ index a572df4..d582c2d 100644
  			break;
  		default:
  			if (!m_renderer->on_renderctl(request_code, args))
-@@ -2168,6 +2487,26 @@ namespace rsx
+@@ -2168,6 +2501,26 @@ namespace rsx
  
  	void thread::on_frame_end(context* ctx, u32 buffer, bool forced)
  	{
@@ -9725,7 +9769,7 @@ index a572df4..d582c2d 100644
  		bool pause_emulator = false;
  
  		// MM sync. This is a pre-emptive operation, so we can use a deferred request.
-@@ -2192,7 +2531,7 @@ namespace rsx
+@@ -2192,7 +2545,7 @@ namespace rsx
  			frame_capture.replay_commands.push_back(std::move(replay_cmd));
  			capture::capture_display_tile_state(this, frame_capture.replay_commands.back());
  		}
@@ -9734,7 +9778,7 @@ index a572df4..d582c2d 100644
  		{
  			capture_current_frame = false;
  
-@@ -2226,7 +2565,29 @@ namespace rsx
+@@ -2226,7 +2579,29 @@ namespace rsx
  			}
  		}
  
@@ -9765,7 +9809,7 @@ index a572df4..d582c2d 100644
  		{
  			// NOTE: This is a workaround for buggy games.
  			// Some applications leave the zpass/stats gathering active but don't use the information.
-@@ -2277,9 +2638,29 @@ namespace rsx
+@@ -2277,9 +2652,29 @@ namespace rsx
  			thread_ctrl::wait_for(30'000);
  		}
  
@@ -9846,7 +9890,7 @@ index 7f134af..7462f45 100644
  		std::string_view renderer_info() const { return m_renderer_info; }
  
 diff --git a/rpcs3/Emu/RSX/RSXZCULL.cpp b/rpcs3/Emu/RSX/RSXZCULL.cpp
-index 8f61814..8f31121 100644
+index 8f61814..63c6c59 100644
 --- a/rpcs3/Emu/RSX/RSXZCULL.cpp
 +++ b/rpcs3/Emu/RSX/RSXZCULL.cpp
 @@ -3,6 +3,29 @@
@@ -9919,8 +9963,17 @@ index 8f61814..8f31121 100644
  					It->type = type;
  					It->sync_tag = rsx::get_shared_tag();
  
-@@ -284,6 +313,9 @@ namespace rsx
+@@ -282,8 +311,18 @@ namespace rsx
  
+ 			on_report_enqueued(sink);
+ 
++			{
++				// PORT: R3_OCC_NOWAIT drain fence: number this claim (the forwarder writes it, in order)
++				const u64 seq = g_guest_wait.nw_claims.load(std::memory_order_relaxed) + 1;
++				forwarder->r2_nw_seq = seq;
++				g_guest_wait.nw_claims.store(seq, std::memory_order_release);
++			}
++
  			ptimer->async_tasks_pending++;
  
 +			r3_guest_wait_claim(ptimer, sink); // PORT: RSX_ZCULL_GUEST_WAIT
@@ -9929,7 +9982,7 @@ index 8f61814..8f31121 100644
  			if (m_statistics_map[m_statistics_tag_id].result != 0)
  			{
  				// Flush guaranteed results; only one positive is needed
-@@ -304,12 +336,14 @@ namespace rsx
+@@ -304,12 +343,14 @@ namespace rsx
  					m_current_task->ctx_id = ptimer->get_context()->id();
  					m_current_task->data_type = 0;
  					m_current_task->num_draws = 0;
@@ -9944,7 +9997,7 @@ index 8f61814..8f31121 100644
  
  					// Flags determine what kind of payload is carried by queries in the 'report'
  					if (zpass_count_enabled) m_current_task->data_type |= CELL_GCM_ZPASS_PIXEL_CNT;
-@@ -344,8 +378,9 @@ namespace rsx
+@@ -344,8 +385,9 @@ namespace rsx
  			m_free_occlusion_pool.push(query);
  		}
  
@@ -9955,7 +10008,7 @@ index 8f61814..8f31121 100644
  			if (!(type & CELL_GCM_ZPASS_PIXEL_CNT))
  			{
  				// Other types do not generate queries at the moment
-@@ -353,7 +388,8 @@ namespace rsx
+@@ -353,7 +395,8 @@ namespace rsx
  			}
  
  			// Discard any running queries. The results will never be read anyway.
@@ -9965,7 +10018,7 @@ index 8f61814..8f31121 100644
  			{
  				discard_host_query(m_current_task);
  				free_query(m_current_task);
-@@ -407,10 +443,45 @@ namespace rsx
+@@ -407,10 +450,45 @@ namespace rsx
  			current_stats.result = 0;
  		}
  
@@ -10011,7 +10064,7 @@ index 8f61814..8f31121 100644
  				m_current_task->num_draws++;
  				m_current_task->sync_tag = m_timer++;
  			}
-@@ -427,6 +498,7 @@ namespace rsx
+@@ -427,6 +505,7 @@ namespace rsx
  
  			auto scale_result = [](u32 value)
  			{
@@ -10019,7 +10072,7 @@ index 8f61814..8f31121 100644
  				const auto scale = get_current_renderer()->resolution_scaling_config.scale_percent;
  				const auto result = (value * 10000ull) / (scale * scale);
  				return std::max(1u, static_cast<u32>(result));
-@@ -454,9 +526,21 @@ namespace rsx
+@@ -454,9 +533,21 @@ namespace rsx
  				break;
  			}
  
@@ -10041,7 +10094,7 @@ index 8f61814..8f31121 100644
  		}
  
  		void ZCULL_control::write(queued_report_write* writer, u64 timestamp, u32 value)
-@@ -466,6 +550,7 @@ namespace rsx
+@@ -466,11 +557,16 @@ namespace rsx
  
  			write(writer->sink, timestamp, writer->type, value);
  			on_report_completed(writer->sink);
@@ -10049,7 +10102,16 @@ index 8f61814..8f31121 100644
  
  			for (auto& addr : writer->sink_alias)
  			{
-@@ -518,6 +603,7 @@ namespace rsx
+ 				write(addr, timestamp, writer->type, value);
+ 			}
++
++			// PORT: R3_OCC_NOWAIT drain fence (reports retire in order: every earlier claim is written or dropped)
++			if (writer->r2_nw_seq && writer->r2_nw_seq > g_guest_wait.nw_done.load(std::memory_order_relaxed))
++				g_guest_wait.nw_done.store(writer->r2_nw_seq, std::memory_order_release);
+ 		}
+ 
+ 		void ZCULL_control::retire(::rsx::thread* ptimer, queued_report_write* writer, u32 result)
+@@ -518,6 +614,7 @@ namespace rsx
  
  		void ZCULL_control::sync(::rsx::thread* ptimer)
  		{
@@ -10057,7 +10119,7 @@ index 8f61814..8f31121 100644
  			if (m_pending_writes.empty())
  			{
  				// Nothing to do
-@@ -530,6 +616,9 @@ namespace rsx
+@@ -530,6 +627,9 @@ namespace rsx
  				return;
  			}
  
@@ -10067,7 +10129,7 @@ index 8f61814..8f31121 100644
  			if (g_cfg.video.relaxed_zcull_sync)
  			{
  				update(ptimer, 0, true);
-@@ -572,8 +661,9 @@ namespace rsx
+@@ -572,8 +672,9 @@ namespace rsx
  
  					if (implemented && !have_result && query->num_draws)
  					{
@@ -10078,7 +10140,15 @@ index 8f61814..8f31121 100644
  					}
  					else
  					{
-@@ -626,10 +716,12 @@ namespace rsx
+@@ -592,6 +693,7 @@ namespace rsx
+ 			{
+ 				ensure(processed == m_pending_writes.size());
+ 				m_pending_writes.clear();
++				g_guest_wait.nw_done.store(g_guest_wait.nw_claims.load(std::memory_order_relaxed), std::memory_order_release); // PORT: R3_OCC_NOWAIT
+ 			}
+ 			else
+ 			{
+@@ -626,10 +728,12 @@ namespace rsx
  
  			//Decrement jobs counter
  			ptimer->async_tasks_pending -= processed;
@@ -10091,7 +10161,7 @@ index 8f61814..8f31121 100644
  			if (m_pending_writes.empty())
  			{
  				return;
-@@ -716,8 +808,9 @@ namespace rsx
+@@ -716,8 +820,9 @@ namespace rsx
  					}
  					else if (force_read || check_host_query(query))
  					{
@@ -10102,7 +10172,11 @@ index 8f61814..8f31121 100644
  					}
  					else
  					{
-@@ -755,11 +848,195 @@ namespace rsx
+@@ -752,14 +857,199 @@ namespace rsx
+ 				else
+ 				{
+ 					m_pending_writes.clear();
++					g_guest_wait.nw_done.store(g_guest_wait.nw_claims.load(std::memory_order_relaxed), std::memory_order_release); // PORT: R3_OCC_NOWAIT
  				}
  
  				ptimer->async_tasks_pending -= processed;
@@ -10299,7 +10373,7 @@ index 8f61814..8f31121 100644
  				return result_none;
  
 diff --git a/rpcs3/Emu/RSX/RSXZCULL.h b/rpcs3/Emu/RSX/RSXZCULL.h
-index d262cec..2d29db0 100644
+index d262cec..8cfbd93 100644
 --- a/rpcs3/Emu/RSX/RSXZCULL.h
 +++ b/rpcs3/Emu/RSX/RSXZCULL.h
 @@ -11,6 +11,7 @@
@@ -10319,7 +10393,15 @@ index d262cec..2d29db0 100644
  			u32 data_type;
  			u64 sync_tag;
  			u64 timestamp;
-@@ -97,6 +100,29 @@ namespace rsx
+@@ -54,6 +57,7 @@ namespace rsx
+ 
+ 			vm::addr_t sink;                      // Memory location of the report
+ 			std::vector<vm::addr_t> sink_alias;   // Aliased memory addresses
++			u64 r2_nw_seq = 0;                    // PORT: R3_OCC_NOWAIT claim number (guest_wait_state::nw_claims), 0 = none
+ 		};
+ 
+ 		struct query_search_result
+@@ -97,6 +101,35 @@ namespace rsx
  			max_stat_registers    = 8192   // Size of the statistics cache
  		};
  
@@ -10342,6 +10424,12 @@ index d262cec..2d29db0 100644
 +			std::atomic<u32> spec_sink[spec_slots]{};
 +			std::atomic<u64> spec_flip[spec_slots]{}; // flips executed when armed (stale slots expire, see the bridge)
 +			std::atomic<int> spec_armed{ 0 };
++			// R3_OCC_NOWAIT catch-up fence (rsx::thread writes, the guest reads). nw_claims counts claimed report writes
++			// (GET_REPORT with a pending query); nw_done = every claim up to it is written or dropped (reports retire in
++			// order). While the guest asks (nw_want), each housekeeping pass that finds the FIFO idle publishes
++			// nw_idle_claims (= nw_claims: every command up to put has run) and then bumps nw_idle_seq.
++			std::atomic<u64> nw_claims{ 0 }, nw_done{ 0 }, nw_idle_claims{ 0 }, nw_idle_seq{ 0 };
++			std::atomic<int> nw_want{ 0 };
 +		};
 +		inline guest_wait_state g_guest_wait;
 +		bool guest_wait_enabled();
@@ -10349,7 +10437,7 @@ index d262cec..2d29db0 100644
  		// Host occlusion query provider. Implemented by the renderer.
  		// The defaults report everything as visible.
  		class occlusion_query_provider
-@@ -198,7 +224,14 @@ namespace rsx
+@@ -198,7 +231,14 @@ namespace rsx
  			void read_report(class ::rsx::thread* ptimer, vm::addr_t sink, u32 type);
  
  			// Clears current stat block and increments stat_tag_id
@@ -10365,7 +10453,7 @@ index d262cec..2d29db0 100644
  
  			// Forcefully flushes all
  			void sync(class ::rsx::thread* ptimer);
-@@ -222,6 +255,66 @@ namespace rsx
+@@ -222,6 +262,66 @@ namespace rsx
  			// Check for pending writes
  			bool has_pending() const { return !m_pending_writes.empty(); }
  
@@ -16430,10 +16518,10 @@ index 0000000..eaec754
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2DlssQuality.h b/rpcs3/Emu/RSX/VK/VKR2DlssQuality.h
 new file mode 100644
-index 0000000..55d726f
+index 0000000..35cc90a
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2DlssQuality.h
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,935 @@
 +/* port_dlss_quality.h -- pure (no GPU / no OS) helpers for three opt-in DLSS quality items, shared by the
 + * Resistance ports (same file in R1 ps3recomp\libs\video, R2/R3 RPCS3 Emu\RSX\VK\VKR2DlssQuality.h) and unit-tested
 + * by scratch\dlss_quality\test_dlss_quality.cpp. C99 and C++ compatible, header only.
@@ -17332,6 +17420,29 @@ index 0000000..55d726f
 +    return b;
 +}
 +
++/* R3_FG_CAM_SANITY bit 1 (ported from R2_FG_CAM_SANITY): slot of the world camera's transform, the widest depth range
++   (|sz|, then |far - near|) among the transforms at least 1/8 as many depth-writing draws used as the most-used one;
++   ties: pdq_s_pick's order. The weapon is drawn last on some frames with its own depth range (sz 0.2): taken as the
++   frame's transform, the world's depth reprojected behind the camera (cut resets, 'offscreen' motion 1e9).
++   -1: no depth-writing draw. */
++static inline int pdq_s_pick_wide(const pdq_s_tally* t)
++{
++    unsigned k, top = 0;
++    int b = -1;
++    for (k = 0; k < t->cnt; ++k)
++        if (t->n[k] && t->dw[k] > top) top = t->dw[k];
++    if (!top) return -1;
++    for (k = 0; k < t->cnt; ++k)
++    {
++        if (!t->n[k] || t->dw[k] * 8u < top) continue;
++        if (b < 0) { b = (int)k; continue; }
++        const float ek = fabsf(t->v[k][4]), eb = fabsf(t->v[b][4]);
++        const float rk = fabsf(t->v[k][7] - t->v[k][6]), rb = fabsf(t->v[b][7] - t->v[b][6]);
++        if (ek > eb || (ek == eb && (rk > rb || (rk == rb && (t->dw[k] > t->dw[b] || (t->dw[k] == t->dw[b] && t->n[k] > t->n[b]))))))
++            b = (int)k;
++    }
++    return b;
++}
 +/* ---- env helpers ------------------------------------------------------------------------------------ */
 +
 +static inline int pdq_env_int(const char* name, int def)
@@ -27991,10 +28102,10 @@ index 0000000..3cb23c0
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..3eaf2ee
+index 0000000..cd10ea9
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12032 @@
+@@ -0,0 +1,12087 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -28527,6 +28638,14 @@ index 0000000..3eaf2ee
 +		// (pdq_s_pick). Off: the R3 diner jolts it was meant for came with a changed game VP (its own log), and in R3 T1 it
 +		// picked the weapon draws' depth range (0.2) over the world's, so the reprojection read as camera cuts (DLSS resets).
 +		bool frame_s_vote = false;
++		// R3_FG_CAM_SANITY (default 1; 0 = old, bits; ported from R2_FG_CAM_SANITY, which is read too): 1 = the frame's
++		// screen transform is the widest depth range most scene draws used (pdq_s_pick_wide), not the last draw's: the
++		// weapon, drawn last on some frames with its own depth range 0.2, made the world's depth reproject behind the
++		// camera (false camera-cut resets 'offscreen' motion 1e9, upscaler and frame generation history lost, wrong
++		// near/far). 2 = a camera cut from a weak vote (under a quarter of the matched draws agree, the game's own VP not
++		// used) keeps the history like an untrusted parallax cut: frame generation still resets on it, and the depth
++		// check resets the upscaler a few frames later when neither the voted motion nor none fits (a real cut).
++		int cam_sanity = 1;
 +		// RSX_DLSS_OBJMV_DEADZONE_PX (default 0.01; 0 = off): an object velocity (RSX_DLSS_OBJMV=1, both modes) below
 +		// this many render pixels is written as exactly zero (float noise of the per-draw previous-frame evaluation)
 +		float om_deadzone = 0.01f;
@@ -28859,6 +28978,8 @@ index 0000000..3eaf2ee
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP"); e && *e) r.static_snap = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP_PX"); e && *e) r.static_snap_px = std::clamp(static_cast<float>(std::atof(e)), 0.f, 1.f);
 +		if (const char* e = std::getenv("RSX_AA_FRAME_S_VOTE"); e && *e) r.frame_s_vote = std::atoi(e) != 0;
++		for (const char* name : { "R3_FG_CAM_SANITY", "R2_FG_CAM_SANITY" })
++			if (const char* e = std::getenv(name); e && *e) { r.cam_sanity = std::clamp(std::atoi(e), 0, 3); break; }
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEADZONE_PX"); e && *e) r.om_deadzone = std::clamp(static_cast<float>(std::atof(e)), 0.f, 1.f);
 +			if (const char* e = std::getenv("RSX_AA_EVALS")) r.evals_max = static_cast<u32>(std::max(16, std::min(4096, std::atoi(e))));
 +			if (const char* e = std::getenv("RSX_AA_VOTE_ROBUST"); e && *e && std::atoi(e) != 0)
@@ -31168,7 +31289,7 @@ index 0000000..3eaf2ee
 +		bool inverted = false;
 +		screen_xform frame_S, last_S;
 +		pdq_s_tally s_tal{}; // RSX_AA_FRAME_S_VOTE: this frame's scene-draw screen transforms
-+		u32 stat_s_mixed = 0, stat_s_voted = 0, stat_s_logged = 0, stat_snap_vp_same = 0;
++		u32 stat_s_mixed = 0, stat_s_voted = 0, stat_s_logged = 0, stat_snap_vp_same = 0, stat_s_wide = 0, stat_s_wide_logged = 0, stat_weak_cut = 0;
 +		// still-camera jolts: a kept camera motion after >= 30 still runs (and the run after it); the game VP of the
 +		// previous run's previous frame, to tell a VP that returns bit-exactly (A-B-A) from a real move
 +		m4 jolt_vpp{};
@@ -35667,9 +35788,9 @@ index 0000000..3eaf2ee
 +					r2log("camera static snap (RSX_AA_STATIC_SNAP_PX %.3f): %u frames snapped to zero motion, %u held/voted motions replaced (game VP unchanged), %u already identity; kept motion <0.1 px %u, <1 px %u, >=1 px %u (%u of them with the game VP unchanged: screen transform moved)",
 +						r2cfg().static_snap_px, st.stat_snap, st.stat_snap_ex, st.stat_snap_id, st.stat_snap_hist[0], st.stat_snap_hist[1], st.stat_snap_hist[2], st.stat_snap_vp_same);
 +				st.stat_snap = st.stat_snap_ex = st.stat_snap_id = st.stat_snap_hist[0] = st.stat_snap_hist[1] = st.stat_snap_hist[2] = st.stat_snap_vp_same = 0;
-+				r2log("frame screen transform (RSX_AA_FRAME_S_VOTE=%d%s): %u frames whose scene draws used more than one, %u where the voted one replaced the last draw's",
-+					r2cfg().frame_s_vote ? 1 : 0, r2cfg().frame_s_vote ? "" : ": off, the last scene draw's", st.stat_s_mixed, st.stat_s_voted);
-+				st.stat_s_mixed = st.stat_s_voted = 0;
++				r2log("frame screen transform (RSX_AA_FRAME_S_VOTE=%d%s): %u frames whose scene draws used more than one, %u where the voted one replaced the last draw's; R3_FG_CAM_SANITY=%d: %u replaced by the widest depth range",
++					r2cfg().frame_s_vote ? 1 : 0, r2cfg().frame_s_vote ? "" : ": off, the last scene draw's", st.stat_s_mixed, st.stat_s_voted, r2cfg().cam_sanity, st.stat_s_wide);
++				st.stat_s_mixed = st.stat_s_voted = st.stat_s_wide = 0;
 +				if (r2cfg().static_snap)
 +					r2log("still-camera jolts: %u kept camera motions after >= 30 still runs (or the run after one), %u where the game VP "
 +						"changed and came back bit-exactly to the one 2 frames before (A-B-A)", st.stat_jolt, st.stat_jolt_aba);
@@ -35678,9 +35799,13 @@ index 0000000..3eaf2ee
 +					r2log("camera MV confidence: %u checks, %u rejected (> %.0f%% of the depth samples off, worse than no motion), %u resets, %u frames with zero camera motion, %u reject runs without a reset (RSX_AA_MV_CONFIDENCE_GAP %u), %u cut resets (RSX_AA_CONF_CUT %u), %u rejects of the confirmed game camera ignored (RSX_AA_CONF_TRUST_EXACT %u)",
 +						st.stat_conf_n, st.stat_conf_rej, r2cfg().mv_conf_bad * 100.f, st.stat_conf_reset, st.stat_conf_zero, st.stat_conf_kept, r2cfg().mv_conf_gap, st.stat_conf_cut, r2cfg().conf_cut ? 1u : 0u, st.stat_conf_exact, r2cfg().conf_trust_exact ? 1u : 0u);
 +				if (r2cfg().cut_par_gap)
-+					r2log("camera cut: %u parallax-only cuts within RSX_AA_CUT_PARALLAX_GAP %u frames kept the history (%u untrusted: last trusted / no motion); depth check: %u real cuts reset, %u deferred, %u unchecked",
-+						st.stat_par_kept, r2cfg().cut_par_gap, st.stat_par_untrusted, st.stat_par_confirmed, st.stat_par_cut_gapped, st.stat_par_unchecked);
++					r2log("camera cut: %u parallax-only cuts within RSX_AA_CUT_PARALLAX_GAP %u frames kept the history (%u untrusted: last trusted / no motion); %u weak-vote cuts held (R3_FG_CAM_SANITY bit 2); depth check: %u real cuts reset, %u deferred, %u unchecked",
++						st.stat_par_kept, r2cfg().cut_par_gap, st.stat_par_untrusted, st.stat_weak_cut, st.stat_par_confirmed, st.stat_par_cut_gapped, st.stat_par_unchecked);
++				else if (st.stat_weak_cut)
++					r2log("camera cut: %u weak-vote cuts held (R3_FG_CAM_SANITY bit 2); depth check: %u real cuts reset, %u deferred, %u unchecked",
++						st.stat_weak_cut, st.stat_par_confirmed, st.stat_par_cut_gapped, st.stat_par_unchecked);
 +			}
++			st.stat_weak_cut = 0;
 +			st.stat_conf_n = st.stat_conf_rej = st.stat_conf_reset = st.stat_conf_zero = st.stat_conf_cut = st.stat_conf_exact = 0;
 +			st.stat_conf_kept = st.stat_par_kept = st.stat_par_confirmed = 0;
 +			st.stat_par_untrusted = st.stat_par_unchecked = st.stat_par_cut_gapped = 0;
@@ -37431,6 +37556,27 @@ index 0000000..3eaf2ee
 +				if (r2cfg().frame_s_vote) st.frame_S = v;
 +			}
 +		}
++		if (!r2cfg().frame_s_vote && (r2cfg().cam_sanity & 1))
++		{
++			const int kw = pdq_s_pick_wide(&st.s_tal);
++			if (kw >= 0)
++			{
++				float la[8];
++				s_to_arr(st.frame_S, la);
++				if (std::memcmp(la, st.s_tal.v[kw], sizeof(la)) != 0)
++				{
++					const screen_xform v = s_from_arr(st.s_tal.v[kw]);
++					if (st.stat_s_wide_logged < 4)
++					{
++						st.stat_s_wide_logged++;
++						r2log("frame screen transform f%u (R3_FG_CAM_SANITY bit 1): last scene draw's z %g*%+g replaced by the widest depth range (%u of %u draws, %u depth-writing) x %g*%+g y %g*%+g z %g*%+g",
++							st.frame, la[4], la[5], st.s_tal.n[kw], st.scene_draws, st.s_tal.dw[kw], v.sx, v.ox, v.sy, v.oy, v.sz, v.oz);
++					}
++					st.stat_s_wide++;
++					st.frame_S = v;
++				}
++			}
++		}
 +	}
 +	if (!st.scene_draws || !rt || !ds || !st.frame_S.valid || st.vw < 1 || st.vh < 1)
 +	{
@@ -37580,6 +37726,7 @@ index 0000000..3eaf2ee
 +	m4 T_check = m4_identity(); // RSX_AA_CUT_PARALLAX_GAP: a held parallax cut's depth check uses the voted motion
 +	bool check_voted = false;
 +	int fg_cut = 0; // R2PORT frame generation: a held parallax cut (pfg_cut_reset kind)
++	bool ex_used = false; // the game's own VP gave this frame's camera
 +	// RSX_AA_STATIC_SNAP: largest displacement (render pixels) of a 3x3 screen grid at far / mid / near depth under A
 +	// (1e9: a point behind the camera); ex_static: the game's verified VP is bit-identical to last frame's
 +	const auto snap_px = [&](const m4& A)
@@ -37785,6 +37932,7 @@ index 0000000..3eaf2ee
 +						members = exm;
 +						have_cam = true;
 +						ex_conf_ok = supported;
++						ex_used = true;
 +						st.stat_ex_used++;
 +					}
 +					if (r2cfg().debug && st.ex_logged < 32 && (disagree || (st.frame % 120) == 0))
@@ -37904,6 +38052,24 @@ index 0000000..3eaf2ee
 +				vk::r2fg_diag_cut(motion, par, members, matched);
 +				if (r2cfg().debug) r2log("parallax cut f%u held (motion %.3f, parallax %.3f, vote %u/%u): %s motion, no reset", st.frame, motion, par, members, matched,
 +					par_untrusted ? "last trusted / no" : "voted");
++			}
++			if (cut && rule != 6 && (r2cfg().cam_sanity & 2) && r2cfg().mv_conf && !ex_used && members * 4 < matched)
++			{
++				// R3_FG_CAM_SANITY bit 2: a cut from a weak vote is most likely a wrong transform: held like an untrusted
++				// parallax cut (last trusted / no motion, frame generation resets); the depth check on the voted motion
++				// resets a real cut a few frames later
++				cut = false;
++				par_untrusted = true;
++				ex_conf_ok = false;
++				fg_cut = 1;
++				T_check = T;
++				check_voted = true;
++				if (pdq_held_push(&st.par_held, st.frame)) st.stat_par_unchecked++;
++				st.stat_weak_cut++;
++				T = pdq_last_t_usable(r2cfg().vote_hold, st.frame, st.last_T_frame) ? st.last_T : m4_identity();
++				if (r2cfg().debug || st.stat_weak_cut <= 4)
++					r2log("camera cut f%u from a weak vote held (R3_FG_CAM_SANITY bit 2; rule %u, motion %.3g, zoom %.3g, vote %u/%u): depth check decides", st.frame, rule,
++						motion, zoom, members, matched);
 +			}
 +			if (cut)
 +			{
@@ -53641,6 +53807,30 @@ index 0000000..deb2c09
 +		scope(const scope&) = delete;
 +		scope& operator=(const scope&) = delete;
 +	};
++}
+diff --git a/rpcs3/Emu/RSX/port_rsx_stall.h b/rpcs3/Emu/RSX/port_rsx_stall.h
+new file mode 100644
+index 0000000..b44d6de
+--- /dev/null
++++ b/rpcs3/Emu/RSX/port_rsx_stall.h
+@@ -0,0 +1,18 @@
++#pragma once
++
++// R3PORT RSX_STALL_DIAG (ported from R2): what the puller is waiting on, for r2rsx_stall_poll (rpcs3_bridge, read from
++// a watchdog thread). R2 report #153831: after ~20 min the game's own "GPU sit and spin timeout" fired with GET fixed
++// and PUT ahead; nothing in run.log said what the RSX was doing. Written by rsx::thread only.
++
++#include <atomic>
++#include <cstdint>
++
++namespace port_rsx_stall
++{
++	// NV406E semaphore acquire in progress: label address, wanted value, get_system_time() at its start (0 = none)
++	inline std::atomic<std::uint32_t> sem_addr{0};
++	inline std::atomic<std::uint32_t> sem_arg{0};
++	inline std::atomic<std::uint64_t> sem_since{0};
++	// acquires the Driver Recovery Timeout (TDR) ended without the value
++	inline std::atomic<std::uint64_t> sem_tdr_n{0};
 +}
 diff --git a/rpcs3/Emu/RSX/port_texdiag.h b/rpcs3/Emu/RSX/port_texdiag.h
 new file mode 100644

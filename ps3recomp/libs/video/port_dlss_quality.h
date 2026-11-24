@@ -896,6 +896,29 @@ static inline int pdq_s_pick(const pdq_s_tally* t)
     return b;
 }
 
+/* R3_FG_CAM_SANITY bit 1 (ported from R2_FG_CAM_SANITY): slot of the world camera's transform, the widest depth range
+   (|sz|, then |far - near|) among the transforms at least 1/8 as many depth-writing draws used as the most-used one;
+   ties: pdq_s_pick's order. The weapon is drawn last on some frames with its own depth range (sz 0.2): taken as the
+   frame's transform, the world's depth reprojected behind the camera (cut resets, 'offscreen' motion 1e9).
+   -1: no depth-writing draw. */
+static inline int pdq_s_pick_wide(const pdq_s_tally* t)
+{
+    unsigned k, top = 0;
+    int b = -1;
+    for (k = 0; k < t->cnt; ++k)
+        if (t->n[k] && t->dw[k] > top) top = t->dw[k];
+    if (!top) return -1;
+    for (k = 0; k < t->cnt; ++k)
+    {
+        if (!t->n[k] || t->dw[k] * 8u < top) continue;
+        if (b < 0) { b = (int)k; continue; }
+        const float ek = fabsf(t->v[k][4]), eb = fabsf(t->v[b][4]);
+        const float rk = fabsf(t->v[k][7] - t->v[k][6]), rb = fabsf(t->v[b][7] - t->v[b][6]);
+        if (ek > eb || (ek == eb && (rk > rb || (rk == rb && (t->dw[k] > t->dw[b] || (t->dw[k] == t->dw[b] && t->n[k] > t->n[b]))))))
+            b = (int)k;
+    }
+    return b;
+}
 /* ---- env helpers ------------------------------------------------------------------------------------ */
 
 static inline int pdq_env_int(const char* name, int def)
