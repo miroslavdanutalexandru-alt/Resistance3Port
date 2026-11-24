@@ -407,8 +407,8 @@ static D3D12_BLEND d3e_bf(u32 f, int alpha)
 {
     int b = rsx_d3d12_blend_factor(f, alpha);
     if (!alpha && s_d.alpha_factor_ok) {
-        if (f == 0x8003u) b = D3D12_BLEND_ALPHA_FACTOR;
-        else if (f == 0x8004u) b = D3D12_BLEND_INV_ALPHA_FACTOR;
+        if (f == 0x8003u) b = RSX_D3D12_BLEND_ALPHA_FACTOR;
+        else if (f == 0x8004u) b = RSX_D3D12_BLEND_INV_ALPHA_FACTOR;
     }
     return (D3D12_BLEND)b;
 }
@@ -514,7 +514,7 @@ static ID3D12PipelineState* d3e_build_pso(d3e_pipe* P, const d3e_vkey* k)
     ra->ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
 
     /* depth-stencil */
-    D3D12_DEPTH_STENCIL_DESC2 ds2;
+    rsx_d3d12_depth_stencil_desc2 ds2;
     memset(&ds2, 0, sizeof ds2);
     int need_ds2 = 0;
     if (k->dsf != DXGI_FORMAT_UNKNOWN) {
@@ -523,14 +523,14 @@ static ID3D12PipelineState* d3e_build_pso(d3e_pipe* P, const d3e_vkey* k)
         ds2.DepthFunc = (D3D12_COMPARISON_FUNC)rsx_d3d12_compare(rs->depth_func);
         if (rs->stencil_enable && k->stencil) {
             ds2.StencilEnable = TRUE;
-            D3D12_DEPTH_STENCILOP_DESC1* f = &ds2.FrontFace;
+            rsx_d3d12_stencilop_desc1* f = &ds2.FrontFace;
             f->StencilFailOp = (D3D12_STENCIL_OP)rsx_d3d12_stencil_op(rs->s_fail);
             f->StencilDepthFailOp = (D3D12_STENCIL_OP)rsx_d3d12_stencil_op(rs->s_zfail);
             f->StencilPassOp = (D3D12_STENCIL_OP)rsx_d3d12_stencil_op(rs->s_zpass);
             f->StencilFunc = (D3D12_COMPARISON_FUNC)rsx_d3d12_compare(rs->s_func);
             f->StencilReadMask = (UINT8)rs->s_func_mask;
             f->StencilWriteMask = (UINT8)rs->s_write_mask;
-            D3D12_DEPTH_STENCILOP_DESC1* b = &ds2.BackFace;
+            rsx_d3d12_stencilop_desc1* b = &ds2.BackFace;
             if (rs->stencil_two_sided) {
                 b->StencilFailOp = (D3D12_STENCIL_OP)rsx_d3d12_stencil_op(rs->bs_fail);
                 b->StencilDepthFailOp = (D3D12_STENCIL_OP)rsx_d3d12_stencil_op(rs->bs_zfail);
@@ -560,7 +560,7 @@ static ID3D12PipelineState* d3e_build_pso(d3e_pipe* P, const d3e_vkey* k)
     pd.DepthStencilState.StencilReadMask = ds2.FrontFace.StencilReadMask;
     pd.DepthStencilState.StencilWriteMask = ds2.FrontFace.StencilWriteMask;
     {
-        const D3D12_DEPTH_STENCILOP_DESC1* s[2] = { &ds2.FrontFace, &ds2.BackFace };
+        const rsx_d3d12_stencilop_desc1* s[2] = { &ds2.FrontFace, &ds2.BackFace };
         D3D12_DEPTH_STENCILOP_DESC* d[2] = { &pd.DepthStencilState.FrontFace, &pd.DepthStencilState.BackFace };
         for (u32 i = 0; i < 2; i++) {
             d[i]->StencilFailOp = s[i]->StencilFailOp ? s[i]->StencilFailOp : D3D12_STENCIL_OP_KEEP;
@@ -596,7 +596,7 @@ static ID3D12PipelineState* d3e_build_pso(d3e_pipe* P, const d3e_vkey* k)
         d3e_ss(b, &n, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, &pd.SampleMask, sizeof pd.SampleMask, 4);
         d3e_ss(b, &n, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, &pd.RasterizerState, sizeof pd.RasterizerState, 4);
         if (need_ds2) {
-            d3e_ss(b, &n, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, &ds2, sizeof ds2, 4);
+            d3e_ss(b, &n, RSX_D3D12_SUBOBJECT_DEPTH_STENCIL2, &ds2, sizeof ds2, 4);
         } else {
             D3D12_DEPTH_STENCIL_DESC1 ds1;
             memset(&ds1, 0, sizeof ds1);
@@ -1195,7 +1195,7 @@ static void d3e_draw(void* user, rsx_topology topology, const void* vertices, u3
     const u32 bref = (s_e.bref & 0x100u) ? (s_e.bref & 0xFFu) : sref;
     if (bref != sref && rs->stencil_two_sided && k.stencil) {
         if (s_d.cl8 && s_d.stencil_ref_ok) {
-            ID3D12GraphicsCommandList8_OMSetFrontAndBackStencilRef(s_d.cl8, sref, bref);
+            s_d.cl8->lpVtbl->OMSetFrontAndBackStencilRef(s_d.cl8, sref, bref);
             s_rc.sref = 0xFFFFFFFFu;
         } else {
             D3E_WARN_ONCE(24, "separate back-face stencil reference not supported here: front used\n");
@@ -2139,13 +2139,13 @@ static int d3e_device_create(u32 width, u32 height)
         memset(&o2, 0, sizeof o2);
         if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(s_d.dev, D3D12_FEATURE_D3D12_OPTIONS2, &o2, sizeof o2)))
             s_d.depth_bounds_ok = o2.DepthBoundsTestSupported ? 1 : 0;
-        D3D12_FEATURE_DATA_D3D12_OPTIONS13 o13;
+        rsx_d3d12_options13 o13;
         memset(&o13, 0, sizeof o13);
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(s_d.dev, D3D12_FEATURE_D3D12_OPTIONS13, &o13, sizeof o13)))
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(s_d.dev, RSX_D3D12_FEATURE_OPTIONS13, &o13, sizeof o13)))
             s_d.alpha_factor_ok = o13.AlphaBlendFactorSupported ? 1 : 0;
-        D3D12_FEATURE_DATA_D3D12_OPTIONS14 o14;
+        rsx_d3d12_options14 o14;
         memset(&o14, 0, sizeof o14);
-        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(s_d.dev, D3D12_FEATURE_D3D12_OPTIONS14, &o14, sizeof o14)))
+        if (SUCCEEDED(ID3D12Device_CheckFeatureSupport(s_d.dev, RSX_D3D12_FEATURE_OPTIONS14, &o14, sizeof o14)))
             s_d.sep_stencil_ok = s_d.stencil_ref_ok = o14.IndependentFrontAndBackStencilRefMaskSupported ? 1 : 0;
         IDXGIFactory5* f5 = NULL;
         if (SUCCEEDED(IDXGIFactory4_QueryInterface(s_d.factory, &IID_IDXGIFactory5, (void**)&f5)) && f5) {
@@ -2177,7 +2177,7 @@ static int d3e_device_create(u32 width, u32 height)
                                               &IID_ID3D12GraphicsCommandList, (void**)&s_d.cl)))
         return -1;
     ID3D12GraphicsCommandList_QueryInterface(s_d.cl, &IID_ID3D12GraphicsCommandList1, (void**)&s_d.cl1);
-    ID3D12GraphicsCommandList_QueryInterface(s_d.cl, &IID_ID3D12GraphicsCommandList8, (void**)&s_d.cl8);
+    ID3D12GraphicsCommandList_QueryInterface(s_d.cl, &rsx_d3d12_iid_cl8, (void**)&s_d.cl8);
     if (FAILED(ID3D12Device_CreateFence(s_d.dev, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_d.fence)))
         return -1;
     s_d.fence_event = CreateEventA(NULL, FALSE, FALSE, NULL);
