@@ -6,7 +6,7 @@
 #define PORT_ZCULL_RELAXED_DEFAULT 1 // R3: relaxed ZCULL sync unless R2_ZCULL=sync (third_party/rpcs3/CMakeLists.txt)
 #endif
 #ifndef PORT_ZCULL_COUNT_APPROX_DEFAULT
-#define PORT_ZCULL_COUNT_APPROX_DEFAULT 1 // R3: any-hit Z-pass reports unless RSX_ZCULL_COUNT=precise
+#define PORT_ZCULL_COUNT_APPROX_DEFAULT 0 // R3: exact Z-pass counts unless RSX_ZCULL_COUNT=approx (lens flares fade by count)
 #endif
 #include "Emu/System.h"
 #include "Emu/system_config.h"
@@ -448,7 +448,8 @@ namespace
 		// that is in no cache becomes a surface-cache render target since RPCS3 PR #19013; normally it is created at the
 		// resolution scale, with this at 100%. Workaround listed in RPCS3 issue #19391 (Insomniac blit regression).
 		if (const int b = penv_bool("RSX_NO_BLIT_UPSCALE"); b >= 0) g_cfg.video.disable_blit_engine_upscaling.set(b != 0);
-		// R3PORT: RSX_ZCULL_COUNT=approx|precise (default approx, PORT_ZCULL_COUNT_APPROX_DEFAULT). Resistance 3 hides
+		// R3PORT: RSX_ZCULL_COUNT=approx|precise (default precise since 2026-11-25: approx drew lens flares at full
+		// strength through wall/roof gaps in Haven; the carpet stayed stable with precise in the user test; PORT_ZCULL_COUNT_APPROX_DEFAULT). Resistance 3 hides
 		// an object when its occlusion proxy's Z-pass count is <= a per-object threshold (func_0074EAB0:
 		// flag = max(count - thr, 0)). Here the count is rasterised at the DLSS/FSR reduced scale with a per-frame
 		// sub-pixel jitter and rescaled to guest pixels, so a proxy near its threshold reads a different count from
