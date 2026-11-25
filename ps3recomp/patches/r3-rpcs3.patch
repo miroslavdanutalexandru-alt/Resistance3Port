@@ -19042,10 +19042,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..f77862a
+index 0000000..4100a4d
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2650 @@
+@@ -0,0 +1,2665 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -19160,6 +19160,7 @@ index 0000000..f77862a
 +		bool cap = true;       // Reflex frame cap so rendered x N stays under the refresh rate
 +		bool yflip = true;     // clip-space y up for the Streamline matrices
 +		int cut_reset = 1;     // R2_DLSS_FG_CUT_RESET: reset on cuts the upscaler holds (pfg_cut_reset)
++		int cam_reset = 1;     // R3_DLSS_FG_CAM_RESET: reset on moving frames with an untrusted camera motion (pfg_cam_reset)
 +		bool cam_ident = false; // R2_DLSS_FG_CAM_IDENT=1: identity clipToPrevClip (R1's constants; the vectors carry all motion)
 +		float depth_sep = 40.f; // R2_DLSS_FG_DEPTH_SEP: minRelativeLinearDepthObjectSeparation (Streamline default 40)
 +		int limit_fps = 0; // R2_DLSS_FG_LIMIT_FPS: cap on presented fps with DLSS-G on (0 = refresh-based cap); evens out an uneven base rate
@@ -19195,6 +19196,7 @@ index 0000000..f77862a
 +			r.cap = penv_int("DLSS_FG_CAP", 1) != 0;
 +			r.yflip = penv_int("DLSS_FG_YFLIP", 1) != 0;
 +			r.cut_reset = penv_int("DLSS_FG_CUT_RESET", 1);
++			r.cam_reset = std::clamp(penv_int("DLSS_FG_CAM_RESET", 1), 0, 2);
 +			r.gap = static_cast<unsigned>(std::clamp(penv_int("DLSS_FG_GAP", 2), 0, 8));
 +			r.cam_ident = penv_int("DLSS_FG_CAM_IDENT", 0) != 0;
 +		r.limit_fps = std::clamp(penv_int("DLSS_FG_LIMIT_FPS", 0), 0, 1000);
@@ -19218,6 +19220,19 @@ index 0000000..f77862a
 +			++logged;
 +			std::fprintf(stderr, "[fg-vk] camera cut held by the upscaler (%s motion): frame generation reset (R2_DLSS_FG_CUT_RESET=%d)\n",
 +				kind == PFG_CUT_UNTRUSTED ? "untrusted" : "voted", fgcfg().cut_reset);
++		}
++		return true;
++	}
++
++	bool r2fg_cam_reset(int src, double moving_px)
++	{
++		if (!fgcfg().want || !pfg_cam_reset(fgcfg().cam_reset, src, moving_px)) return false;
++		static bool logged = false;
++		if (!logged)
++		{
++			logged = true;
++			std::fprintf(stderr, "[fg-vk] camera motion not measured this frame (%s) while the camera moves (%.1f px): frame generation reset (R3_DLSS_FG_CAM_RESET=%d)\n",
++				src == PFG_CAM_HELD ? "failed vote, held" : src == PFG_CAM_GUESSED ? "failed vote, guessed" : "depth check reject, zeroed", moving_px, fgcfg().cam_reset);
 +		}
 +		return true;
 +	}
@@ -21698,10 +21713,10 @@ index 0000000..f77862a
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.h b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
 new file mode 100644
-index 0000000..1c8fd36
+index 0000000..f92764a
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,75 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation: NVIDIA DLSS Frame Generation (2x, 3x/4x Multi Frame Generation) through Streamline
 +// (sl.interposer.dll and its plugins), or AMD FSR 3 frame interpolation (2x, amd_fidelityfx_vk.dll) for GPUs
@@ -21749,6 +21764,9 @@ index 0000000..1c8fd36
 +	// VKR2Upscaler.cpp: a camera cut the upscaler keeps its history through (PFG_CUT_UNTRUSTED / PFG_CUT_HELD):
 +	// true when frame generation should reset on it anyway (R2_DLSS_FG_CUT_RESET, default 1 = untrusted ones)
 +	bool r2fg_cut_reset(int kind);
++	// VKR2Upscaler.cpp: this frame's camera motion is not a measurement (PFG_CAM_HELD / _GUESSED / _ZEROED) and the camera
++	// moved moving_px render pixels: true when frame generation should reset (R3_DLSS_FG_CAM_RESET, default 1)
++	bool r2fg_cam_reset(int src, double moving_px);
 +	// VKR2Upscaler.cpp, for R2_FG_DIAG / R3_FG_DIAG (VKR2FgDiag.h): the values of a held camera cut, and once per
 +	// frame-generation-tagged frame the upscaler's reset (reset_why bits), held cut kind and whether FG reset on it
 +	void r2fg_diag_cut(double motion, double parallax, u32 members, u32 matched);
@@ -21776,10 +21794,10 @@ index 0000000..1c8fd36
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
 new file mode 100644
-index 0000000..fc62095
+index 0000000..9adb01b
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,214 @@
 +/* R2PORT: Resistance 1/2/3 port addition (not upstream RPCS3).
 + * Frame generation decisions without any graphics API: the PORT_FG / PORT_FG_HUDLESS / PORT_FG_PACE selectors,
 + * the FSR 3 present pacer, the Reflex frame cap, the FSR 3 enable hold and the per-frame on/off gate.
@@ -21900,6 +21918,34 @@ index 0000000..fc62095
 +static inline int pfg_cut_reset(int mode, int kind)
 +{
 +    return kind > PFG_CUT_NONE && mode >= kind;
++}
++
++/* R2_DLSS_FG_CAM_RESET: a frame whose camera motion is not a measurement (the upscaler's camera vote failed, or its
++   depth check rejected the motion and zeroed it) while the camera moves resets frame generation, which would
++   otherwise interpolate the whole scene with a wrong or zero camera motion (a double image of everything while
++   turning; R2 Chicago Leviathan). src: PFG_CAM_HELD (failed vote, last frame's motion reused), PFG_CAM_GUESSED
++   (failed vote, the largest agreeing group of draws or no motion), PFG_CAM_ZEROED (depth check reject).
++   moving_px: pfg_cam_moving_px. Never the rejected motion (usually an object's).
++   mode: 0 off, 1 guessed / zeroed (default), 2 held ones too. */
++enum { PFG_CAM_TRUSTED = 0, PFG_CAM_HELD = 1, PFG_CAM_GUESSED = 2, PFG_CAM_ZEROED = 3 };
++#define PFG_CAM_MOVING_PX 1.0
++#define PFG_CAM_LATCH 8 /* frames a measured camera motion stands for the camera's movement */
++static inline int pfg_cam_reset(int mode, int src, double moving_px)
++{
++    if (mode <= 0 || src <= PFG_CAM_TRUSTED) return 0;
++    if (src == PFG_CAM_HELD && mode < 2) return 0;
++    return moving_px >= PFG_CAM_MOVING_PX;
++}
++
++/* moving_px for pfg_cam_reset. vp_px: the game's view-projection motion (< 0: unknown); stand_px: the stand-in motion
++   frame generation would warp by when it is one (held, or a plausible largest agreeing group: near zero = still;
++   < 0: none, the identity or a zeroed reject); latch_px / latch_age: the last measured motion and its age in frames,
++   used for PFG_CAM_LATCH frames only (a run of unmeasured frames that outlasts the turn must not keep resetting). */
++static inline double pfg_cam_moving_px(double vp_px, double stand_px, double latch_px, unsigned latch_age)
++{
++    if (vp_px >= 0.0) return stand_px > vp_px ? stand_px : vp_px;
++    if (stand_px >= 0.0) return stand_px;
++    return latch_age <= PFG_CAM_LATCH ? latch_px : 0.0;
 +}
 +
 +/* the generated frame must not blend with history: first frame, new swapchain, camera cut or a held (off) frame */
@@ -28223,10 +28269,10 @@ index 0000000..3cb23c0
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..cd10ea9
+index 0000000..31937fd
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12087 @@
+@@ -0,0 +1,12121 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -28244,6 +28290,7 @@ index 0000000..cd10ea9
 +#include "VKR2Upscaler.h"
 +#include "VKR2XeSS.h"
 +#include "VKR2FrameGen.h" // R2PORT frame generation
++#include "VKR2FrameGenLogic.h" // R2PORT: PFG_CAM_* (R3_DLSS_FG_CAM_RESET)
 +#include "Emu/RSX/port_r2preload.h" // R2PORT: r2preload::driver_call (issue #10/#23)
 +#include "VKR2DeformLogic.h" // R2PORT: RSX_DLSS_OBJMV_DEFORM capture policy (unit-tested in project\tests\fg_logic_test.cpp)
 +#include "VKR2DlssQuality.h" // PORT_DLSS_BIAS_MASK / PORT_DLSS_RESET_* helpers (unit-tested in scratch\dlss_quality)
@@ -31411,6 +31458,9 @@ index 0000000..cd10ea9
 +		screen_xform frame_S, last_S;
 +		pdq_s_tally s_tal{}; // RSX_AA_FRAME_S_VOTE: this frame's scene-draw screen transforms
 +		u32 stat_s_mixed = 0, stat_s_voted = 0, stat_s_logged = 0, stat_snap_vp_same = 0, stat_s_wide = 0, stat_s_wide_logged = 0, stat_weak_cut = 0;
++		u32 stat_fg_cam[3] = {}; // R3_DLSS_FG_CAM_RESET: frame generation resets by pfg_cam_reset src (held, guessed, zeroed)
++		double fg_mov_px = 0.0; // R3_DLSS_FG_CAM_RESET: camera motion (render px) of the last measured frame or game VP
++		u32 fg_mov_frame = 0;   // ... and its frame (PFG_CAM_LATCH)
 +		// still-camera jolts: a kept camera motion after >= 30 still runs (and the run after it); the game VP of the
 +		// previous run's previous frame, to tell a VP that returns bit-exactly (A-B-A) from a real move
 +		m4 jolt_vpp{};
@@ -35925,8 +35975,12 @@ index 0000000..cd10ea9
 +				else if (st.stat_weak_cut)
 +					r2log("camera cut: %u weak-vote cuts held (R3_FG_CAM_SANITY bit 2); depth check: %u real cuts reset, %u deferred, %u unchecked",
 +						st.stat_weak_cut, st.stat_par_confirmed, st.stat_par_cut_gapped, st.stat_par_unchecked);
++				if (st.stat_fg_cam[0] + st.stat_fg_cam[1] + st.stat_fg_cam[2])
++					r2log("frame generation reset on %u moving frames without a measured camera motion (R3_DLSS_FG_CAM_RESET): failed vote held %u, guessed %u; depth check zeroed %u",
++						st.stat_fg_cam[0] + st.stat_fg_cam[1] + st.stat_fg_cam[2], st.stat_fg_cam[0], st.stat_fg_cam[1], st.stat_fg_cam[2]);
 +			}
 +			st.stat_weak_cut = 0;
++			st.stat_fg_cam[0] = st.stat_fg_cam[1] = st.stat_fg_cam[2] = 0;
 +			st.stat_conf_n = st.stat_conf_rej = st.stat_conf_reset = st.stat_conf_zero = st.stat_conf_cut = st.stat_conf_exact = 0;
 +			st.stat_conf_kept = st.stat_par_kept = st.stat_par_confirmed = 0;
 +			st.stat_par_untrusted = st.stat_par_unchecked = st.stat_par_cut_gapped = 0;
@@ -37847,6 +37901,8 @@ index 0000000..cd10ea9
 +	m4 T_check = m4_identity(); // RSX_AA_CUT_PARALLAX_GAP: a held parallax cut's depth check uses the voted motion
 +	bool check_voted = false;
 +	int fg_cut = 0; // R2PORT frame generation: a held parallax cut (pfg_cut_reset kind)
++	int fg_cam = 0; // R3_DLSS_FG_CAM_RESET: the camera motion is not a measurement (pfg_cam_reset src)
++	double fg_cam_px = -1.0; // ... the stand-in motion it would warp by (render px; < 0: none), then pfg_cam_moving_px
 +	bool ex_used = false; // the game's own VP gave this frame's camera
 +	// RSX_AA_STATIC_SNAP: largest displacement (render pixels) of a 3x3 screen grid at far / mid / near depth under A
 +	// (1e9: a point behind the camera); ex_static: the game's verified VP is bit-identical to last frame's
@@ -38272,6 +38328,10 @@ index 0000000..cd10ea9
 +				st.stat_vote_ident++;
 +				fb = "none";
 +			}
++			// R3_DLSS_FG_CAM_RESET: the frame's motion is a stand-in. A held or largest-group stand-in is what frame
++			// generation would warp by (near zero: the static geometry stands still); "none" tells nothing.
++			fg_cam = fb[0] == 'h' ? PFG_CAM_HELD : PFG_CAM_GUESSED;
++			fg_cam_px = fb[0] == 'n' ? -1.0 : snap_px(T);
 +			if (st.vote_fail_logged < 16 || (r2cfg().debug && (st.frame % 120) == 0))
 +			{
 +				st.vote_fail_logged++;
@@ -38392,8 +38452,26 @@ index 0000000..cd10ea9
 +	}
 +	if (r2cfg().mv_conf && st.conf_reject && !reset && !(r2cfg().conf_trust_exact && st.conf_exact[st.frame % 8] == st.frame + 1))
 +	{
++		// R3_DLSS_FG_CAM_RESET: the rejected motion is no evidence that the camera moves (it is usually an object's)
++		fg_cam = PFG_CAM_ZEROED;
++		fg_cam_px = -1.0;
 +		T = m4_identity();
 +		st.stat_conf_zero++;
++	}
++	{
++		// R3_DLSS_FG_CAM_RESET: is the camera moving? The game's VP motion when it is known (confirmed or shared by most
++		// draws), the stand-in's own motion, else the last measured motion for PFG_CAM_LATCH frames (pfg_cam_moving_px).
++		// A still verified VP (ex_static) replaces the stand-in with the identity below: nothing to reset.
++		double vp_px = -1.0;
++		if (ex_static) vp_px = 0.0;
++		else if (ps_vp == 2 || (ps_vp == 1 && ex_vp_same)) vp_px = snap_px(ps_vp_T);
++		if ((!fg_cam && !fg_cut && !reset) || vp_px >= 0.0)
++		{
++			st.fg_mov_px = !fg_cam && !fg_cut && !reset ? snap_px(T) : vp_px;
++			st.fg_mov_frame = st.frame;
++		}
++		if (ex_static) fg_cam = 0;
++		if (fg_cam) fg_cam_px = pfg_cam_moving_px(vp_px, fg_cam_px, st.fg_mov_px, st.frame - st.fg_mov_frame);
 +	}
 +	if (reset)
 +	{
@@ -38876,8 +38954,10 @@ index 0000000..cd10ea9
 +	ph.mark(4);
 +
 +	const bool fg_cut_rs = ok && !reset && fg_cut && vk::r2fg_cut_reset(fg_cut);
-+	const bool fg_reset = ok && (reset || fg_cut_rs);
-+	if (ok) vk::r2fg_diag_upscaler(reset, label_why, fg_cut, fg_cut_rs);
++	const bool fg_cam_rs = ok && !reset && !fg_cut_rs && fg_cam && vk::r2fg_cam_reset(fg_cam, fg_cam_px);
++	if (fg_cam_rs) st.stat_fg_cam[fg_cam - 1]++;
++	const bool fg_reset = ok && (reset || fg_cut_rs || fg_cam_rs);
++	if (ok) vk::r2fg_diag_upscaler(reset, label_why, fg_cut, fg_cut_rs || fg_cam_rs);
 +	if (ok) vk::r2fg_tag_scene(cmd, st.depth.get(), st.mv.get(), rw, rh, jx, jy, st.vw, st.vh, st.inverted, fg_reset, &T.m[0][0], zA, zB); // R2PORT frame generation
 +	if (ok && mvd_on())
 +	{
