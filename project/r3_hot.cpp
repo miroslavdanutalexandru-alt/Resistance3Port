@@ -76,6 +76,7 @@ inline bool span_ok(uint32_t ea, uint64_t n)
 }
 inline uint32_t ld_be32(uint32_t ea) { uint32_t v; memcpy(&v, vm_base + ea, 4); return _byteswap_ulong(v); }
 inline uint16_t ld_be16(uint32_t ea) { uint16_t v; memcpy(&v, vm_base + ea, 2); return _byteswap_ushort(v); }
+inline uint64_t ld_be64(uint32_t ea) { uint64_t v; memcpy(&v, vm_base + ea, 8); return _byteswap_uint64(v); }
 
 int env_int(const char* name, int def)
 {
@@ -111,6 +112,8 @@ uint64_t g_nw_tail_seq = 0;
 uint32_t g_nw_tail_frame = 0, g_nw_tail_settle_frame = 0;
 std::atomic<long long> g_nw_skips{0}, g_nw_budget_ok{0}, g_nw_periods{0}, g_nw_drains{0}, g_nw_drain_ns{0}, g_nw_drain_max_ns{0},
     g_nw_drain_to{0}, g_nw_forced{0};
+int g_nw_late_prev = 1;             /* R3_OCC_NOWAIT_LATE: prev (default) / visible (see occ_nw_prev) */
+std::atomic<long long> g_nw_ans_prev{0}, g_nw_ans_vis{0}, g_nw_rep_prev{0}, g_nw_rep_fb{0};
 std::atomic<unsigned long long> g_occ_next{0};
 struct OccSet { uint32_t obj; int32_t b; int run; };
 OccSet g_occ_sets[16];   /* main thread only */
@@ -166,15 +169,18 @@ void occ_report()
             la = a; lf = fo; lrf = rf; lmw = mw; le = ep; lmf = mf;
         }
         if (g_nw_on || g_nw_skips.load()) {
-            static long long lsk, lbo, lpe, ldr, ldn, lto, lfo;
+            static long long lsk, lbo, lpe, ldr, ldn, lto, lfo, lap, lav, lrp, lrf;
             const long long sk = g_nw_skips.load(), bo = g_nw_budget_ok.load(), pe = g_nw_periods.load(), dr = g_nw_drains.load(),
                             dn = g_nw_drain_ns.load(), to = g_nw_drain_to.load(), fo = g_nw_forced.load();
+            const long long ap = g_nw_ans_prev.load(), av = g_nw_ans_vis.load(), rp = g_nw_rep_prev.load(), rf = g_nw_rep_fb.load();
             const long long mx = g_nw_drain_max_ns.exchange(0);
-            fprintf(stderr, "[occ] nowait 5 s: late sets drawn visible %lld in %lld frames, in within %lld us %lld; drains %lld "
-                            "(%.2f ms avg, max %.2f ms, timeouts %lld), sets visible while undrained %lld (R3_OCC_NOWAIT=%d)\n",
+            fprintf(stderr, "[occ] nowait 5 s: late sets answered %lld in %lld frames, in within %lld us %lld; drains %lld "
+                            "(%.2f ms avg, max %.2f ms, timeouts %lld), sets answered while undrained %lld; answers: previous "
+                            "results %lld (flags prev %lld, fallback %lld), visible %lld (R3_OCC_NOWAIT=%d, R3_OCC_NOWAIT_LATE=%s)\n",
                     sk - lsk, pe - lpe, g_nw_us, bo - lbo, dr - ldr, dr - ldr ? (double)(dn - ldn) / 1e6 / (double)(dr - ldr) : 0.0,
-                    (double)mx / 1e6, to - lto, fo - lfo, g_nw_on);
-            lsk = sk; lbo = bo; lpe = pe; ldr = dr; ldn = dn; lto = to; lfo = fo;
+                    (double)mx / 1e6, to - lto, fo - lfo, ap - lap, rp - lrp, rf - lrf, av - lav, g_nw_on,
+                    g_nw_late_prev ? "prev" : "visible");
+            lsk = sk; lbo = bo; lpe = pe; ldr = dr; ldn = dn; lto = to; lfo = fo; lap = ap; lav = av; lrp = rp; lrf = rf;
         }
         occ_gw_report();
         return;
@@ -200,6 +206,7 @@ HANDLE occ_timer()   /* one per calling thread (the reader is the main thread; a
 }
 
 inline void st_be32(uint32_t ea, uint32_t v) { v = _byteswap_ulong(v); memcpy(vm_base + ea, &v, 4); }
+inline void st_be16(uint32_t ea, uint16_t v) { v = _byteswap_ushort(v); memcpy(vm_base + ea, &v, 2); }
 
 /* Timeout / skip path: instead of leaving last frame's flags (which can keep an object hidden),
  * write a VISIBLE value for every report of the set (the previous value if it was visible, else 1).
@@ -380,7 +387,8 @@ void sp_update_mark(uint32_t frame)
 
 /* ---- R3_OCC_NOWAIT (default 1; R3_OCC_BLOCKING=1, RSX_OCC_SPEC_VISIBLE=0, R3_OCC_TIMEOUT_PARTIAL=0 only), ported from R2 -----------------
    Frame S: a set read from the per-object caller (0x00274E64, the only call site of func_0074EAB0) whose last report is
-   still not written after R3_OCC_NOWAIT_US (default 2000) is answered at once with occ_nw_visible (every flag
+   still not written after R3_OCC_NOWAIT_US (default 2000) is answered at once with occ_nw_answer (R3_OCC_NOWAIT_LATE=prev:
+   each object's last exact result, see occ_nw_prev; =visible: occ_nw_visible, every flag
    1 -- the object is drawn and the depth test hides it if it really is occluded; never hidden). Sets that are
    ready in S keep their exact results. The skipped reports can still land after the game zeroed and reused their
    slots, so at the FIRST set read of frame S+1 the main thread drains the RSX once (occ_nw_drain): it waits until
@@ -432,6 +440,147 @@ int occ_nw_visible(uint32_t obj, int32_t b)
     return 1;
 }
 
+/* ---- R3_OCC_NOWAIT_LATE=prev (default; =visible: every late set as occ_nw_visible, the 0.3.1 behaviour) ----------
+   Why "visible" is not harmless: occ_nw_visible returns from func_0074EAB0 with the set NOT marked read (bit b of
+   u16 obj+6, what the lifted timeout path does too). The consumers then fill the flags of an unread set with their
+   own fallbacks instead of a measured result: func_0075F378 (after 0x00274E94) calls func_0075F1C4, which writes
+   for every drawable of table 0x012B6300 its zone bit (u64 +0x40 >> entry byte +1: 1 for anything in a visible
+   zone, behind a wall or not), and func_007D7188 writes for every entry of table 0x012CA980 bit b of entry
+   byte +0x6E. Flags themselves cannot carry anything over: func_0074E944 (per frame, from func_00734A24) memsets
+   all of them to 0xFFFFFFFF, so "leave them as they were" would be visible too. Flares (additive, depth test off)
+   are then drawn through walls.
+   prev: every exact evaluation (the lifted body about to read a set whose last report is written) is recorded per
+   set b per drawable of both tables (entry index; its flag index for set b looked up in the list) with the value
+   the lifted body writes for it (max(count - thr, 0)). A late set is then answered with
+   the last exact value of each drawable (recorded at most 2 guest frames ago) -- written to the flags, the set
+   marked read exactly like the lifted body's success path, so no fallback overwrites it. Drawables without such a
+   record get what the game's own fallback writes for them (the formulas above). Flag indices are handed out anew
+   every frame (func_0074E190: obj+0x24++, reset by func_0074E944), so a flag index or list position says nothing
+   about which object it was: list entries outside both tables (other users of func_0074E190, e.g. table B
+   +0x188+2b, func_0075F1C4's r27 field) get 1 (visible, what they read with the old path too). A set with
+   no recorded value at all is answered "visible" (old path, fallbacks run). Report slots are never read here
+   (only on exact evaluations), so stale late writes in the g_nw_pend / g_nw_tail periods cannot leak in.
+   Worst case an object that just came out of cover appears one or two frames late. Main thread only. */
+constexpr uint32_t kNwObj = 0x012B3400u;   /* the only object read at 0x00274E64 (func_00274B04: r15) */
+constexpr uint32_t kNwTabA = 0x012B6300u, kNwTabB = 0x012CA980u;
+constexpr int kNwSets = 8;
+constexpr uint32_t kNwCap = 0x400;       /* flags capacity, obj+0x28 (func_0074E328) */
+constexpr uint32_t kNwEnt = 4096;
+struct NwRec { uint32_t frame, val; };
+NwRec g_nw_ra[kNwSets][kNwEnt], g_nw_rb[kNwSets][kNwEnt];
+uint32_t g_nw_mval[kNwCap], g_nw_mgen[kNwCap], g_nw_gen = 0;
+
+inline bool nw_fresh(uint32_t rf, uint32_t frame) { return rf && frame - rf <= 2; }
+
+/* calls fn(table 0/1, entry, flag index, game fallback value) for every drawable func_0075F1C4 / func_007D7188 visits */
+template <class F> bool nw_tables(int32_t b, uint32_t cap, F&& fn)
+{
+    if (!span_ok(kNwTabA, 0x48) || !span_ok(kNwTabB, 0x24)) return false;
+    const uint32_t na = ld_be32(kNwTabA + 0x34), ba = ld_be32(kNwTabA + 0x0);
+    const uint64_t zmask = ld_be64(kNwTabA + 0x40);
+    if ((int32_t)na > 0) {
+        if (na > kNwEnt || !span_ok(kNwTabA + 0x48, 8 * (uint64_t)((na + 63) / 64)) || !span_ok(ba, 0x80 * (uint64_t)na)) return false;
+        for (uint32_t i = 0; i < na; i++) {
+            if (!(ld_be64(kNwTabA + 0x48 + 8 * (i >> 6)) & (1ull << (i & 63)))) continue;
+            const uint32_t e = ba + 0x80 * i, idx = ld_be16(e + 8 + 2 * b);
+            if (idx == 0xFFFF || idx >= cap) continue;
+            const uint32_t z = vm_base[e + 1];
+            const uint32_t fb = z == 0xFF ? 0 : (zmask & (uint64_t)(int64_t)(int32_t)((z & 0x20) ? 0u : (1u << (z & 31)))) ? 1 : 0;
+            fn(0, i, idx, fb);
+        }
+    }
+    const uint32_t nb = ld_be32(kNwTabB + 0x20), bb = ld_be32(kNwTabB + 0x4);
+    if ((int32_t)nb > 0) {
+        if (nb > kNwEnt || !span_ok(bb, 0x180 * (uint64_t)nb)) return false;
+        for (uint32_t i = 0; i < nb; i++) {
+            const uint32_t e = bb + 0x180 * i;
+            if (ld_be16(e + 0x50) == 0xFFFF) continue;
+            const uint32_t idx = ld_be16(e + 0x108 + 2 * b);
+            if (idx >= cap) continue;
+            fn(1, i, idx, (vm_base[e + 0x6E] & (1u << b)) ? 1u : 0u);
+        }
+    }
+    return true;
+}
+
+bool nw_layout(uint32_t obj, int32_t b, uint32_t* cap)
+{
+    if (obj != kNwObj || b >= kNwSets || !occ_set_writable(obj, b)) return false;
+    *cap = ld_be32(obj + 0x28);
+    return *cap && *cap <= kNwCap && span_ok(ld_be32(obj + 0x0), 4 * (uint64_t)*cap);
+}
+
+/* the lifted body is about to read set b exactly (its last report is written): record what it will write */
+void nw_record(uint32_t obj, int32_t b, uint32_t frame)
+{
+    uint32_t cap;
+    if (!g_nw_late_prev || !frame || !nw_layout(obj, b, &cap)) return;
+    const uint32_t count = ld_be16(obj + 0x84 + 2 * b), list = ld_be32(obj + 0x74 + 4 * b);
+    const uint32_t base = ld_be32(0x012D6F74), thr = ld_be32(obj + 0x20);
+    if (count > kNwCap) return;
+    const uint32_t gen = ++g_nw_gen;
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t idx = ld_be16(list + 2 * i);
+        const uint32_t c = ld_be32(base + (idx << 4) + 8);
+        const uint32_t v = c > thr ? c - thr : 0;   /* func_0074EAB0 loc_0074EC30 */
+        if (idx < kNwCap) { g_nw_mval[idx] = v; g_nw_mgen[idx] = gen; }
+    }
+    nw_tables(b, cap, [&](int t, uint32_t i, uint32_t idx, uint32_t) {
+        if (g_nw_mgen[idx] != gen) return;
+        NwRec& r = (t ? g_nw_rb : g_nw_ra)[b][i];
+        r.frame = frame; r.val = g_nw_mval[idx];
+    });
+}
+
+/* a late set answered from the records (see above): 1 answered (set marked read), 0 nothing recorded / layout */
+int occ_nw_prev(uint32_t obj, int32_t b, uint32_t frame)
+{
+    uint32_t cap;
+    if (!g_nw_late_prev || !nw_layout(obj, b, &cap)) return 0;
+    const uint32_t count = ld_be16(obj + 0x84 + 2 * b), list = ld_be32(obj + 0x74 + 4 * b);
+    long long np = 0;
+    nw_tables(b, cap, [&](int t, uint32_t i, uint32_t, uint32_t) {
+        if (nw_fresh((t ? g_nw_rb : g_nw_ra)[b][i].frame, frame)) np++;
+    });
+    if (!np) return 0;
+    const uint32_t flags = ld_be32(obj + 0x0);
+    const uint32_t gen = ++g_nw_gen;
+    long long nf = 0;
+    np = 0;
+    for (uint32_t i = 0; i < count; i++) {   /* list entries: visible unless a table drawable below has a value */
+        const uint32_t idx = ld_be16(list + 2 * i);
+        st_be32(flags + (idx << 2), 1);
+        if (idx < kNwCap) g_nw_mgen[idx] = gen;
+    }
+    uint32_t hi = ld_be16(obj + 0x4);
+    const bool ok = nw_tables(b, cap, [&](int t, uint32_t i, uint32_t idx, uint32_t fb) {
+        if (!t && idx + 1 > hi) hi = idx + 1;   /* func_0075F1C4: obj+4 = max(obj+4, idx + 1) */
+        const NwRec& r = (t ? g_nw_rb : g_nw_ra)[b][i];
+        g_nw_mgen[idx] = 0;
+        if (nw_fresh(r.frame, frame)) { st_be32(flags + (idx << 2), r.val); np++; }
+        else { st_be32(flags + (idx << 2), fb); nf++; }   /* no exact value: the game's fallback */
+    });
+    for (uint32_t i = 0; ok && i < count; i++) {   /* list-only entries left at 1 */
+        const uint32_t idx = ld_be16(list + 2 * i);
+        if (idx < kNwCap && g_nw_mgen[idx] == gen) { g_nw_mgen[idx] = 0; nf++; }
+    }
+    if (!ok) return 0;   /* tables changed shape between the passes: not marked, the fallbacks run */
+    st_be16(obj + 0x4, (uint16_t)hi);
+    st_be16(obj + 0x6, (uint16_t)(ld_be16(obj + 0x6) | (1u << b)));   /* marked read: func_0074EAB0 loc_0074EB24 */
+    g_nw_rep_prev.fetch_add(np, std::memory_order_relaxed);
+    g_nw_rep_fb.fetch_add(nf, std::memory_order_relaxed);
+    return 1;
+}
+
+/* a late set's answer: occ_nw_prev, else occ_nw_visible; 0 = layout unexpected (the lifted wait) */
+int occ_nw_answer(uint32_t obj, int32_t b, uint32_t frame)
+{
+    if (occ_nw_prev(obj, b, frame)) { g_nw_ans_prev.fetch_add(1, std::memory_order_relaxed); return 1; }
+    if (!occ_nw_visible(obj, b)) return 0;
+    g_nw_ans_vis.fetch_add(1, std::memory_order_relaxed);
+    return 1;
+}
+
 /* R3_OCC_NOWAIT step for a lifted_only set read: 1/0 = r3_occ_wait's answer, -1 = go on with the normal path */
 int occ_nw_step(uint32_t site_lr, uint32_t obj, int32_t b, uint32_t frame, const volatile uint64_t* ts, uint32_t rep)
 {
@@ -460,7 +609,7 @@ int occ_nw_step(uint32_t site_lr, uint32_t obj, int32_t b, uint32_t frame, const
             }
         }
         if (g_nw_pend) {   /* not drained yet: a ready report may be a stale late write */
-            if (!occ_nw_visible(obj, b)) return 0;
+            if (!occ_nw_answer(obj, b, frame)) return 0;
             g_nw_forced.fetch_add(1, std::memory_order_relaxed);
             return 1;
         }
@@ -477,7 +626,7 @@ int occ_nw_step(uint32_t site_lr, uint32_t obj, int32_t b, uint32_t frame, const
         }
         if (g_nw_tail) {
             if (!*ts) { if (g_occ_gw) r2rsx_occ_guest_wait(rep); occ_native_wait(ts, 1000000); }
-            if (!occ_nw_visible(obj, b)) return 0;
+            if (!occ_nw_answer(obj, b, frame)) return 0;
             g_nw_forced.fetch_add(1, std::memory_order_relaxed);
             return 1;
         }
@@ -487,9 +636,10 @@ int occ_nw_step(uint32_t site_lr, uint32_t obj, int32_t b, uint32_t frame, const
         if (g_occ_gw) r2rsx_occ_guest_wait(rep);
         if (g_nw_us > 0 && !occ_native_wait(ts, g_nw_us)) {
             g_nw_budget_ok.fetch_add(1, std::memory_order_relaxed);
+            nw_record(obj, b, frame);
             return 0;   /* in within the budget: the lifted body reads the exact results */
         }
-        if (!occ_nw_visible(obj, b)) return 0;   /* layout unexpected: the lifted wait */
+        if (!occ_nw_answer(obj, b, frame)) return 0;   /* layout unexpected: the lifted wait */
         if (!g_nw_pend) g_nw_periods.fetch_add(1, std::memory_order_relaxed);
         g_nw_pend = 1; g_nw_frame = frame;
         g_nw_skips.fetch_add(1, std::memory_order_relaxed);
@@ -538,7 +688,9 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
                             "at once, report-write fence + 2 frames all-visible after; RSX_OCC_SPEC_NEED)\n",
                     g_sp_on ? "on" : "off (needs R3_OCC_BLOCKING=1 and R3_OCC_TIMEOUT_PARTIAL=0)", g_sp_need);
         {
-            const int nw = env_int("R3_OCC_NOWAIT", 1);
+            /* default 0 since 2026-11-25: a late set answered without waiting drew lens flares through walls (Haven
+             * shed), and the next frame's drain waited 15-35 ms anyway, so the saving was ~nil. 1 = opt-in. */
+            const int nw = env_int("R3_OCC_NOWAIT", 0);
             g_nw_on = (g_occ_block == 1 && !g_sp_on && !g_occ_partial && nw > 0) ? 1 : 0;
             const char* u = getenv("R3_OCC_NOWAIT_US");
             g_nw_us = (u && *u) ? atoll(u) : 2000;
@@ -546,11 +698,18 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
             long long dm = env_int("R3_OCC_NOWAIT_DRAIN_MS", 100);
             if (dm < 1) dm = 1;
             g_nw_drain_us = dm * 1000;
+            {
+                const char* lt = getenv("R3_OCC_NOWAIT_LATE");
+                g_nw_late_prev = !(lt && (!_stricmp(lt, "visible") || !strcmp(lt, "0")));
+            }
             if (g_nw_on)
-                fprintf(stderr, "[occ] R3_OCC_NOWAIT=1: an occlusion set still late after %lld us (R3_OCC_NOWAIT_US) is drawn "
-                                "visible instead of stalling the frame (caller 0x00274E64); the next frame drains the RSX once "
-                                "(<= %lld ms, R3_OCC_NOWAIT_DRAIN_MS) so results stay exact. 0 = the game's own wait\n",
-                        g_nw_us, g_nw_drain_us / 1000);
+                fprintf(stderr, "[occ] R3_OCC_NOWAIT=1: an occlusion set still late after %lld us (R3_OCC_NOWAIT_US) is answered "
+                                "without stalling the frame (caller 0x00274E64) with %s (R3_OCC_NOWAIT_LATE=prev|visible); the next "
+                                "frame drains the RSX once (<= %lld ms, R3_OCC_NOWAIT_DRAIN_MS) so results stay exact. 0 = the game's own wait\n",
+                        g_nw_us,
+                        g_nw_late_prev ? "each object's last exact result (no record: the game's fallback / visible)"
+                                       : "every object visible",
+                        g_nw_drain_us / 1000);
             else if (nw > 0)
                 fprintf(stderr, "[occ] R3_OCC_NOWAIT: off (needs R3_OCC_BLOCKING=1, RSX_OCC_SPEC_VISIBLE=0 and R3_OCC_TIMEOUT_PARTIAL=0)\n");
         }
@@ -631,6 +790,7 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
                 return 1;
             }
             if (h) h->real = 1;
+            if (g_nw_on) nw_record(obj, b, frame);   /* R3_OCC_NOWAIT_LATE=prev: the lifted body reads exact results */
         } else {
             g_occ_waited.fetch_add(1, std::memory_order_relaxed);
             if (g_occ_gw) r2rsx_occ_guest_wait(rep);   /* RSX_ZCULL_GUEST_WAIT: submit this report's query now */
