@@ -450,12 +450,14 @@ int occ_nw_visible(uint32_t obj, int32_t b)
    all of them to 0xFFFFFFFF, so "leave them as they were" would be visible too. Flares (additive, depth test off)
    are then drawn through walls.
    prev: every exact evaluation (the lifted body about to read a set whose last report is written) is recorded per
-   set b: the list (positions, flag indices) with the values the lifted body writes (max(count - thr, 0)), and per
-   drawable of both tables (entry index, its flag index for set b) the same value. A late set is then answered with
+   set b per drawable of both tables (entry index; its flag index for set b looked up in the list) with the value
+   the lifted body writes for it (max(count - thr, 0)). A late set is then answered with
    the last exact value of each drawable (recorded at most 2 guest frames ago) -- written to the flags, the set
    marked read exactly like the lifted body's success path, so no fallback overwrites it. Drawables without such a
-   record get what the game's own fallback writes for them (the formulas above), other list entries get the
-   previous value when the whole list (count + every flag index) is the one recorded, else 1 (visible). A set with
+   record get what the game's own fallback writes for them (the formulas above). Flag indices are handed out anew
+   every frame (func_0074E190: obj+0x24++, reset by func_0074E944), so a flag index or list position says nothing
+   about which object it was: list entries outside both tables (other users of func_0074E190, e.g. table B
+   +0x188+2b, func_0075F1C4's r27 field) get 1 (visible, what they read with the old path too). A set with
    no recorded value at all is answered "visible" (old path, fallbacks run). Report slots are never read here
    (only on exact evaluations), so stale late writes in the g_nw_pend / g_nw_tail periods cannot leak in.
    Worst case an object that just came out of cover appears one or two frames late. Main thread only. */
@@ -464,9 +466,7 @@ constexpr uint32_t kNwTabA = 0x012B6300u, kNwTabB = 0x012CA980u;
 constexpr int kNwSets = 8;
 constexpr uint32_t kNwCap = 0x400;       /* flags capacity, obj+0x28 (func_0074E328) */
 constexpr uint32_t kNwEnt = 4096;
-struct NwPos { uint32_t frame, count; uint16_t idx[kNwCap]; uint32_t val[kNwCap]; };
 struct NwRec { uint32_t frame, val; };
-NwPos g_nw_pos[kNwSets];
 NwRec g_nw_ra[kNwSets][kNwEnt], g_nw_rb[kNwSets][kNwEnt];
 uint32_t g_nw_mval[kNwCap], g_nw_mgen[kNwCap], g_nw_gen = 0;
 
@@ -518,17 +518,13 @@ void nw_record(uint32_t obj, int32_t b, uint32_t frame)
     const uint32_t count = ld_be16(obj + 0x84 + 2 * b), list = ld_be32(obj + 0x74 + 4 * b);
     const uint32_t base = ld_be32(0x012D6F74), thr = ld_be32(obj + 0x20);
     if (count > kNwCap) return;
-    NwPos& p = g_nw_pos[b];
     const uint32_t gen = ++g_nw_gen;
-    p.frame = 0;
     for (uint32_t i = 0; i < count; i++) {
         const uint32_t idx = ld_be16(list + 2 * i);
         const uint32_t c = ld_be32(base + (idx << 4) + 8);
         const uint32_t v = c > thr ? c - thr : 0;   /* func_0074EAB0 loc_0074EC30 */
-        p.idx[i] = (uint16_t)idx; p.val[i] = v;
         if (idx < kNwCap) { g_nw_mval[idx] = v; g_nw_mgen[idx] = gen; }
     }
-    p.count = count; p.frame = frame;
     nw_tables(b, cap, [&](int t, uint32_t i, uint32_t idx, uint32_t) {
         if (g_nw_mgen[idx] != gen) return;
         NwRec& r = (t ? g_nw_rb : g_nw_ra)[b][i];
@@ -542,10 +538,7 @@ int occ_nw_prev(uint32_t obj, int32_t b, uint32_t frame)
     uint32_t cap;
     if (!g_nw_late_prev || !nw_layout(obj, b, &cap)) return 0;
     const uint32_t count = ld_be16(obj + 0x84 + 2 * b), list = ld_be32(obj + 0x74 + 4 * b);
-    const NwPos& p = g_nw_pos[b];
-    bool same = nw_fresh(p.frame, frame) && p.count == count;
-    for (uint32_t i = 0; same && i < count; i++) same = p.idx[i] == ld_be16(list + 2 * i);
-    long long np = same ? count : 0;
+    long long np = 0;
     nw_tables(b, cap, [&](int t, uint32_t i, uint32_t, uint32_t) {
         if (nw_fresh((t ? g_nw_rb : g_nw_ra)[b][i].frame, frame)) np++;
     });
@@ -554,20 +547,23 @@ int occ_nw_prev(uint32_t obj, int32_t b, uint32_t frame)
     const uint32_t gen = ++g_nw_gen;
     long long nf = 0;
     np = 0;
-    for (uint32_t i = 0; i < count; i++) {
+    for (uint32_t i = 0; i < count; i++) {   /* list entries: visible unless a table drawable below has a value */
         const uint32_t idx = ld_be16(list + 2 * i);
-        st_be32(flags + (idx << 2), same ? p.val[i] : 1);
+        st_be32(flags + (idx << 2), 1);
         if (idx < kNwCap) g_nw_mgen[idx] = gen;
-        if (same) np++; else nf++;
     }
     uint32_t hi = ld_be16(obj + 0x4);
     const bool ok = nw_tables(b, cap, [&](int t, uint32_t i, uint32_t idx, uint32_t fb) {
         if (!t && idx + 1 > hi) hi = idx + 1;   /* func_0075F1C4: obj+4 = max(obj+4, idx + 1) */
         const NwRec& r = (t ? g_nw_rb : g_nw_ra)[b][i];
-        const bool in = g_nw_mgen[idx] == gen;
+        g_nw_mgen[idx] = 0;
         if (nw_fresh(r.frame, frame)) { st_be32(flags + (idx << 2), r.val); np++; }
-        else if (!(same && in)) { st_be32(flags + (idx << 2), fb); nf++; }   /* no exact value: the game's fallback */
+        else { st_be32(flags + (idx << 2), fb); nf++; }   /* no exact value: the game's fallback */
     });
+    for (uint32_t i = 0; ok && i < count; i++) {   /* list-only entries left at 1 */
+        const uint32_t idx = ld_be16(list + 2 * i);
+        if (idx < kNwCap && g_nw_mgen[idx] == gen) { g_nw_mgen[idx] = 0; nf++; }
+    }
     if (!ok) return 0;   /* tables changed shape between the passes: not marked, the fallbacks run */
     st_be16(obj + 0x4, (uint16_t)hi);
     st_be16(obj + 0x6, (uint16_t)(ld_be16(obj + 0x6) | (1u << b)));   /* marked read: func_0074EAB0 loc_0074EB24 */
