@@ -1288,7 +1288,9 @@ extern "C" int r2rsx_context_allocate(uint32_t dma_control_ea, uint32_t label_ea
 	}
 
 	std::thread(intr_thread_main).detach();
-	if (r2prof::enabled) std::thread(prof_thread_main).detach(); // R2PORT perf
+	// the 5 s [r2rsx-prof] log block only with R2_RSX_PROF=1: the F3 overlay (R2_OVERLAY=1 turns it on before
+	// this point) needs the counters, not this thread, whose thread scans cost CPU on 4-thread PCs (R3 #33)
+	if (penv_bool("R2_RSX_PROF") == 1) std::thread(prof_thread_main).detach(); // R2PORT perf
 	rsx_host_sample::start_if_enabled(); // R3PORT perf r8: RSX_HOST_SAMPLE=1 (default off)
 	r2texdiag::start_reporter(); // R2PORT: [texcache] 10 s line (RSX_TEXDIAG=0 off)
 
