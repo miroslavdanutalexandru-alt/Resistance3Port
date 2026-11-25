@@ -688,7 +688,9 @@ extern "C" int r3_occ_wait(ppu_context* ctx)
                             "at once, report-write fence + 2 frames all-visible after; RSX_OCC_SPEC_NEED)\n",
                     g_sp_on ? "on" : "off (needs R3_OCC_BLOCKING=1 and R3_OCC_TIMEOUT_PARTIAL=0)", g_sp_need);
         {
-            const int nw = env_int("R3_OCC_NOWAIT", 1);
+            /* default 0 since 2026-11-25: a late set answered without waiting drew lens flares through walls (Haven
+             * shed), and the next frame's drain waited 15-35 ms anyway, so the saving was ~nil. 1 = opt-in. */
+            const int nw = env_int("R3_OCC_NOWAIT", 0);
             g_nw_on = (g_occ_block == 1 && !g_sp_on && !g_occ_partial && nw > 0) ? 1 : 0;
             const char* u = getenv("R3_OCC_NOWAIT_US");
             g_nw_us = (u && *u) ? atoll(u) : 2000;
