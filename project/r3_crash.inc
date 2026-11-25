@@ -42,6 +42,52 @@ static void r3_crash_guest(PortGuestState* g)
                                      &g->syscall_last, &g->callsite);
 }
 
+/* R3 #33: an RPCS3 renderer thread (rsx::thread, ...) that dies of a fatal error -- e.g. out of video memory --
+ * used to leave the game frozen on its last frame, with no report (focus pauses kept resetting the hang
+ * watchdog). Utilities/Thread.cpp calls this right after logging the error: write the crash report now,
+ * tell the player what happened and close the game. Other RPCS3 threads keep the old behaviour. */
+extern "C" void (*g_port_thread_fatal_hook)(const char* thread_name, const char* reason);
+extern "C" void* rsx_null_backend_get_hwnd(void);
+static void r3_thread_fatal(const char* thread_name, const char* reason)
+{
+    if (!thread_name || !(strstr(thread_name, "rsx") || strstr(thread_name, "RSX"))) return;
+    static volatile LONG s_once = 0;
+    if (InterlockedExchange(&s_once, 1)) { Sleep(INFINITE); }   /* a second dying thread waits for the first to exit */
+    if (!reason) reason = "?";
+    const bool vram = strstr(reason, "0xfffffffe") || strstr(reason, "OUT_OF_DEVICE_MEMORY") ||
+                      (strstr(reason, "memory.cpp") && strstr(reason, "Not enough memory"));
+    const DWORD code = vram ? 0xE0000E01u : 0xE0000E02u;
+    static char how[640];
+    snprintf(how, sizeof how, "%s: renderer thread '%s' died: %.520s", vram ? "out of video memory" : "renderer fatal error",
+             thread_name, reason);
+    for (char* p = how; *p; ++p) if (*p == '\r' || *p == '\n') *p = ' ';   /* one line in crashes.txt */
+    port_crash::crash_here(how, code);
+
+    rsx_null_refresh_restore_on_crash();
+    ClipCursor(NULL);
+    if (HWND w = (HWND)rsx_null_backend_get_hwnd()) ShowWindowAsync(w, SW_MINIMIZE);
+    char msg[1024];
+    if (vram) {
+        r2ac::Hardware hw;
+        r2ac::detect_gpu(hw);
+        char gpu[96] = "";
+        if (hw.vram_gb > 0.1) snprintf(gpu, sizeof gpu, " (%.0f GB on this GPU)", hw.vram_gb);
+        snprintf(msg, sizeof msg,
+                 "Resistance 3 has to close: the graphics card ran out of video memory%s.\n\n"
+                 "In the launcher, set Render resolution to 1280 x 720 (or pick a lower preset), "
+                 "then start the game again.%s", gpu,
+                 port_crash::s_on ? "\n\nA report was saved in logs\\crash." : "");
+    } else {
+        snprintf(msg, sizeof msg,
+                 "Resistance 3 has to close: the renderer hit an error it cannot recover from.\n\n%.360s%s", reason,
+                 port_crash::s_on ? "\n\nA report was saved in logs\\crash. Please include it and logs\\run.log when you report this." : "");
+    }
+    fprintf(stderr, "[crash] %s: closing the game\n", vram ? "out of video memory" : "renderer fatal error");
+    fflush(stderr);
+    MessageBoxA(NULL, msg, "Resistance 3", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    TerminateProcess(GetCurrentProcess(), code);
+}
+
 static void r2_crash_init(void)
 {
     PortCrashConfig c = {};
@@ -60,6 +106,7 @@ static void r2_crash_init(void)
     c.guest_threads = ppu_crash_guest_threads;
     c.after_report = port_ft_on_report;
     port_crash::init(c);
+    g_port_thread_fatal_hook = r3_thread_fatal;
     PortFtConfig f = {};
     f.title = c.title;
     f.paused = r3_crash_paused;
