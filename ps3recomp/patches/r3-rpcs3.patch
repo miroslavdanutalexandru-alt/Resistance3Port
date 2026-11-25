@@ -764,7 +764,7 @@ index 0000000..2a256ca
 +- `r2port::g_rsx_cache_dir` sets the shader cache dir. Leave it empty to disable the on-disk cache.
 +- `rpcs3_shim/rsx_events_stub.cpp` holds `rsx::thread::send_event` and `sys_rsx_context_attribute`. Replace it with the real lv2 bridge.
 diff --git a/Utilities/Thread.cpp b/Utilities/Thread.cpp
-index 8f79b7c..9a1ab93 100644
+index 8f79b7c..e41a7f0 100644
 --- a/Utilities/Thread.cpp
 +++ b/Utilities/Thread.cpp
 @@ -2530,8 +2530,16 @@ static LONG exception_filter(PEXCEPTION_POINTERS pExp) noexcept
@@ -784,7 +784,17 @@ index 8f79b7c..9a1ab93 100644
  #ifdef USE_ASAN
  	if (!AddVectoredExceptionHandler(FALSE, static_cast<PVECTORED_EXCEPTION_HANDLER>(exception_handler)))
  #else
-@@ -3509,6 +3517,11 @@ void thread_ctrl::set_name(std::string name)
+@@ -3465,6 +3473,9 @@ void thread_ctrl::set_name(std::string name)
+ 	g_tls_this_thread->set_name(std::move(name));
+ }
+ 
++// R3PORT (#33): set by the game (crash reporter); called once per fatal thread error after it is logged
++extern "C" void (*g_port_thread_fatal_hook)(const char* thread_name, const char* reason) = nullptr;
++
+ [[noreturn]] void thread_ctrl::emergency_exit(std::string_view reason)
+ {
+ 	// Print stacktrace
+@@ -3509,8 +3520,20 @@ void thread_ctrl::set_name(std::string name)
  
  	sig_log.fatal("Thread terminated due to fatal error: %s", reason);
  
@@ -795,7 +805,16 @@ index 8f79b7c..9a1ab93 100644
 +
  	logs::listener::sync_all();
  
++	// R3PORT (#33): the game hooks this to write a crash report and tell the user, instead of a silent freeze
++	if (const auto hook = g_port_thread_fatal_hook)
++	{
++		const std::string reason_str{reason};
++		hook(g_tls_this_thread ? thread_ctrl::get_name().c_str() : "?", reason_str.c_str());
++	}
++
  	if (IsDebuggerPresent())
+ 	{
+ 		// Prevent repeatedly halting the debugger in case multiple threads crashed at once
 diff --git a/rpcs3/Emu/Memory/vm.h b/rpcs3/Emu/Memory/vm.h
 index 9e8aa9e..1a1028f 100644
 --- a/rpcs3/Emu/Memory/vm.h
@@ -11856,7 +11875,7 @@ index 439cd37..55957d2 100644
  	decompiler.device_props.has_low_precision_rounding = vk::is_NVIDIA(vk::get_driver_vendor());
  	decompiler.Task();
 diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.cpp b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
-index b101a27..3706ba2 100644
+index b101a27..58312f5 100644
 --- a/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 @@ -21,10 +21,26 @@
@@ -11941,10 +11960,35 @@ index b101a27..3706ba2 100644
  	}
  
  	if (!m_swapchain)
-@@ -473,6 +528,36 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -473,6 +528,61 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  	vk::set_current_renderer(m_swapchain->get_device());
  	vk::init();
  
++	// R3PORT (#33): a 2 GB GPU runs out of video memory above 1.25x render scale (RSX_RES_SCALE). Cap it once, before
++	// any surface exists. VRAM = the largest device-local heap (or RSX_VRAM_LIMIT_MB if lower). RSX_VRAM_AUTOCAP=0 = off.
++	if (const char* e = std::getenv("RSX_VRAM_AUTOCAP"); !(e && e[0] == '0'))
++	{
++		const auto& mem_props = m_device->gpu().get_memory_properties();
++		u64 vram = 0;
++		for (u32 i = 0; i < mem_props.memoryHeapCount; ++i)
++		{
++			if (mem_props.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
++			{
++				vram = std::max<u64>(vram, mem_props.memoryHeaps[i].size);
++			}
++		}
++		vram = std::min<u64>(vram, g_cfg.video.vk.vram_allocation_limit * 0x100000ull) / 0x100000;
++
++		constexpr u32 capped_scale = 125;
++		if (vram && vram <= 2560 && g_cfg.video.resolution_scale_percent.get() > capped_scale &&
++			m_device->get_memory_mapping().device_local != m_device->get_memory_mapping().host_visible_coherent) // not an IGP
++		{
++			std::fprintf(stderr, "[rsx] %llu MB of video memory: render scale capped at %.2fx (was %.2fx) so the GPU does not run out of VRAM; RSX_VRAM_AUTOCAP=0 keeps it\n",
++				static_cast<unsigned long long>(vram), capped_scale / 100.0, g_cfg.video.resolution_scale_percent.get() / 100.0);
++			g_cfg.video.resolution_scale_percent.set(capped_scale);
++		}
++	}
++
 +	{
 +		// R2PORT (issue #10): AMD GPUs create pipelines one at a time (PORT_PIPE_SERIAL), decided before any compile
 +		VkPhysicalDeviceProperties props{};
@@ -11978,7 +12022,7 @@ index b101a27..3706ba2 100644
  	m_swapchain_dims.width = m_frame->client_width();
  	m_swapchain_dims.height = m_frame->client_height();
  
-@@ -486,6 +571,8 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -486,6 +596,8 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  	m_primary_cb_list.create(m_command_buffer_pool, vk::command_buffer::access_type_hint::flush_only);
  	m_current_command_buffer = m_primary_cb_list.get();
  	m_current_command_buffer->begin();
@@ -11987,7 +12031,7 @@ index b101a27..3706ba2 100644
  
  	// Create secondary command_buffer for parallel operations
  	m_secondary_command_buffer_pool.create((*m_device), m_device->get_graphics_queue_family());
-@@ -500,15 +587,20 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -500,15 +612,20 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  		m_occlusion_query_manager->set_control_flags(VK_QUERY_CONTROL_PRECISE_BIT, 0);
  	}
  
@@ -12010,7 +12054,7 @@ index b101a27..3706ba2 100644
  	m_raster_env_ring_info.create(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_UBO_RING_BUFFER_SIZE_M * 0x100000, vk::heap_pool_low_latency, "raster env buffer", 0x10000, VK_TRUE);
  	// Below here, we do not bind these persistently. Each draw call specifies the range manually so we do not need heap_grow notifications.
  	m_instancing_buffer_ring_info.create(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_TRANSFORM_CONSTANTS_BUFFER_SIZE_M * 0x100000, vk::heap_pool_default, "instancing data buffer");
-@@ -530,6 +622,14 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -530,6 +647,14 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  		std::ref(m_instancing_buffer_ring_info)
  	});
  
@@ -12025,7 +12069,7 @@ index b101a27..3706ba2 100644
  	m_flushable_data_heaps = vk::data_heap_manager::to_list().filter(FN(x->has_shadow()));
  
  	const auto shadermode = g_cfg.video.shadermode.get();
-@@ -606,6 +706,7 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -606,6 +731,7 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  		{
  			// Program was linked or queued for linking
  			m_shaders_cache->store(props, vp, fp);
@@ -12033,7 +12077,7 @@ index b101a27..3706ba2 100644
  		}
  	);
  
-@@ -648,6 +749,32 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -648,6 +774,32 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  		!m_device->get_barycoords_support() ||
  		g_cfg.video.shader_precision == gpu_preset_level::low);
  
@@ -12066,7 +12110,7 @@ index b101a27..3706ba2 100644
  	// NOTE: We do not actually need multiple sample support for A2C to work
  	// This is here for visual consistency - will be removed when AA problems due to mipmaps are fixed
  	if (g_cfg.video.antialiasing_level != msaa_level::none)
-@@ -809,6 +936,12 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
+@@ -809,6 +961,12 @@ VKGSRender::VKGSRender(rsx::context* ctx, rsx::display_output* output) noexcept
  
  VKGSRender::~VKGSRender()
  {
@@ -12079,7 +12123,7 @@ index b101a27..3706ba2 100644
  	if (m_device == VK_NULL_HANDLE)
  	{
  		//Initialization failed
-@@ -817,6 +950,7 @@ VKGSRender::~VKGSRender()
+@@ -817,6 +975,7 @@ VKGSRender::~VKGSRender()
  
  	//Wait for device to finish up with resources
  	vkDeviceWaitIdle(*m_device);
@@ -12087,7 +12131,7 @@ index b101a27..3706ba2 100644
  
  	// Globals. TODO: Refactor lifetime management
  	if (auto async_scheduler = g_fxo->try_get<vk::AsyncTaskScheduler>())
-@@ -826,6 +960,8 @@ VKGSRender::~VKGSRender()
+@@ -826,6 +985,8 @@ VKGSRender::~VKGSRender()
  
  	// GC cleanup
  	vk::get_resource_manager()->flush();
@@ -12096,7 +12140,7 @@ index b101a27..3706ba2 100644
  
  	// Host data
  	if (m_host_object_data)
-@@ -838,9 +974,17 @@ VKGSRender::~VKGSRender()
+@@ -838,9 +999,17 @@ VKGSRender::~VKGSRender()
  	m_flush_requests.clear_pending_flag();
  
  	// Shaders
@@ -12114,7 +12158,7 @@ index b101a27..3706ba2 100644
  	m_shader_interpreter.destroy();
  
  	m_persistent_attribute_storage.reset();
-@@ -873,6 +1017,7 @@ VKGSRender::~VKGSRender()
+@@ -873,6 +1042,7 @@ VKGSRender::~VKGSRender()
  
  	m_overlay_recording_img.reset();
  	m_stencil_mirror_sampler.reset();
@@ -12122,7 +12166,7 @@ index b101a27..3706ba2 100644
  
  	// Queries
  	m_occlusion_query_manager.reset();
-@@ -919,7 +1064,7 @@ std::string VKGSRender::configured_logical_id() const
+@@ -919,7 +1089,7 @@ std::string VKGSRender::configured_logical_id() const
  
  	// An empty adapter selects the default GPU, which is the one in use
  	const std::string adapter = g_cfg.video.vk.adapter.to_string();
@@ -12131,7 +12175,7 @@ index b101a27..3706ba2 100644
  		? logical_id()
  		: "Vulkan | " + adapter;
  }
-@@ -951,6 +1096,11 @@ bool VKGSRender::on_access_violation(rsx::context* ctx, u32 address, bool is_wri
+@@ -951,6 +1121,11 @@ bool VKGSRender::on_access_violation(rsx::context* ctx, u32 address, bool is_wri
  
  	if (result.num_flushable > 0)
  	{
@@ -12143,7 +12187,7 @@ index b101a27..3706ba2 100644
  		if (g_fxo->get<rsx::dma_manager>().is_current_thread())
  		{
  			// The offloader thread cannot handle flush requests
-@@ -1011,7 +1161,33 @@ bool VKGSRender::on_access_violation(rsx::context* ctx, u32 address, bool is_wri
+@@ -1011,7 +1186,33 @@ bool VKGSRender::on_access_violation(rsx::context* ctx, u32 address, bool is_wri
  			};
  		}
  
@@ -12178,7 +12222,7 @@ index b101a27..3706ba2 100644
  
  		if (has_queue_ref)
  		{
-@@ -1052,8 +1228,44 @@ void VKGSRender::on_unmap_memory_range(const utils::address_range32& range)
+@@ -1052,8 +1253,44 @@ void VKGSRender::on_unmap_memory_range(const utils::address_range32& range)
  	vk::unmap_dma(range.start, range.length());
  }
  
@@ -12223,7 +12267,7 @@ index b101a27..3706ba2 100644
  	if (m_flush_requests.pending() ||
  		RSX(m_ctx)->display_ctrl().has_flip_request(rsx::thread::flip_request::emu_requested) ||
  		(m_queue_status & flush_queue_state::deadlock))
-@@ -1062,6 +1274,26 @@ void VKGSRender::on_semaphore_acquire_wait()
+@@ -1062,12 +1299,33 @@ void VKGSRender::on_semaphore_acquire_wait()
  	}
  }
  
@@ -12250,7 +12294,36 @@ index b101a27..3706ba2 100644
  bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
  {
  	ensure(!vk::is_uninterruptible() && rsx::get_current_renderer()->is_current_thread());
-@@ -1236,6 +1468,7 @@ void VKGSRender::set_viewport()
+ 
+ 	const auto resources = res();
+ 	bool texture_cache_relieved = false;
++	const bool emergency = vk::vmm_in_oom_emergency(); // R3PORT (#33): an allocation failed even after the normal pass
+ 	if (severity >= rsx::problem_severity::fatal)
+ 	{
+ 		// Hard sync before trying to evict anything. This guarantees no UAF crashes in the driver.
+@@ -1075,7 +1333,7 @@ bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
+ 		flush_command_queue(true, true);
+ 		g_fxo->get<vk::driver_manager_thread>().drain();
+ 
+-		if (resources && resources->texture_cache.is_overallocated())
++		if (resources && (emergency || resources->texture_cache.is_overallocated()))
+ 		{
+ 			// Evict some unused textures. Do not evict any active references
+ 			std::set<u32> exclusion_list;
+@@ -1116,10 +1374,10 @@ bool VKGSRender::on_vram_exhausted(rsx::problem_severity severity)
+ 	// Check if we need to spill
+ 	if (severity >= rsx::problem_severity::fatal &&                // Only spill for fatal errors
+ 		mem_info.device_local != mem_info.host_visible_coherent && // Do not spill if it is an IGP, there is nowhere to spill to
+-		resources && resources->surface_cache.is_overallocated())  // Surface cache must be over-allocated by the design quota
++		resources && (emergency || resources->surface_cache.is_overallocated()))  // Surface cache must be over-allocated by the design quota
+ 	{
+ 		// Queue a VRAM spill operation.
+-		resources->surface_cache.spill_unused_memory();
++		resources->surface_cache.spill_unused_memory(emergency);
+ 	}
+ 
+ 	// Moderate severity and higher also starts removing stale render target objects
+@@ -1236,6 +1494,7 @@ void VKGSRender::set_viewport()
  	{
  		m_viewport.minDepth = zclip_near;
  		m_viewport.maxDepth = zclip_far;
@@ -12258,7 +12331,7 @@ index b101a27..3706ba2 100644
  	}
  	else
  	{
-@@ -1269,17 +1502,51 @@ void VKGSRender::set_scissor()
+@@ -1269,17 +1528,51 @@ void VKGSRender::set_scissor()
  
  void VKGSRender::bind_viewport()
  {
@@ -12312,7 +12385,7 @@ index b101a27..3706ba2 100644
  void VKGSRender::on_init()
  {
  	// Disable automatic backend reset if we crash during initialization.
-@@ -1295,8 +1562,17 @@ void VKGSRender::on_init()
+@@ -1295,8 +1588,17 @@ void VKGSRender::on_init()
  	if (Emu.GetBootMode() == boot_mode::application)
  	{
  		preload_shaders();
@@ -12330,7 +12403,7 @@ index b101a27..3706ba2 100644
  	// Now we properly initialize the pipe compiler as per the user's configuration
  	if (!g_cfg.video.shader_compiler_threads_count)
  	{
-@@ -1305,14 +1581,295 @@ void VKGSRender::on_init()
+@@ -1305,14 +1607,295 @@ void VKGSRender::on_init()
  
  	// If we survived init - loading shaders, etc, then we can re-enable protection.
  	vk::arm_device_loss_protection();
@@ -12627,7 +12700,7 @@ index b101a27..3706ba2 100644
  			? std::make_unique<rsx::shader_loading_dialog_native>(RSX(m_ctx))
  			: std::make_unique<rsx::shader_loading_dialog>();
  		m_shader_interpreter.preload(dlg.get());
-@@ -1321,7 +1878,7 @@ void VKGSRender::preload_shaders()
+@@ -1321,7 +1904,7 @@ void VKGSRender::preload_shaders()
  
  	if (g_cfg.video.shadermode != shader_mode::interpreter_only)
  	{
@@ -12636,7 +12709,7 @@ index b101a27..3706ba2 100644
  		{
  			m_frame->hide();
  			m_shaders_cache->load(nullptr);
-@@ -1334,6 +1891,7 @@ void VKGSRender::preload_shaders()
+@@ -1334,6 +1917,7 @@ void VKGSRender::preload_shaders()
  			// TODO: Handle window resize messages during loading on GPUs without OUT_OF_DATE_KHR support
  			m_shaders_cache->load(&dlg);
  		}
@@ -12644,7 +12717,7 @@ index b101a27..3706ba2 100644
  	}
  }
  
-@@ -1350,6 +1908,13 @@ std::unique_ptr<rsx::context_resources> VKGSRender::create_context_resources(rsx
+@@ -1350,6 +1934,13 @@ std::unique_ptr<rsx::context_resources> VKGSRender::create_context_resources(rsx
  	resources->texture_cache.set_context(ctx);
  	resources->texture_cache.initialize(*m_device, m_device->get_graphics_queue(), m_texture_upload_buffer_ring_info);
  
@@ -12658,7 +12731,7 @@ index b101a27..3706ba2 100644
  	return resources;
  }
  
-@@ -1414,6 +1979,7 @@ void VKGSRender::on_unbind_context(rsx::context* ctx)
+@@ -1414,6 +2005,7 @@ void VKGSRender::on_unbind_context(rsx::context* ctx)
  
  void VKGSRender::on_shutdown()
  {
@@ -12666,7 +12739,7 @@ index b101a27..3706ba2 100644
  	// Flush DMA queue
  	while (!g_fxo->get<rsx::dma_manager>().sync())
  	{
-@@ -1421,6 +1987,8 @@ void VKGSRender::on_shutdown()
+@@ -1421,6 +2013,8 @@ void VKGSRender::on_shutdown()
  	}
  
  	destroy_frame_context();
@@ -12675,7 +12748,7 @@ index b101a27..3706ba2 100644
  	vk::destroy_pipe_compiler(); // Ensure no pending shaders being compiled
  }
  
-@@ -1430,6 +1998,9 @@ void VKGSRender::clear()
+@@ -1430,6 +2024,9 @@ void VKGSRender::clear()
  	const auto& info = m_ctx->draw_state.clear;
  	const auto mask = info.mask;
  
@@ -12685,7 +12758,7 @@ index b101a27..3706ba2 100644
  	set_scissor();
  
  	constexpr u32 stencil_clear = 0;
-@@ -1456,6 +2027,15 @@ void VKGSRender::clear()
+@@ -1456,6 +2053,15 @@ void VKGSRender::clear()
  
  	if (auto ds = std::get<1>(res()->surface_cache.m_bound_depth_stencil); ds && (mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK))
  	{
@@ -12701,7 +12774,7 @@ index b101a27..3706ba2 100644
  		if (mask & RSX_GCM_CLEAR_DEPTH_BIT)
  		{
  			f32 depth_clear = info.depth_value;
-@@ -1513,7 +2093,7 @@ void VKGSRender::clear()
+@@ -1513,7 +2119,7 @@ void VKGSRender::clear()
  			else
  			{
  				// Barrier required before any writes
@@ -12710,7 +12783,7 @@ index b101a27..3706ba2 100644
  			}
  		}
  	}
-@@ -1598,10 +2178,34 @@ void VKGSRender::clear()
+@@ -1598,10 +2204,34 @@ void VKGSRender::clear()
  		begin_render_pass();
  		vkCmdClearAttachments(*m_current_command_buffer, ::size32(clear_descriptors), clear_descriptors.data(), 1, &region);
  	}
@@ -12745,7 +12818,7 @@ index b101a27..3706ba2 100644
  	close_and_submit_command_buffer();
  
  	if (hard_sync)
-@@ -1643,6 +2247,9 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
+@@ -1643,6 +2273,9 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
  	}
  
  	m_current_command_buffer->begin();
@@ -12755,7 +12828,7 @@ index b101a27..3706ba2 100644
  }
  
  std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data() const
-@@ -1779,6 +2386,7 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
+@@ -1779,6 +2412,7 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
  
  		// Unavoidable hard sync coming up, flush immediately
  		// This heavyweight hint should be used with caution
@@ -12763,7 +12836,7 @@ index b101a27..3706ba2 100644
  		std::lock_guard lock(m_flush_queue_mutex);
  		flush_command_queue();
  
-@@ -1794,6 +2402,48 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
+@@ -1794,6 +2428,48 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
  
  bool VKGSRender::on_local_task(rsx::FIFO::state state)
  {
@@ -12812,7 +12885,7 @@ index b101a27..3706ba2 100644
  	if (m_queue_status & flush_queue_state::deadlock)
  	{
  		// Clear offloader deadlock
-@@ -1813,6 +2463,7 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
+@@ -1813,6 +2489,7 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
  	{
  		if (m_flush_queue_mutex.try_lock())
  		{
@@ -12820,7 +12893,7 @@ index b101a27..3706ba2 100644
  			// TODO: Determine if a hard sync is necessary
  			// Pipeline barriers later may do a better job synchronizing than wholly stalling the pipeline
  			flush_command_queue();
-@@ -1834,6 +2485,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
+@@ -1834,6 +2511,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
  			}
  			m_ctx->graphics_state.clear(rsx::pipeline_state::framebuffer_reads_dirty);
  		}
@@ -12829,7 +12902,7 @@ index b101a27..3706ba2 100644
  	}
  
  	return true;
-@@ -1850,8 +2503,10 @@ bool VKGSRender::load_program()
+@@ -1850,8 +2529,10 @@ bool VKGSRender::load_program()
  	constexpr u32 pipeline_properties_invalidate_bits = (RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING | RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE);
  	const u32 pipeline_properties_ctrl = m_ctx->program.fragment_program.ctrl & pipeline_properties_invalidate_bits;
  
@@ -12840,7 +12913,7 @@ index b101a27..3706ba2 100644
  		pipeline_properties_ctrl != m_pipeline_properties_ctrl ||
  		vk::get_renderpass_format_key(m_pipeline_properties.renderpass_key) != vk::get_renderpass_format_key(m_current_renderpass_key) || // We only care about RP format mismatch
  		m_pipeline_properties.state.cs.attachmentCount != m_draw_buffers.size();
-@@ -1902,10 +2557,11 @@ bool VKGSRender::load_program()
+@@ -1902,10 +2583,11 @@ bool VKGSRender::load_program()
  			u8((m_current_renderpass_key >> 16) & 0xF),
  			m_device->get_depth_bounds_support(),
  			!!(m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING),
@@ -12853,7 +12926,7 @@ index b101a27..3706ba2 100644
  		m_pipeline_properties_ctrl = pipeline_properties_ctrl;
  
  		if (m_program &&
-@@ -1935,7 +2591,7 @@ bool VKGSRender::load_program()
+@@ -1935,7 +2617,7 @@ bool VKGSRender::load_program()
  	{
  		vk::enter_uninterruptible();
  
@@ -12862,7 +12935,7 @@ index b101a27..3706ba2 100644
  		{
  			m_ctx->stats.program_cache_lookups_total += 2;
  			if (m_ctx->program.cache_hint.has_fragment_program())
-@@ -1953,12 +2609,99 @@ bool VKGSRender::load_program()
+@@ -1953,12 +2635,99 @@ bool VKGSRender::load_program()
  		const bool allow_async = shadermode != shader_mode::recompiler &&
  			!(fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE);
  
@@ -12968,7 +13041,7 @@ index b101a27..3706ba2 100644
  
  		vk::leave_uninterruptible();
  
-@@ -2027,6 +2770,7 @@ bool VKGSRender::load_program()
+@@ -2027,6 +2796,7 @@ bool VKGSRender::load_program()
  
  void VKGSRender::load_program_env()
  {
@@ -12976,7 +13049,7 @@ index b101a27..3706ba2 100644
  	if (!m_program)
  	{
  		fmt::throw_exception("Unreachable right now");
-@@ -2042,21 +2786,81 @@ void VKGSRender::load_program_env()
+@@ -2042,21 +2812,81 @@ void VKGSRender::load_program_env()
  
  	const bool update_transform_constants = m_stale_constants.test(rsx::draw_state_t::group::transform_constants);
  	const bool update_fragment_constants = m_stale_constants.test(rsx::draw_state_t::group::fragment_constants);
@@ -13061,7 +13134,7 @@ index b101a27..3706ba2 100644
  
  		m_vertex_env_ring_info.unmap();
  		m_vertex_env_dynamic_offset = mem;
-@@ -2067,6 +2871,7 @@ void VKGSRender::load_program_env()
+@@ -2067,6 +2897,7 @@ void VKGSRender::load_program_env()
  
  	if (update_instancing_data)
  	{
@@ -13069,7 +13142,7 @@ index b101a27..3706ba2 100644
  		// Combines transform load + instancing lookup table
  		const auto alignment = m_device->gpu().get_limits().minStorageBufferOffsetAlignment;
  		usz indirection_table_offset = 0;
-@@ -2093,6 +2898,22 @@ void VKGSRender::load_program_env()
+@@ -2093,6 +2924,22 @@ void VKGSRender::load_program_env()
  	}
  	else if (update_transform_constants)
  	{
@@ -13092,7 +13165,7 @@ index b101a27..3706ba2 100644
  		// Transform constants
  		usz mem_offset = 0;
  		auto alloc_storage = [&](usz size) -> std::pair<void*, usz>
-@@ -2102,15 +2923,44 @@ void VKGSRender::load_program_env()
+@@ -2102,15 +2949,44 @@ void VKGSRender::load_program_env()
  		};
  
  		auto io_buf = rsx::io_buffer(alloc_storage);
@@ -13138,7 +13211,7 @@ index b101a27..3706ba2 100644
  		}
  	}
  
-@@ -2119,6 +2969,7 @@ void VKGSRender::load_program_env()
+@@ -2119,6 +2995,7 @@ void VKGSRender::load_program_env()
  		// Fragment constants
  		if (fragment_constants_size)
  		{
@@ -13146,7 +13219,7 @@ index b101a27..3706ba2 100644
  			m_fragment_constants_dynamic_offset = m_fragment_constants_allocator->alloc_bytes(fragment_constants_size);
  			auto buf = m_fragment_constants_ring_info.map(m_fragment_constants_dynamic_offset, fragment_constants_size);
  
-@@ -2134,10 +2985,23 @@ void VKGSRender::load_program_env()
+@@ -2134,10 +3011,23 @@ void VKGSRender::load_program_env()
  
  	if (update_fragment_env)
  	{
@@ -13171,7 +13244,7 @@ index b101a27..3706ba2 100644
  		m_fragment_env_ring_info.unmap();
  
  		m_fragment_env_buffer_info = m_fragment_env_ring_info.window<32>(m_fragment_env_dynamic_offset, 32, gpu_limits.maxUniformBufferRange);
-@@ -2146,10 +3010,12 @@ void VKGSRender::load_program_env()
+@@ -2146,10 +3036,12 @@ void VKGSRender::load_program_env()
  
  	if (update_fragment_texture_env)
  	{
@@ -13184,7 +13257,7 @@ index b101a27..3706ba2 100644
  		m_fragment_texture_params_ring_info.unmap();
  
  		m_fragment_texture_params_buffer_info = m_fragment_texture_params_ring_info.window<768>(m_texture_parameters_dynamic_offset, 768, gpu_limits.maxUniformBufferRange);
-@@ -2198,6 +3064,7 @@ void VKGSRender::load_program_env()
+@@ -2198,6 +3090,7 @@ void VKGSRender::load_program_env()
  		}
  	}
  
@@ -13192,7 +13265,7 @@ index b101a27..3706ba2 100644
  	m_program->bind_uniform(m_vertex_env_buffer_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->context_buffer_location);
  	m_program->bind_uniform(m_vertex_layout_stream_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 2);
  	m_program->bind_uniform(m_fragment_env_buffer_info, vk::glsl::binding_set_index_fragment, m_fs_binding_table->context_buffer_location);
-@@ -2420,6 +3287,7 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
+@@ -2420,6 +3313,7 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
  void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
  {
  	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
@@ -13200,7 +13273,7 @@ index b101a27..3706ba2 100644
  
  	// Host MM sync before executing anything on the GPU
  	rsx::mm_flush();
-@@ -2473,6 +3341,8 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2473,6 +3367,8 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		m_current_command_buffer->flags &= ~vk::command_buffer::cb_has_open_query;
  	}
  
@@ -13209,7 +13282,7 @@ index b101a27..3706ba2 100644
  	if (m_host_dma_ctrl && m_host_dma_ctrl->host_ctx()->needs_label_release())
  	{
  		vkCmdUpdateBuffer(*m_current_command_buffer,
-@@ -2484,8 +3354,10 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2484,8 +3380,10 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		m_host_dma_ctrl->host_ctx()->on_label_release();
  	}
  
@@ -13220,7 +13293,7 @@ index b101a27..3706ba2 100644
  
  	// Supporting concurrent access vastly simplifies this logic.
  	// Instead of doing CB slice injection, we can just chain these together logically with the async stream going first
-@@ -2518,7 +3390,12 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2518,7 +3416,12 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		primary_submit_info.queue_signal(signal_semaphore);
  	}
  
@@ -13233,7 +13306,7 @@ index b101a27..3706ba2 100644
  
  	m_queue_status.clear(flush_queue_state::flushing);
  }
-@@ -2533,9 +3410,46 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2533,9 +3436,46 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	if (m_draw_fbo && layout.ignore_change)
  	{
  		// Nothing has changed, we're still using the same framebuffer
@@ -13280,7 +13353,7 @@ index b101a27..3706ba2 100644
  	res()->surface_cache.prepare_render_target(*m_current_command_buffer,
  		m_ctx->fb.layout.color_format, m_ctx->fb.layout.depth_format,
  		m_ctx->fb.layout.width, m_ctx->fb.layout.height,
-@@ -2544,18 +3458,69 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2544,18 +3484,69 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		m_ctx->fb.layout.actual_color_pitch, m_ctx->fb.layout.actual_zeta_pitch,
  		RSX(m_ctx)->resolution_scaling_config);
  
@@ -13354,7 +13427,7 @@ index b101a27..3706ba2 100644
  		}
  
  		m_ctx->fb.surface_info[i].address = m_ctx->fb.surface_info[i].pitch = 0;
-@@ -2573,6 +3538,8 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2573,6 +3564,8 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  			const utils::address_range32 surface_range = m_ctx->fb.depth_surface_info.get_memory_range();
  			res()->texture_cache.set_memory_read_flags(surface_range, rsx::memory_read_flags::flush_once);
  			res()->texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, surface_range);
@@ -13363,7 +13436,7 @@ index b101a27..3706ba2 100644
  		}
  
  		m_ctx->fb.depth_surface_info.address = m_ctx->fb.depth_surface_info.pitch = 0;
-@@ -2583,6 +3550,11 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2583,6 +3576,11 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		m_ctx->fb.depth_surface_info.samples = samples;
  	}
  
@@ -13375,7 +13448,7 @@ index b101a27..3706ba2 100644
  	// Bind created rtts as current fbo...
  	const auto draw_buffers = rsx::utility::get_rtt_indexes(m_ctx->fb.layout.target);
  	m_draw_buffers.clear();
-@@ -2618,11 +3590,28 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2618,11 +3616,28 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	// Before messing with memory properties, flush command queue if there are dma transfers queued up
  	if (m_current_command_buffer->flags & vk::command_buffer::cb_has_dma_transfer)
  	{
@@ -13404,7 +13477,7 @@ index b101a27..3706ba2 100644
  		for (auto& surface : res()->surface_cache.superseded_surfaces)
  		{
  			res()->texture_cache.discard_framebuffer_memory_region(*m_current_command_buffer, surface->get_memory_range());
-@@ -2630,13 +3619,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2630,13 +3645,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  
  		res()->surface_cache.superseded_surfaces.clear();
  	}
@@ -13420,7 +13493,7 @@ index b101a27..3706ba2 100644
  
  			if (lock &&
  #ifdef TEXTURE_CACHE_DEBUG
-@@ -2666,13 +3656,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2666,13 +3682,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  
  		res()->surface_cache.orphaned_surfaces.clear();
  	}
@@ -13436,7 +13509,7 @@ index b101a27..3706ba2 100644
  		{
  			res()->texture_cache.lock_memory_region(
  				*m_current_command_buffer, res()->surface_cache.m_bound_render_targets[index].second, surface_range, true,
-@@ -2684,6 +3675,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2684,6 +3701,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  			res()->texture_cache.commit_framebuffer_memory_region(*m_current_command_buffer, surface_range);
  		}
  	}
@@ -13444,7 +13517,7 @@ index b101a27..3706ba2 100644
  
  	if (m_ctx->fb.depth_surface_info.address && m_ctx->fb.depth_surface_info.pitch)
  	{
-@@ -2701,6 +3693,16 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2701,6 +3719,16 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		}
  	}
  
@@ -13461,7 +13534,7 @@ index b101a27..3706ba2 100644
  	std::vector<u8> input_attachments{};
  	if ((m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) &&
  		!m_ctx->draw_state.dirty.test(rsx::draw_state_t::group::fragment_program))
-@@ -2737,6 +3739,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2737,6 +3765,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	m_draw_fbo->add_ref();
  
  	set_viewport();
@@ -13469,7 +13542,7 @@ index b101a27..3706ba2 100644
  	return true;
  }
  
-@@ -2758,11 +3761,28 @@ bool VKGSRender::on_renderctl(u32 request_code, void* args)
+@@ -2758,11 +3787,28 @@ bool VKGSRender::on_renderctl(u32 request_code, void* args)
  
  bool VKGSRender::scaled_image_from_memory(const rsx::blit_src_info& src, const rsx::blit_dst_info& dst, bool interpolate)
  {
@@ -13498,7 +13571,7 @@ index b101a27..3706ba2 100644
  		if (m_current_command_buffer->flags & vk::command_buffer::cb_has_dma_transfer)
  		{
  			// A dma transfer has been queued onto this cb
-@@ -2826,20 +3846,65 @@ bool VKGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_info
+@@ -2826,20 +3872,65 @@ bool VKGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_info
  	if (data.is_current(m_current_command_buffer))
  		return false;
  
@@ -13564,7 +13637,7 @@ index b101a27..3706ba2 100644
  			std::lock_guard lock(m_flush_queue_mutex);
  			flush_command_queue();
  
-@@ -2852,7 +3917,35 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info*
+@@ -2852,7 +3943,35 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info*
  			busy_wait();
  		}
  
@@ -18921,7 +18994,7 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..9d4aa00
+index 0000000..f77862a
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 @@ -0,0 +1,2650 @@
@@ -26727,7 +26800,7 @@ index 0000000..f545eb3
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Pipe.cpp b/rpcs3/Emu/RSX/VK/VKR2Pipe.cpp
 new file mode 100644
-index 0000000..2ac2877
+index 0000000..b4b0fbc
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Pipe.cpp
 @@ -0,0 +1,158 @@
@@ -43849,7 +43922,7 @@ index 1513d74..46d15b8 100644
  
  	bool is_renderpass_open(const vk::command_buffer& cmd)
 diff --git a/rpcs3/Emu/RSX/VK/VKRenderTargets.cpp b/rpcs3/Emu/RSX/VK/VKRenderTargets.cpp
-index aca6799..bd78392 100644
+index aca6799..3fa7cd7 100644
 --- a/rpcs3/Emu/RSX/VK/VKRenderTargets.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKRenderTargets.cpp
 @@ -9,6 +9,10 @@
@@ -43863,6 +43936,25 @@ index aca6799..bd78392 100644
  namespace vk
  {
  	namespace surface_cache_utils
+@@ -252,15 +256,15 @@ namespace vk
+ 		return (surface_cache_vram_load > surface_cache_allocation_quota);
+ 	}
+ 
+-	bool surface_cache::spill_unused_memory()
++	bool surface_cache::spill_unused_memory(bool all_unbound)
+ 	{
+ 		// Determine how much memory we need to save to system RAM if any
+ 		const u64 current_surface_cache_memory = vk::vmm_get_application_pool_usage(VMM_ALLOCATION_POOL_SURFACE_CACHE);
+ 		const u64 total_device_memory = vk::get_current_renderer()->get_memory_mapping().device_local_total_bytes;
+-		const u64 target_memory = get_surface_cache_memory_quota(total_device_memory);
++		const u64 target_memory = all_unbound ? 0 : get_surface_cache_memory_quota(total_device_memory);
+ 
+ 		rsx_log.warning("Surface cache memory usage is %lluM", current_surface_cache_memory / 0x100000);
+-		if (current_surface_cache_memory < target_memory)
++		if (current_surface_cache_memory < target_memory || !current_surface_cache_memory)
+ 		{
+ 			rsx_log.warning("Surface cache memory usage is very low. Will not spill contents to RAM");
+ 			return false;
 @@ -890,6 +894,12 @@ namespace vk
  		}
  	}
@@ -43975,7 +44067,7 @@ index aca6799..bd78392 100644
  			optimize_copy = optimize_copy && !memory_load;
  			newest_tag = src_texture->last_use_tag;
 diff --git a/rpcs3/Emu/RSX/VK/VKRenderTargets.h b/rpcs3/Emu/RSX/VK/VKRenderTargets.h
-index 6de3e15..b04988e 100644
+index 6de3e15..e4deb46 100644
 --- a/rpcs3/Emu/RSX/VK/VKRenderTargets.h
 +++ b/rpcs3/Emu/RSX/VK/VKRenderTargets.h
 @@ -21,6 +21,14 @@ namespace vk
@@ -43993,6 +44085,80 @@ index 6de3e15..b04988e 100644
  	class image_reference_sync_barrier
  	{
  		u32 m_texture_barrier_count = 0;
+@@ -751,7 +759,7 @@ namespace vk
+ 
+ 	public:
+ 		void destroy();
+-		bool spill_unused_memory();
++		bool spill_unused_memory(bool all_unbound = false); // R3PORT (#33): all_unbound = OOM emergency, spill every unbound surface
+ 		bool is_overallocated();
+ 		bool can_collapse_surface(const std::unique_ptr<vk::render_target>& surface, rsx::problem_severity severity) override;
+ 		bool handle_memory_pressure(vk::command_buffer& cmd, rsx::problem_severity severity) override;
+diff --git a/rpcs3/Emu/RSX/VK/VKResourceManager.cpp b/rpcs3/Emu/RSX/VK/VKResourceManager.cpp
+index 75a5aeb..917f736 100644
+--- a/rpcs3/Emu/RSX/VK/VKResourceManager.cpp
++++ b/rpcs3/Emu/RSX/VK/VKResourceManager.cpp
+@@ -250,6 +250,22 @@ namespace vk
+ 				load_severity = rsx::problem_severity::moderate;
+ 			}
+ 
++			// R3PORT (#33): the checks above only see our own allocations. The driver's own VRAM (pipelines, swapchain,
++			// upscaler resources) can fill a small GPU while they look harmless; with VK_EXT_memory_budget, a budget that
++			// is really nearly used up keeps the severity from being lowered.
++			if (load_severity < rsx::problem_severity::moderate)
++			{
++				const u64 headroom = get_current_mem_allocator()->get_device_local_headroom();
++				if (headroom <= mem_threshold_2)
++				{
++					load_severity = (vmm_load > 90.f) ? rsx::problem_severity::severe : rsx::problem_severity::moderate;
++				}
++				else if (headroom <= mem_threshold_1)
++				{
++					load_severity = rsx::problem_severity::moderate;
++				}
++			}
++
+ 			if (load_severity >= rsx::problem_severity::moderate)
+ 			{
+ 				// NOTE: For some reason fmt::format with a sized float followed by percentage sign causes random crashing.
+@@ -273,6 +289,37 @@ namespace vk
+ 		return false;
+ 	}
+ 
++	// R3PORT (#33): set only on the thread running the emergency pass (on_vram_exhausted runs on the RSX thread)
++	static thread_local bool s_vmm_oom_emergency = false;
++
++	bool vmm_in_oom_emergency()
++	{
++		return s_vmm_oom_emergency;
++	}
++
++	bool vmm_oom_emergency_recover()
++	{
++		if (s_vmm_oom_emergency)
++		{
++			return false; // An allocation made by the emergency pass itself; do not recurse
++		}
++
++		rsx_log.warning("Out of video memory. Flushing all unused cached textures and render targets.");
++		s_vmm_oom_emergency = true;
++		bool relieved = false;
++		try
++		{
++			relieved = vmm_handle_memory_pressure(rsx::problem_severity::fatal);
++		}
++		catch (...)
++		{
++			s_vmm_oom_emergency = false;
++			throw;
++		}
++		s_vmm_oom_emergency = false;
++		return relieved;
++	}
++
+ 	void vmm_check_memory_usage()
+ 	{
+ 		if (const auto load_severity = vmm_determine_memory_load_severity();
 diff --git a/rpcs3/Emu/RSX/VK/VKShaderInterpreter.cpp b/rpcs3/Emu/RSX/VK/VKShaderInterpreter.cpp
 index 19f3ce9..4054c1b 100644
 --- a/rpcs3/Emu/RSX/VK/VKShaderInterpreter.cpp
@@ -50293,6 +50459,21 @@ index 0000000..3cee3bd
 +#ifdef __cplusplus
 +}    // extern "C"
 +#endif
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/buffer_object.cpp b/rpcs3/Emu/RSX/VK/vkutils/buffer_object.cpp
+index b3d4ff8..ddd443b 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/buffer_object.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/buffer_object.cpp
+@@ -78,7 +78,9 @@ namespace vk
+ 			.memory_type = &allocation_type_info,
+ 			.pool = allocation_pool,
+ 			.throw_on_fail = !nullable,
+-			.recover_vmem_on_fail = !no_vmem_recovery
++			.recover_vmem_on_fail = !no_vmem_recovery,
++			// R3PORT (#33): GPU-only buffers may fall back to system memory when VRAM is exhausted
++			.fallback_type_bits = (access_flags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? memory_reqs.memoryTypeBits : 0u
+ 		};
+ 		memory = std::make_unique<memory_block>(m_device, request);
+ 
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp b/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
 index 9740d74..76c581f 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/commands.cpp
@@ -50591,7 +50772,7 @@ index e169caa..761147c 100644
  	}
  }
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/device.cpp b/rpcs3/Emu/RSX/VK/vkutils/device.cpp
-index dae7b29..7786730 100644
+index dae7b29..e37108c 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/device.cpp
 +++ b/rpcs3/Emu/RSX/VK/vkutils/device.cpp
 @@ -1,5 +1,9 @@
@@ -50636,7 +50817,7 @@ index dae7b29..7786730 100644
  
  		features = features2.features;
  
-@@ -135,6 +150,20 @@ namespace vk
+@@ -135,9 +150,24 @@ namespace vk
  
  		optional_features_support.shader_stencil_export    = device_extensions.is_supported(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
  		optional_features_support.conditional_rendering    = device_extensions.is_supported(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
@@ -50657,7 +50838,11 @@ index dae7b29..7786730 100644
  		optional_features_support.external_memory_host     = device_extensions.is_supported(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
  		optional_features_support.synchronization_2        = device_extensions.is_supported(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
  		optional_features_support.unrestricted_depth_range = device_extensions.is_supported(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
-@@ -203,11 +232,27 @@ namespace vk
++		optional_features_support.memory_budget            = device_extensions.is_supported(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME); // R3PORT (#33)
+ #ifdef __APPLE__
+ 		optional_features_support.portability              = device_extensions.is_supported(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+ #endif
+@@ -203,11 +233,27 @@ namespace vk
  
  		VkPhysicalDeviceDescriptorIndexingPropertiesEXT descriptor_indexing_props{};
  		VkPhysicalDeviceMultiDrawPropertiesEXT multidraw_props{};
@@ -50685,7 +50870,7 @@ index dae7b29..7786730 100644
  		if (multidraw_support.supported)
  		{
  			multidraw_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT;
-@@ -218,6 +263,22 @@ namespace vk
+@@ -218,6 +264,22 @@ namespace vk
  		vkGetPhysicalDeviceProperties2(dev, &properties2);
  		props = properties2.properties;
  
@@ -50708,7 +50893,19 @@ index dae7b29..7786730 100644
  		if (descriptor_indexing_support)
  		{
  			if (descriptor_indexing_props.maxUpdateAfterBindDescriptorsInAllPools < 800'000)
-@@ -609,6 +670,36 @@ namespace vk
+@@ -580,6 +642,11 @@ namespace vk
+ 			requested_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+ 		}
+ 
++		if (pgpu->optional_features_support.memory_budget) // R3PORT (#33)
++		{
++			requested_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
++		}
++
+ 		if (pgpu->optional_features_support.shader_stencil_export)
+ 		{
+ 			requested_extensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+@@ -609,6 +676,36 @@ namespace vk
  		{
  			requested_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
  		}
@@ -50745,7 +50942,7 @@ index dae7b29..7786730 100644
  		
  #ifdef __APPLE__
  		if (pgpu->optional_features_support.portability)
-@@ -871,7 +962,20 @@ namespace vk
+@@ -871,7 +968,20 @@ namespace vk
  			device.pNext = &provoking_vertex_info;
  		}
  
@@ -50767,7 +50964,7 @@ index dae7b29..7786730 100644
  		{
  			dump_debug_info(requested_extensions, enabled_features);
  			vk::die_with_error(error);
-@@ -919,6 +1023,7 @@ namespace vk
+@@ -919,6 +1029,7 @@ namespace vk
  
  		if (dev && pgpu)
  		{
@@ -50776,7 +50973,7 @@ index dae7b29..7786730 100644
  			{
  				m_allocator->destroy();
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/device.h b/rpcs3/Emu/RSX/VK/vkutils/device.h
-index ae672fb..395974f 100644
+index ae672fb..448b06b 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/device.h
 +++ b/rpcs3/Emu/RSX/VK/vkutils/device.h
 @@ -85,6 +85,7 @@ namespace vk
@@ -50787,28 +50984,30 @@ index ae672fb..395974f 100644
  		descriptor_indexing_features descriptor_indexing_support{};
  
  		custom_border_color_features custom_border_color_support{};
-@@ -107,6 +108,8 @@ namespace vk
+@@ -107,6 +108,9 @@ namespace vk
  			bool portability = false;
  			bool provoking_vertex_last = false;
  			bool shader_draw_parameters = false;
 +			bool graphics_pipeline_library = false;      // R2PORT (R2_VK_GPL): feature + fast linking, switch on
 +			bool push_descriptor = false;                // R2PORT (RSX_VK_PUSH_DESC, default on, 0 = off): extension + switch
++			bool memory_budget = false;                  // R3PORT (#33): VK_EXT_memory_budget, real VRAM usage/budget for VMA
  		} optional_features_support;
  
  		friend class render_device;
-@@ -200,7 +203,10 @@ namespace vk
+@@ -200,7 +204,11 @@ namespace vk
  		bool get_extended_device_fault_support() const { return pgpu->optional_features_support.extended_device_fault; }
  		bool get_texture_compression_bc_support() const { return pgpu->optional_features_support.texture_compression_bc; }
  		bool get_provoking_vertex_last_support() const { return pgpu->optional_features_support.provoking_vertex_last; }
 +		bool get_graphics_pipeline_library_support() const { return pgpu->optional_features_support.graphics_pipeline_library; }
  		bool get_shader_draw_parameters_support() const { return pgpu->optional_features_support.shader_draw_parameters; }
++		bool get_memory_budget_support() const { return pgpu->optional_features_support.memory_budget; } // R3PORT (#33)
 +		// R2PORT (RSX_VK_PUSH_DESC=1): maxPushDescriptors when push descriptors are in use, else 0
 +		u32 get_push_descriptor_max() const { return pgpu->optional_features_support.push_descriptor ? pgpu->r2_max_push_descriptors : 0u; }
  
  		u64 get_descriptor_update_after_bind_support() const { return pgpu->descriptor_indexing_support.update_after_bind_mask; }
  		u32 get_descriptor_max_draw_calls() const { return pgpu->descriptor_max_draw_calls; }
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/image.cpp b/rpcs3/Emu/RSX/VK/vkutils/image.cpp
-index 9197c5a..7a0ec22 100644
+index 9197c5a..0056432 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/image.cpp
 +++ b/rpcs3/Emu/RSX/VK/vkutils/image.cpp
 @@ -7,6 +7,9 @@
@@ -50845,7 +51044,18 @@ index 9197c5a..7a0ec22 100644
  		}
  	}
  
-@@ -469,6 +485,9 @@ namespace vk
+@@ -144,7 +160,9 @@ namespace vk
+ 			.alignment = memory_req.alignment,
+ 			.memory_type = &allocation_type_info,
+ 			.pool = allocation_pool,
+-			.throw_on_fail = !nullable
++			.throw_on_fail = !nullable,
++			// R3PORT (#33): GPU-only images may fall back to system memory when VRAM is exhausted
++			.fallback_type_bits = (access_flags == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? memory_req.memoryTypeBits : 0u
+ 		};
+ 		memory = std::make_shared<vk::memory_block>(m_device, alloc_request);
+ 
+@@ -469,6 +487,9 @@ namespace vk
  		result->value = this->value;
  		result->memory = std::move(this->memory);
  		result->views = std::move(this->views);
@@ -50855,7 +51065,7 @@ index 9197c5a..7a0ec22 100644
  		this->value = VK_NULL_HANDLE;
  		return result;
  	}
-@@ -488,10 +507,17 @@ namespace vk
+@@ -488,10 +509,17 @@ namespace vk
  		}
  
  		const u64 storage_key = remap_encoding | (static_cast<u64>(mask) << 32);
@@ -50873,7 +51083,7 @@ index 9197c5a..7a0ec22 100644
  			return found->second.get();
  		}
  
-@@ -519,6 +545,8 @@ namespace vk
+@@ -519,6 +547,8 @@ namespace vk
  		auto view = std::make_unique<vk::image_view>(*g_render_device, this, format(), VK_IMAGE_VIEW_TYPE_MAX_ENUM, real_mapping, range);
  		auto result = view.get();
  		views.emplace(storage_key, std::move(view));
@@ -50882,7 +51092,7 @@ index 9197c5a..7a0ec22 100644
  		return result;
  	}
  
-@@ -538,6 +566,8 @@ namespace vk
+@@ -538,6 +568,8 @@ namespace vk
  				gc->dispose(p.second);
  			}
  			views.clear();
@@ -50962,6 +51172,221 @@ index e59c249..dacc6e1 100644
  
  		return new swapchain_WSI(dev, present_queue_idx, graphics_queue_idx, transfer_queue_idx, format, m_surface, color_space, !surface_config.supports_automatic_wm_reports);
  	}
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/memory.cpp b/rpcs3/Emu/RSX/VK/vkutils/memory.cpp
+index 7e1a2a0..ce9b5a6 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/memory.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/memory.cpp
+@@ -172,6 +172,14 @@ namespace vk
+ 		allocatorInfo.instance = inst;
+ 		allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_2;
+ 
++		// R3PORT (#33): with VK_EXT_memory_budget VMA reports the process's real VRAM usage and the OS budget
++		// (driver-internal memory such as pipelines included), not just its own blocks against 80% of the heap.
++		m_use_memory_budget = dev.get_memory_budget_support();
++		if (m_use_memory_budget)
++		{
++			allocatorInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
++		}
++
+ 		std::vector<VkDeviceSize> heap_limits;
+ 		const auto vram_allocation_limit = g_cfg.video.vk.vram_allocation_limit * 0x100000ull;
+ 		if (vram_allocation_limit < dev.get_memory_mapping().device_local_total_bytes)
+@@ -254,11 +262,10 @@ namespace vk
+ 			}
+ 		}
+ 
+-		if (request.recover_vmem_on_fail)
++		if (request.recover_vmem_on_fail && error_code == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+ 		{
+ 			const auto severity = (request.throw_on_fail) ? rsx::problem_severity::fatal : rsx::problem_severity::severe;
+-			if (error_code == VK_ERROR_OUT_OF_DEVICE_MEMORY &&
+-				vmm_handle_memory_pressure(severity))
++			if (vmm_handle_memory_pressure(severity))
+ 			{
+ 				// Out of memory. Try again.
+ 				const auto [status, type] = do_vma_alloc();
+@@ -269,6 +276,27 @@ namespace vk
+ 					return vma_alloc;
+ 				}
+ 			}
++
++			// R3PORT (#33): the normal pass only trims caches above their quotas, which leaves little to free on a small GPU.
++			// Before the renderer dies, drop everything not in use by the current draw and try once more.
++			if (request.throw_on_fail && vmm_oom_emergency_recover())
++			{
++				const auto [status, type] = do_vma_alloc();
++				if (status == VK_SUCCESS)
++				{
++					rsx_log.warning("Renderer ran out of video memory and recovered after flushing the caches.");
++					vmm_notify_memory_allocated(vma_alloc, type, request.size, request.pool);
++					return vma_alloc;
++				}
++			}
++		}
++
++		if (request.throw_on_fail && error_code == VK_ERROR_OUT_OF_DEVICE_MEMORY && request.fallback_type_bits)
++		{
++			if (const auto handle = alloc_host_fallback(request))
++			{
++				return handle;
++			}
+ 		}
+ 
+ 		if (!request.throw_on_fail)
+@@ -280,6 +308,53 @@ namespace vk
+ 		fmt::throw_exception("Unreachable! Error_code=0x%x", static_cast<u32>(error_code));
+ 	}
+ 
++	// R3PORT (#33): last resort when VRAM is exhausted: place the resource in system memory (slower, read over PCIe)
++	// instead of killing the renderer. Only memory types of the resource's own memoryTypeBits on non-device-local heaps.
++	mem_allocator_vk::mem_handle_t mem_allocator_vma::alloc_host_fallback(const memory_allocation_request& request)
++	{
++		const VkPhysicalDeviceMemoryProperties* props = nullptr;
++		vmaGetMemoryProperties(m_allocator, &props);
++
++		for (u32 pass = 0; pass < 2; ++pass)
++		{
++			for (u32 t = 0; t < props->memoryTypeCount; ++t)
++			{
++				const auto& type = props->memoryTypes[t];
++				if (!(request.fallback_type_bits & (1u << t)) ||
++					(props->memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) ||
++					((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) != (pass != 0)) // plain types first
++				{
++					continue;
++				}
++
++				VkMemoryRequirements mem_req = {};
++				mem_req.size = rsx::align2(request.size, request.alignment);
++				mem_req.alignment = request.alignment;
++				mem_req.memoryTypeBits = 1u << t;
++
++				VmaAllocationCreateInfo create_info = {};
++				create_info.memoryTypeBits = 1u << t;
++				create_info.flags = m_allocation_flags;
++
++				VmaAllocation vma_alloc;
++				if (vmaAllocateMemory(m_allocator, &mem_req, &create_info, &vma_alloc, nullptr) == VK_SUCCESS)
++				{
++					static atomic_t<u32> s_count = 0;
++					if (s_count++ == 0)
++					{
++						std::fprintf(stderr, "[rsx] video memory is full: some graphics data now lives in system RAM (slower). Lower Render scale in the launcher if this GPU has little VRAM.\n");
++					}
++
++					rsx_log.warning("Out of video memory: %llu bytes placed in system memory type %u", request.size, t);
++					vmm_notify_memory_allocated(vma_alloc, t, request.size, request.pool);
++					return vma_alloc;
++				}
++			}
++		}
++
++		return nullptr;
++	}
++
+ 	void mem_allocator_vma::free(mem_handle_t mem_handle)
+ 	{
+ 		vmm_notify_memory_freed(mem_handle);
+@@ -347,6 +422,32 @@ namespace vk
+ 		return max_usage;
+ 	}
+ 
++	u64 mem_allocator_vma::get_device_local_headroom()
++	{
++		if (!m_use_memory_budget)
++		{
++			return umax;
++		}
++
++		// R3PORT (#33): smallest free budget over the VRAM heaps (Re-BAR heap excluded), as get_memory_usage
++		vmaGetHeapBudgets(m_allocator, stats.data());
++		const VkPhysicalDeviceMemoryProperties* props = nullptr;
++		vmaGetMemoryProperties(m_allocator, &props);
++
++		u64 headroom = umax;
++		for (u32 i = 0; i < props->memoryHeapCount; ++i)
++		{
++			if (i == m_rebar_heap_idx || !(props->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || !stats[i].budget)
++			{
++				continue;
++			}
++
++			headroom = std::min<u64>(headroom, stats[i].usage < stats[i].budget ? stats[i].budget - stats[i].usage : 0);
++		}
++
++		return headroom;
++	}
++
+ 	void mem_allocator_vma::set_safest_allocation_flags()
+ 	{
+ 		m_allocation_flags = VMA_ALLOCATION_CREATE_STRATEGY_BEST_FIT_BIT;
+@@ -405,6 +506,18 @@ namespace vk
+ 					return memory;
+ 				}
+ 			}
++
++			// R3PORT (#33): see mem_allocator_vma::alloc
++			if (request.throw_on_fail && error_code == VK_ERROR_OUT_OF_DEVICE_MEMORY && vmm_oom_emergency_recover())
++			{
++				const auto [status, type] = do_vk_alloc();
++				if (status == VK_SUCCESS)
++				{
++					rsx_log.warning("Renderer ran out of video memory and recovered after flushing the caches.");
++					vmm_notify_memory_allocated(memory, type, request.size, request.pool);
++					return memory;
++				}
++			}
+ 		}
+ 
+ 		if (!request.throw_on_fail)
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/memory.h b/rpcs3/Emu/RSX/VK/vkutils/memory.h
+index 834c777..b9e2682 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/memory.h
++++ b/rpcs3/Emu/RSX/VK/vkutils/memory.h
+@@ -74,6 +74,7 @@ namespace vk
+ 		vmm_allocation_pool pool = VMM_ALLOCATION_POOL_UNDEFINED;
+ 		bool throw_on_fail = true;
+ 		bool recover_vmem_on_fail = true;
++		u32 fallback_type_bits = 0; // R3PORT (#33): memoryTypeBits of the resource; lets a VRAM allocation fall back to system memory as a last resort
+ 	};
+ 
+ 	class mem_allocator_base
+@@ -93,6 +94,7 @@ namespace vk
+ 		virtual VkDeviceMemory get_vk_device_memory(mem_handle_t mem_handle) = 0;
+ 		virtual u64 get_vk_device_memory_offset(mem_handle_t mem_handle) = 0;
+ 		virtual f32 get_memory_usage() = 0;
++		virtual u64 get_device_local_headroom() { return umax; } // R3PORT (#33): free bytes in the VRAM budget (VK_EXT_memory_budget)
+ 
+ 		virtual void set_safest_allocation_flags() {}
+ 		virtual void set_fastest_allocation_flags() {}
+@@ -123,14 +125,18 @@ namespace vk
+ 		VkDeviceMemory get_vk_device_memory(mem_handle_t mem_handle) override;
+ 		u64 get_vk_device_memory_offset(mem_handle_t mem_handle) override;
+ 		f32 get_memory_usage() override;
++		u64 get_device_local_headroom() override;
+ 
+ 		void set_safest_allocation_flags() override;
+ 		void set_fastest_allocation_flags() override;
+ 
+ 	private:
++		mem_handle_t alloc_host_fallback(const memory_allocation_request& request); // R3PORT (#33)
++
+ 		VmaAllocator m_allocator;
+ 		std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> stats;
+ 		u32 m_rebar_heap_idx = UINT32_MAX;
++		bool m_use_memory_budget = false; // R3PORT (#33)
+ 	};
+ 
+ 
+@@ -210,6 +216,8 @@ namespace vk
+ 	u64  vmm_get_application_pool_usage(vmm_allocation_pool pool);
+ 	bool vmm_handle_memory_pressure(rsx::problem_severity severity);
+ 	rsx::problem_severity vmm_determine_memory_load_severity();
++	bool vmm_in_oom_emergency(); // R3PORT (#33): an allocation already failed; caches drop everything not in use
++	bool vmm_oom_emergency_recover(); // R3PORT (#33): runs the fatal memory-pressure pass in emergency mode
+ 
+ 	// Tracking for host memory objects. Allocated count is more important than actual memory amount.
+ 	void vmm_notify_object_allocated(vmm_allocation_pool pool);
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp b/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
 index 2fd2dc0..0def34b 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/swapchain.cpp
@@ -51139,7 +51564,7 @@ index 4041f4f..8e52bb2 100644
  }
 diff --git a/rpcs3/Emu/RSX/port_adsrb.h b/rpcs3/Emu/RSX/port_adsrb.h
 new file mode 100644
-index 0000000..14eda1e
+index 0000000..7bd22e9
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/port_adsrb.h
 @@ -0,0 +1,671 @@
@@ -53501,7 +53926,7 @@ index 0000000..44adbd4
 +}
 diff --git a/rpcs3/Emu/RSX/port_rbattr.h b/rpcs3/Emu/RSX/port_rbattr.h
 new file mode 100644
-index 0000000..deb2c09
+index 0000000..82fddea
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/port_rbattr.h
 @@ -0,0 +1,303 @@
@@ -53834,7 +54259,7 @@ index 0000000..b44d6de
 +}
 diff --git a/rpcs3/Emu/RSX/port_texdiag.h b/rpcs3/Emu/RSX/port_texdiag.h
 new file mode 100644
-index 0000000..1adf867
+index 0000000..5807c97
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/port_texdiag.h
 @@ -0,0 +1,152 @@

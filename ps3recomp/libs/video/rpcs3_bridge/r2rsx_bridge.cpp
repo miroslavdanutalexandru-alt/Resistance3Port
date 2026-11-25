@@ -229,6 +229,17 @@ namespace
 		// RSX_DISPLAY=exclusive: the fullscreen window (rsx_null_backend.c) may take Vulkan exclusive fullscreen.
 		if (const char* e = env("RSX_DISPLAY"))
 			g_cfg.video.vk.exclusive_fullscreen_mode.set(!_stricmp(e, "exclusive") ? vk_exclusive_fs_mode::enable : vk_exclusive_fs_mode::disable);
+		// RSX_VRAM_LIMIT_MB (test switch, R3 #33): caps the renderer's video memory as if the GPU had only this much
+		// (256..65536), to reproduce out-of-VRAM handling on a big GPU. Unset = no cap.
+		if (const char* e = env("RSX_VRAM_LIMIT_MB"))
+		{
+			const int mb = std::atoi(e);
+			if (mb >= 256 && mb <= 65536)
+			{
+				g_cfg.video.vk.vram_allocation_limit.set(static_cast<u32>(mb));
+				std::printf("[r2rsx] RSX_VRAM_LIMIT_MB=%d: video memory capped at %d MB (test)\n", mb, mb);
+			}
+		}
 		std::printf("[r2rsx] video: scale %u%%, output scaling %d, sharpen %u, aniso %u, vsync %d, exclusive fs %d\n",
 			g_cfg.video.resolution_scale_percent.get(), static_cast<int>(g_cfg.video.output_scaling.get()),
 			g_cfg.video.rcas_sharpening_intensity.get(), g_cfg.video.anisotropic_level_override.get(),
