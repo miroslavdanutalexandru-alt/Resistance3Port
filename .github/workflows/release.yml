@@ -33,6 +33,13 @@ env:
   INNO_VERSION: '6.7.3'
   INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe
   INNO_SHA256: 9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732
+  # The runner's own LLVM is older than 22, and Visual Studio's C++ headers refuse clang older than 22 (error STL1000).
+  # So the runner's C:\Program Files\LLVM is replaced by the LLVM 22 release archive (the runner is thrown away after
+  # the run), which is also where build_setup.bat looks for clang-cl. Build-time only, never shipped. The SHA-256 is
+  # the digest GitHub shows for the release asset.
+  LLVM_VERSION: '22.1.8'
+  LLVM_URL: https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz
+  LLVM_SHA256: d96c2cc1736f4eb7fa43cb9bbdf56d93551a9ae0a9aadb9c99c3c3b2b712a234
 
 jobs:
   build:
@@ -82,10 +89,28 @@ jobs:
           }
           Write-Output "Inno Setup $have"
 
+      - name: LLVM 22 (pinned)
+        shell: pwsh
+        run: |
+          $arc = Join-Path $env:RUNNER_TEMP 'llvm.tar.xz'
+          Invoke-WebRequest -Uri $env:LLVM_URL -OutFile $arc
+          $got = (Get-FileHash -Algorithm SHA256 $arc).Hash.ToLower()
+          if ($got -ne $env:LLVM_SHA256) { Write-Output "LLVM: SHA-256 $got, expected $env:LLVM_SHA256"; exit 1 }
+          $dst = 'C:\Program Files\LLVM'
+          if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+          New-Item -ItemType Directory -Force $dst | Out-Null
+          & "$env:SystemRoot\System32\tar.exe" -xf $arc -C $dst --strip-components=1
+          if ($LASTEXITCODE -ne 0) { Write-Output "tar exit $LASTEXITCODE"; exit 1 }
+          Remove-Item $arc
+          $v = (& (Join-Path $dst 'bin\clang-cl.exe') --version | Select-Object -First 1)
+          Write-Output $v
+          if ($v -notmatch "clang version $([regex]::Escape($env:LLVM_VERSION))") { Write-Output "Not LLVM $env:LLVM_VERSION"; exit 1 }
+
       - name: Launcher.exe
-        # The same commands as the launcher step of build.bat (clang-cl from the runner's LLVM, MSVC libraries from Visual Studio).
-        # The game itself is never built here (it needs the player's game files). LLVM 22 is only needed for the PGO
-        # game build on the player's PC (pgo\r3.profdata, which ships as a tracked file); the launcher is built without it.
+        # The same commands as the launcher step of build.bat (clang-cl from the LLVM 22 above, MSVC libraries from Visual Studio).
+        # The game itself is never built here (it needs the player's game files). LLVM 22 is needed here because of
+        # Visual Studio's headers (see LLVM_URL above) and for the PGO game build on the player's PC (pgo\r3.profdata,
+        # a tracked file); the launcher is built without the profile.
         shell: cmd
         run: |
           set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
