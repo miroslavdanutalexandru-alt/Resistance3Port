@@ -5320,6 +5320,47 @@ static void spu_indirect_branch_full(spu_context* ctx)
                    * this job through the policy module's job-exit handler
                    * (0x2CAC in the game; the jobs branch there to finish,
                    * at any stack depth). SPU_BADCALL_EXIT=0 returns as before. */
+                  /* Resistance 3 issue #42 (Haven evacuation): job 403
+                   * (igjob_00D7A480, under the igPm policy module) reads a
+                   * callback from LS 0x14C2C + 4*state (bisl $r0,$r90 at 0xF8F0,
+                   * r3 = 0x14C60, the claimed object) where state is the
+                   * object's halfword +0x18. Only states 0-11 have slots; an
+                   * object with a bad state reads past the table into stale LS
+                   * or the object's own fields (0x8D here). Halting the PM run
+                   * below never reports the job done and the PPU waits for it
+                   * forever. For THIS call site only -- lr 0xF8F4 with job 403's
+                   * table-load sequence at 0xF8C0..0xF8F0 still in LS and r90
+                   * still holding the target -- skip the call like the zero slot
+                   * the job itself skips (brz at 0xF8E4), so it finishes and
+                   * writes its result. Every other bad call keeps the halt (or
+                   * SPU_BADCALL_EXIT, which takes precedence when set): returning
+                   * into an arbitrary job carried its garbage on (v59).
+                   * SPU_JOB_BADCALL_SKIP=0 halts here too. */
+                  { static int s_jbs = -1, s_jbx = -1;
+                    if (s_jbs < 0) { const char* e = getenv("SPU_JOB_BADCALL_SKIP"); s_jbs = e ? atoi(e) : 1; }
+                    if (s_jbx < 0) { const char* e = getenv("SPU_BADCALL_EXIT"); s_jbx = (e && strtoul(e, 0, 16)) ? 1 : 0; }
+                    static const uint32_t k_j403_f8c0[13] = {
+                        0x42A61005u, 0x4080062Cu, 0x3F81982Fu, 0x183417AEu, 0x0F60972Du,
+                        0x180156ABu, 0x1C0315D9u, 0x388B15D8u, 0x3B966C5Au, 0x2000025Au,
+                        0x1C100283u, 0x3FE02904u, 0x35202D00u };   /* ila $r5,0x14C20 ... bisl $r0,$r90 */
+                    int site = s_jbs && !s_jbx && lr == 0xF8F4u &&
+                               (ctx->gpr[90]._u32[0] & SPU_LS_MASK & ~3u) == p0;
+                    for (int k = 0; site && k < 13; k++) {
+                        const uint8_t* c = ctx->ls + 0xF8C0u + 4u * (uint32_t)k;
+                        site = (((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3]) == k_j403_f8c0[k];
+                    }
+                    if (site) {
+                        static volatile LONG n_jbs = 0;
+                        if (InterlockedIncrement(&n_jbs) == 1)
+                            fprintf(stderr, "[spu] WARNING: img=%d job 403 called a bad callback 0x%05X (LS 0x%05X, word 0x%08X) "
+                                            "from lr=0x%05X r3=0x%05X -- skipped like an empty slot so the job finishes "
+                                            "(logged once; SPU_JOB_BADCALL_SKIP=0 halts)\n",
+                                    ctx->image_id, ctx->gpr[90]._u32[0] & SPU_LS_MASK, p0, w, lr,
+                                    ctx->gpr[3]._u32[0] & SPU_LS_MASK);
+                        ctx->pc = lr;
+                        g_spu_trampoline_fn = spu_indirect_branch;
+                        return;
+                    } }
                   { static int ex = -1;
                     if (ex < 0) { const char* e = getenv("SPU_BADCALL_EXIT"); ex = e ? (int)strtoul(e, 0, 16) : 0; }
                     extern SPU_THREAD_LOCAL uint32_t g_spu_job_entry_sp;
