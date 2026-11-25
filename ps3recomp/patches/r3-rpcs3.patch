@@ -6910,20 +6910,25 @@ index 8044044..dd1ab5d 100644
  		std::vector<u32> constant_offsets;
  	}
 diff --git a/rpcs3/Emu/RSX/Program/GLSLCommon.cpp b/rpcs3/Emu/RSX/Program/GLSLCommon.cpp
-index 37bbff0..659b098 100644
+index 37bbff0..5517cfc 100644
 --- a/rpcs3/Emu/RSX/Program/GLSLCommon.cpp
 +++ b/rpcs3/Emu/RSX/Program/GLSLCommon.cpp
-@@ -223,6 +223,9 @@ namespace glsl
+@@ -223,6 +223,14 @@ namespace glsl
  				{ "ROP_CMD_MASK                ", rsx::ROP_control_bits::ROP_CMD_MASK }
  			});
  
 +			// R2PORT: emulated depth-EQUAL tolerance on Z24 surfaces, in 24-bit steps (see rsx::r2_depth_eq_lsb)
 +			OS << "#define R2_DEPTH_EQ_LSB " << std::max(1u, rsx::r2_depth_eq_lsb()) << "\n";
++			// R2PORT: distance-aware floor of that tolerance, eye-depth metres (see rsx::r2_depth_eq_near_um)
++			if (rsx::r2_depth_eq_lsb() != 0 && rsx::r2_depth_eq_near_um() != 0)
++			{
++				OS << "#define R2_DEPTH_EQ_NEAR_W (float(" << rsx::r2_depth_eq_near_um() << ") * 0.000001)\n";
++			}
 +
  			if (props.ROP_channel_remap)
  			{
  				program_common::define_glsl_constants<rsx::ROP_channel_remap>(OS,
-@@ -739,11 +742,22 @@ namespace glsl
+@@ -739,11 +747,22 @@ namespace glsl
  				(reg.name.starts_with("diff_color"sv) || reg.name.starts_with("spec_color"sv));
  		};
  
@@ -6947,7 +6952,7 @@ index 37bbff0..659b098 100644
  					<< reg.type << " " << reg.name << ";\n";
  			}
  
-@@ -768,6 +782,25 @@ namespace glsl
+@@ -768,6 +787,25 @@ namespace glsl
  			"	const vec4 p20 = v[2] - v[0];\n"
  			"	return v[0] + p10 * $gl_BaryCoord.y + p20 * $gl_BaryCoord.z;\n"
  			"}\n\n";
@@ -6973,7 +6978,7 @@ index 37bbff0..659b098 100644
  		OS << fmt::replace_all(interpolate_function_block, {{ "$gl_BaryCoord", "gl_BaryCoord"s + std::string(ext_flavour) }});
  
  		for (const auto& reg : varying_list)
-@@ -776,6 +809,10 @@ namespace glsl
+@@ -776,6 +814,10 @@ namespace glsl
  			{
  				OS << "vec4 " << reg.name << " = " << reg.name << "_raw[2];\n";
  			}
@@ -6985,7 +6990,7 @@ index 37bbff0..659b098 100644
  			{
  				OS << "vec4 " << reg.name << " = _interpolate_varying3(" << reg.name << "_raw);\n";
 diff --git a/rpcs3/Emu/RSX/Program/GLSLCommon.h b/rpcs3/Emu/RSX/Program/GLSLCommon.h
-index 5d929dc..a9f44a0 100644
+index 5d929dc..776f080 100644
 --- a/rpcs3/Emu/RSX/Program/GLSLCommon.h
 +++ b/rpcs3/Emu/RSX/Program/GLSLCommon.h
 @@ -1,4 +1,5 @@
@@ -7002,7 +7007,7 @@ index 5d929dc..a9f44a0 100644
  
  		void set_alpha_test_func(uint func) { value |= (func << ROP_control_bits::ALPHA_FUNC_OFFSET); }
  		void set_msaa_control(uint ctrl) { value |= (ctrl << ROP_control_bits::MSAA_SAMPLE_CTRL_OFFSET); }
-@@ -60,6 +62,35 @@ namespace rsx
+@@ -60,6 +62,64 @@ namespace rsx
  		void set_output_remap(uint remap) { value |= (remap << ROP_control_bits::MRT_CHANNEL_REMAP_OFFSET); }
  		void set_blend_target_mask(uint mask) { value |= ((mask & 0xF) << ROP_control_bits::MRT_BLEND_TARGETS_OFFSET); }
  	};
@@ -7034,6 +7039,35 @@ index 5d929dc..a9f44a0 100644
 +			return n <= 0 ? 0u : static_cast<u32>(n > 256 ? 256 : n);
 +		}();
 +		return lsb;
++	}
++
++	// R2PORT: RSX_DEPTH_EQ_NEAR -- distance-aware floor for the Z24 EQUAL tolerance above, in micrometres of eye
++	// depth (default 100). A fixed 2-step tolerance is ~0.3 um of eye depth on a 0.4 m cutscene close-up (near plane
++	// 0.06), far below the float rounding of skinned vertices, so a material pass redrawn EQUAL over the light-prepass
++	// fails on faces/necks and the prepass normals show through (R3 #43 rainbow neck, green eyelid). The shader widens
++	// the tolerance to this eye-depth delta (capped at 1024 steps), which keeps 1-3 mm layers (basement rug) apart at
++	// any distance. Values: off/no/none/false/0 = fixed RSX_DEPTH_EQ_LSB only; a number = micrometres (max 10000).
++	inline u32 r2_depth_eq_near_um()
++	{
++		static const u32 um = []() -> u32
++		{
++			const char* e = std::getenv("RSX_DEPTH_EQ_NEAR");
++			if (!e || !*e) return 100;
++			char w[8]{};
++			usz len = 0;
++			for (; e[len] && len < sizeof(w) - 1; len++)
++				w[len] = static_cast<char>((e[len] >= 'A' && e[len] <= 'Z') ? e[len] - 'A' + 'a' : e[len]);
++			if (!e[len])
++			{
++				const std::string_view s(w, len);
++				if (s == "off" || s == "no" || s == "none" || s == "false") return 0;
++			}
++			char* end = nullptr;
++			const long n = std::strtol(e, &end, 10);
++			if (end == e || *end) return 100;
++			return n <= 0 ? 0u : static_cast<u32>(n > 10000 ? 10000 : n);
++		}();
++		return um;
 +	}
  }
  
@@ -7427,7 +7461,7 @@ index 0cabcf4..21d0802 100644
  #ifdef _EMULATED_TEXSHADOW
  	#define SHADOW_COORD(index, coord3) _texcoord_xform_shadow(coord3, TEX_PARAM(index))
 diff --git a/rpcs3/Emu/RSX/Program/GLSLSnippets/RSXProg/RSXROPEpilogue.glsl b/rpcs3/Emu/RSX/Program/GLSLSnippets/RSXProg/RSXROPEpilogue.glsl
-index e4b8cec..617a3c9 100644
+index e4b8cec..5e4c47b 100644
 --- a/rpcs3/Emu/RSX/Program/GLSLSnippets/RSXProg/RSXROPEpilogue.glsl
 +++ b/rpcs3/Emu/RSX/Program/GLSLSnippets/RSXProg/RSXROPEpilogue.glsl
 @@ -32,14 +32,48 @@ R"(
@@ -7480,16 +7514,30 @@ index e4b8cec..617a3c9 100644
  	{
  		discard;
  	}
-@@ -81,7 +115,8 @@ R"(
+@@ -81,10 +115,21 @@ R"(
  	float dstDepth = texelFetch(frag_depth, ivec2(gl_FragCoord.xy), 0).r;
  #endif // _ENABLE_ROP_OUTPUT_MULTISAMPLED
  	float srcDepth = gl_FragCoord.z;
 -	float scale = _test_bit(rop_control, FRAG_DEPTH_24_BIT) ? float(0xffffffu) : float(0xffffu);
 +	// R2PORT: Z24 tolerance is R2_DEPTH_EQ_LSB 24-bit steps (FRAG_DEPTH_24_BIT is set by RSXDrawCommands.cpp)
 +	float scale = _test_bit(rop_control, FRAG_DEPTH_24_BIT) ? (float(0xffffffu) / float(R2_DEPTH_EQ_LSB)) : float(0xffffu);
++	float eq_tolerance = 1.f / scale;
++#ifdef R2_DEPTH_EQ_NEAR_W
++	// R2PORT: window z ~ 1 - B/w, so an eye-depth delta dw moves z by (1 - z) * dw / w. Close-ups need far more than
++	// R2_DEPTH_EQ_LSB steps to absorb vertex float rounding between the prepass and the EQUAL redraw (R3 #43).
++	if (_test_bit(rop_control, FRAG_DEPTH_24_BIT))
++	{
++		float near_tol = max(1.f - srcDepth, 0.f) * R2_DEPTH_EQ_NEAR_W * abs(gl_FragCoord.w);
++		eq_tolerance = clamp(near_tol, eq_tolerance, 1024.f / float(0xffffffu));
++	}
++#endif
  
  	// Quantize and compare
- 	if (abs(srcDepth - dstDepth) < (1.f / scale))
+-	if (abs(srcDepth - dstDepth) < (1.f / scale))
++	if (abs(srcDepth - dstDepth) < eq_tolerance)
+ 	{
+ 		gl_FragDepth = dstDepth;
+ 	}
 diff --git a/rpcs3/Emu/RSX/Program/ProgramStateCache.cpp b/rpcs3/Emu/RSX/Program/ProgramStateCache.cpp
 index ae6a3bd..c5bbd22 100644
 --- a/rpcs3/Emu/RSX/Program/ProgramStateCache.cpp
