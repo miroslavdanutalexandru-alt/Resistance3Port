@@ -51,7 +51,8 @@
  *                                game loop runs (not while paused)
  *   PORT_HANG_DUMP=0             no hang watchdog
  *   (unset)                      the original watchdog: game loop only,
- *                                <prefix>_HANG_S seconds (default 90)
+ *                                <prefix>_HANG_S seconds (default 60; a pause
+ *                                holds the stall count, it does not restart it)
  *   PORT_HANG_S=<s>              the strict watchdog's limit (default 20, >= 5)
  *   PORT_CRASH_KEEP=<n>          dumps kept in logs\crash (default 12)
  *   PORT_CRASH_SYMBOLS=0         no PDB symbol lookup in reports
@@ -1077,7 +1078,7 @@ static DWORD WINAPI watchdog(LPVOID)
 {
     const ULONGLONG limit = (ULONGLONG)s_hang_s * 1000ull;
     uint64_t lm = s_cfg.main_progress(), lr = s_cfg.rsx_progress ? s_cfg.rsx_progress() : 0, mr = lm;
-    ULONGLONG tm = GetTickCount64(), tr = tm;
+    ULONGLONG tm = GetTickCount64(), tr = tm, prev = tm;
     int rep_m = 0, rep_r = 0;
     for (;;) {
         Sleep(1000);
@@ -1085,7 +1086,15 @@ static DWORD WINAPI watchdog(LPVOID)
         const int paused = s_cfg.paused && s_cfg.paused();
         const uint64_t m = s_cfg.main_progress();
         const int started = m && m >= s_cfg.main_start_min;
-        if (m != lm || paused || !started) { lm = m; tm = now; rep_m = 0; }
+        /* A pause HOLDS the stall clock instead of restarting it: a game loop
+         * parked on purpose still feeds its counter (R3's frame limiter does),
+         * so a pause cannot fake a hang -- but a hung loop's window losing and
+         * regaining focus used to reset the count on every alt-tab, and a
+         * player who tabbed out to look at it never got a report. */
+        if (paused && m == lm && started) tm += now - prev;
+        prev = now;
+        if (m != lm || !started) { lm = m; tm = now; rep_m = 0; }
+        else if (paused) { /* held */ }
         else if (!rep_m && now - tm >= limit) {
             rep_m = 1;
             char d[200];
@@ -1219,7 +1228,7 @@ static void init(const PortCrashConfig& cfg)
         s_hang_mode = 2; s_hang_s = 20;
         if (const char* e = getenv("PORT_HANG_S")) { const int v = atoi(e); if (v >= 5) s_hang_s = v; }
     } else {
-        s_hang_mode = 1; s_hang_s = 90;
+        s_hang_mode = 1; s_hang_s = 60;
         if (const char* e = cfg.env_prefix ? env2(cfg.env_prefix, "HANG_S", nb, sizeof nb) : NULL) {
             const int v = atoi(e); if (v >= 10) s_hang_s = v;
         }
