@@ -19042,10 +19042,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..704f42a
+index 0000000..06ffcf2
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2681 @@
+@@ -0,0 +1,2802 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -19155,6 +19155,7 @@ index 0000000..704f42a
 +		int backend = 0;       // R2_FG_BACKEND: 0 auto (DLSS-G, else FSR 3), 1 DLSS-G only, 2 FSR 3 only
 +		bool hud = true;       // split the HUD from the scene (R2_DLSS_FG_HUD)
 +		bool hud_debug = false; // tint the detected HUD / overlays on screen (R2_DLSS_FG_HUD_DEBUG)
++		bool hud_hold = true;  // R3_DLSS_FG_HUD_HOLD: frames without a HUD split keep the last split's HUD area as UI
 +		bool debug = false;    // verbose Streamline log (R2_DLSS_FG_DEBUG)
 +		int debug_level = 0;   // R2_DLSS_FG_DEBUG=2: FSR 3 tear lines and reset indicators
 +		bool menu_off = true;  // off while the game's look code is idle (menus, movies, loading)
@@ -19196,6 +19197,8 @@ index 0000000..704f42a
 +			r.pace = pfg_parse_pace(std::getenv("PORT_FG_PACE"));
 +			r.hud = pfg_hudless(std::getenv("PORT_FG_HUDLESS"), penv_int("DLSS_FG_HUD", 1) != 0);
 +			r.hud_debug = penv_int("DLSS_FG_HUD_DEBUG", 0) != 0;
++			r.hud_hold = penv_int("DLSS_FG_HUD_HOLD", 1) != 0;
++			if (r.want && !r.hud_hold) std::fprintf(stderr, "[fg-vk] DLSS_FG_HUD_HOLD=0 (no HUD hold on frames without a HUD split)\n");
 +			r.debug_level = penv_int("DLSS_FG_DEBUG", 0);
 +			r.debug = r.debug_level != 0;
 +			r.menu_off = penv_int("DLSS_FG_MENU_OFF", 1) != 0;
@@ -20030,14 +20033,15 @@ index 0000000..704f42a
 +	// draw, FlipIn = the same buffer at flip (scene + HUD), B0 = the swapchain image before the port overlays,
 +	// B1 = after them. a: game rectangle on the swapchain (x, y, w, h); b: uv scale of the used buffer region
 +	// (x, y), swapchain size (z, w); c: HUD threshold, overlay threshold, HUD pixel limit, flags
-+	// (1 = split the HUD this frame, 2 = HDR10 output, 4 = debug view).
++	// (1 = split the HUD this frame, 2 = HDR10 output, 4 = debug view, 8 / 16 = HUD hold record / use);
++	// hd.x: HUD hold time stamp (1/8 s units, >= 1), hd.y: its maximum age in those units.
 +	const char* r2fg_hud_common =
 +		"layout(set=0, binding=0) uniform sampler2D HudIn;\n"
 +		"layout(set=0, binding=1) uniform sampler2D FlipIn;\n"
 +		"layout(set=0, binding=2) uniform sampler2D B0;\n"
 +		"layout(set=0, binding=3) uniform sampler2D B1;\n"
 +		"layout(set=0, binding=4, r32ui) uniform uimage2D Count;\n"
-+		"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; };\n"
++		"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; vec4 hd; };\n"
 +		"float maxdiff(vec3 x, vec3 y) { vec3 d = abs(x - y); return max(d.x, max(d.y, d.z)); }\n"
 +		"bool game_uv(ivec2 p, out vec2 uv)\n"
 +		"{\n"
@@ -20064,7 +20068,7 @@ index 0000000..704f42a
 +			m_src = std::string("#version 450\nlayout(local_size_x = 8, local_size_y = 8) in;\n") + r2fg_hud_common + body;
 +			ssbo_count = 0;
 +			use_push_constants = true;
-+			push_constants_size = 48;
++			push_constants_size = 64;
 +			create();
 +		}
 +
@@ -20124,6 +20128,7 @@ index 0000000..704f42a
 +	{
 +		const vk::image_view* out_hudless = nullptr;
 +		const vk::image_view* out_ui = nullptr;
++		const vk::image_view* hold = nullptr;
 +
 +		r2fg_compose_pass()
 +		{
@@ -20131,6 +20136,7 @@ index 0000000..704f42a
 +			init(
 +				"layout(set=0, binding=5, " + fmt + ") uniform writeonly image2D HudlessOut;\n"
 +				"layout(set=0, binding=6, " + fmt + ") uniform writeonly image2D UiOut;\n"
++				"layout(set=0, binding=7, r32ui) uniform uimage2D Hold;\n"
 +				"void main()\n"
 +				"{\n"
 +				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
@@ -20148,17 +20154,25 @@ index 0000000..704f42a
 +				"	}\n"
 +				"	vec4 b0 = texelFetch(B0, p, 0);\n"
 +				"	vec4 b1 = texelFetch(B1, p, 0);\n"
++				// R3_DLSS_FG_HUD_HOLD: a split frame the coverage limit accepted records its HUD area with the time stamp hd.x
++				// (flags 8); a frame without one (the classifier was unsure, or the coverage limit tripped) keeps an area
++				// recorded at most hd.y ago as UI (flags 16), see r2fg_hold_mv_pass. Only accepted splits refresh the stamp.
++				"	bool held = false;\n"
++				"	uint now = uint(hd.x + 0.5);\n"
++				"	if (split && (flags & 8u) != 0u) imageStore(Hold, p, uvec4(hud ? now : 0u));\n"
++				"	else if (!split && (flags & 16u) != 0u) { uint h = imageLoad(Hold, p).r; held = h != 0u && now - h <= uint(hd.y + 0.5); }\n"
 +				"	vec3 hl = b0.rgb;\n"
 +				"	vec2 uv;\n"
 +				// SDR: take the HUD's own contribution back out of the presented scene. HDR10 (PQ) is not additive:
 +				// the scene under the HUD keeps the HUD there, the opaque UI layer covers it on every frame.
 +				"	if (hud_c && (flags & 2u) == 0u && game_uv(p, uv))\n"
 +				"		hl = clamp(b0.rgb + textureLod(HudIn, uv, 0.0).rgb - textureLod(FlipIn, uv, 0.0).rgb, 0.0, 1.0);\n"
-+				"	vec4 ui = (hud || ovl) ? vec4(b1.rgb, 1.0) : vec4(0.0);\n"
++				"	vec4 ui = (hud || ovl || held) ? vec4(b1.rgb, 1.0) : vec4(0.0);\n"
 +				"	if ((flags & 4u) != 0u)\n"
 +				"	{\n"
 +				"		vec3 d = b1.rgb;\n"
 +				"		if (hud) d = mix(d, vec3(1.0, 0.0, 1.0), 0.5);\n"
++				"		else if (held) d = mix(d, vec3(1.0, 1.0, 0.0), 0.5);\n"
 +				"		else if (ovl) d = mix(d, vec3(0.0, 1.0, 1.0), 0.5);\n"
 +				"		hl = d;\n"
 +				"	}\n"
@@ -20172,6 +20186,7 @@ index 0000000..704f42a
 +			auto r = r2fg_hud_pass_base::get_inputs();
 +			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "HudlessOut", vk::glsl::input_type_storage_texture, 0, 5));
 +			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "UiOut", vk::glsl::input_type_storage_texture, 0, 6));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Hold", vk::glsl::input_type_storage_texture, 0, 7));
 +			return r;
 +		}
 +
@@ -20180,6 +20195,66 @@ index 0000000..704f42a
 +			r2fg_hud_pass_base::bind_resources(cmd);
 +			m_program->bind_uniform({ *out_hudless }, 0, 5);
 +			m_program->bind_uniform({ *out_ui }, 0, 6);
++			m_program->bind_uniform({ *hold }, 0, 7);
++		}
++	};
++
++	// R3_DLSS_FG_HUD_HOLD, on a frame without a HUD split: zero frame generation's motion vectors under the held HUD
++	// area so the HUD still baked into the HUD-less colour is not dragged along with the scene behind it (from R2).
++	// a: game rectangle on the swapchain; b: motion-vector size (w, h), HUD pixel limit, flags (1 = split attempted);
++	// c: the HUD hold time stamp and maximum age (as hd in r2fg_compose_pass).
++	struct r2fg_hold_mv_pass : compute_task
++	{
++		const vk::image_view* count = nullptr;
++		const vk::image_view* hold = nullptr;
++		const vk::image_view* out_mv = nullptr;
++
++		r2fg_hold_mv_pass()
++		{
++			m_src =
++				"#version 450\n"
++				"layout(local_size_x = 8, local_size_y = 8) in;\n"
++				"layout(set=0, binding=0, r32ui) uniform uimage2D Count;\n"
++				"layout(set=0, binding=1, r32ui) uniform uimage2D Hold;\n"
++				"layout(set=0, binding=2, rg16f) uniform writeonly image2D MvOut;\n"
++				"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; };\n"
++				"void main()\n"
++				"{\n"
++				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
++				"	if (p.x >= int(b.x) || p.y >= int(b.y)) return;\n"
++				"	if ((uint(b.w + 0.5) & 1u) != 0u && float(imageLoad(Count, ivec2(0, 0)).r) < b.z) return;\n"
++				"	ivec2 hs = imageSize(Hold);\n"
++				"	ivec2 s = clamp(ivec2(a.xy + (vec2(p) + 0.5) / b.xy * a.zw), ivec2(0), hs - 1);\n"
++				"	uint h = imageLoad(Hold, s).r;\n"
++				"	if (h != 0u && uint(c.x + 0.5) - h <= uint(c.y + 0.5)) imageStore(MvOut, p, vec4(0.0));\n"
++				"}\n";
++			ssbo_count = 0;
++			use_push_constants = true;
++			push_constants_size = 48;
++			create();
++		}
++
++		std::vector<glsl::program_input> get_inputs() override
++		{
++			auto r = compute_task::get_inputs();
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Count", vk::glsl::input_type_storage_texture, 0, 0));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Hold", vk::glsl::input_type_storage_texture, 0, 1));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "MvOut", vk::glsl::input_type_storage_texture, 0, 2));
++			return r;
++		}
++
++		void bind_resources(const vk::command_buffer&) override
++		{
++			m_program->bind_uniform({ *count }, 0, 0);
++			m_program->bind_uniform({ *hold }, 0, 1);
++			m_program->bind_uniform({ *out_mv }, 0, 2);
++		}
++
++		void run(const vk::command_buffer& cmd, const float* k, u32 w, u32 h)
++		{
++			if (!m_program) load_program(cmd);
++			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, k);
++			compute_task::run(cmd, (w + 7) / 8, (h + 7) / 8, 1);
 +		}
 +	};
 +}
@@ -20223,6 +20298,10 @@ index 0000000..704f42a
 +
 +		// present phases
 +		image_ptr b0, b1, hudless, ui, count;
++		// R3_DLSS_FG_HUD_HOLD: HUD area of the last accepted split (swapchain-sized r32ui time stamps, 1/8 s units
++		// since hold_base); hold_ms: the last CPU-side split attempt
++		image_ptr hold;
++		unsigned long long hold_ms = 0, hold_base = 0;
 +		VkFormat out_fmt = VK_FORMAT_UNDEFINED;
 +		bool have_b0 = false, have_ui = false, split = false;
 +		s32 rx = 0, ry = 0, rwid = 0, rhei = 0; // game rectangle on the swapchain
@@ -20302,7 +20381,7 @@ index 0000000..704f42a
 +	{
 +		auto& f = g_fg;
 +		f.depth.reset(); f.mv.reset(); f.hud.reset();
-+		f.b0.reset(); f.b1.reset(); f.hudless.reset(); f.ui.reset(); f.count.reset();
++		f.b0.reset(); f.b1.reset(); f.hudless.reset(); f.ui.reset(); f.count.reset(); f.hold.reset();
 +		f.scene = f.hud_started = f.have_b0 = f.ready = false;
 +	}
 +
@@ -20602,6 +20681,33 @@ index 0000000..704f42a
 +		const bool split = fgcfg().hud && f.hud && f.hud_rt == src && !f.unsure && f.hud_draws &&
 +			f.hud->info.format == src->info.format && f.hud->width() == src->width() && f.hud->height() == src->height();
 +
++		// R3_DLSS_FG_HUD_HOLD (ported from R2): the HUD area of the last split frame the GPU accepted (under 2 s old)
++		// stays UI on frames without one, and frame generation's motion vectors there are zeroed. Without it such a
++		// frame hands DLSS-G a HUD-less colour that still holds the HUD, with the scene's motion under it: the
++		// generated frames drag the HUD. The age is checked on the GPU against the stamp each accepted split writes
++		// (r2fg_compose_pass); hold_ms (the last CPU-side split attempt) skips the hold passes once no split was even
++		// tried for 2 s.
++		const unsigned long long t_now = now_ms();
++		const bool hold_on = fgcfg().hud_hold && fgcfg().hud;
++		{
++			vk::viewable_image* old = f.hold.get();
++			fg_ensure(f.hold, VK_FORMAT_R32_UINT, hold_on ? W : 1, hold_on ? H : 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++			// stamps stay exact in a float push constant: restart (clear) long before 2^24
++			if (f.hold.get() != old || (t_now - f.hold_base) / 125 > (1u << 22))
++			{
++				f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++				const VkClearColorValue z{};
++				vkCmdClearColorImage(cmd, f.hold->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &k_color_range);
++				f.hold_ms = 0;
++				f.hold_base = t_now;
++			}
++			f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
++		}
++		const bool hold_use = hold_on && f.hold_ms && t_now - f.hold_ms < 2000;
++		if (hold_on && split) f.hold_ms = t_now;
++		const float hold_stamp = static_cast<float>((t_now - f.hold_base) / 125 + 1);
++		constexpr float hold_max_age = 15.f; // 1/8 s units: elapsed < 2 s since the last accepted split
++
 +		f.count->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 +		const VkClearColorValue zero{};
 +		vkCmdClearColorImage(cmd, f.count->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &k_color_range);
@@ -20609,13 +20715,14 @@ index 0000000..704f42a
 +		src->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +
 +		const float rect_w = static_cast<float>(x2 - x1), rect_h = static_cast<float>(y2 - y1);
-+		const float k[12] = {
++		const float k[16] = {
 +			static_cast<float>(x1), static_cast<float>(y1), rect_w, rect_h,
 +			static_cast<float>(std::min(buffer_w, src->width())) / static_cast<float>(src->width()),
 +			static_cast<float>(std::min(buffer_h, src->height())) / static_cast<float>(src->height()),
 +			static_cast<float>(W), static_cast<float>(H),
 +			0.5f / 255.f, 0.25f / 1023.f, 0.3f * rect_w * rect_h,
-+			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0)) };
++			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0) | (hold_on ? 8 : 0) | (hold_use ? 16 : 0)),
++			hold_stamp, hold_max_age, 0.f, 0.f };
 +		const auto bind = [&](vk::r2fg_hud_pass_base* pass)
 +		{
 +			pass->in[0] = split ? fg_view(f.hud.get()) : fg_view(f.b0.get());
@@ -20638,12 +20745,26 @@ index 0000000..704f42a
 +			bind(pass);
 +			pass->out_hudless = fg_view(f.hudless.get());
 +			pass->out_ui = fg_view(f.ui.get());
++			pass->hold = fg_view(f.hold.get());
 +			pass->run(cmd, k, W, H);
 +		};
 +		if (hdr10) compose(vk::get_compute_task<vk::r2fg_compose_pass<true>>());
 +		else compose(vk::get_compute_task<vk::r2fg_compose_pass<false>>());
 +		src->pop_layout(cmd);
 +		f.ui->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++		if (hold_use && f.mv && f.rw && f.rh)
++		{
++			vk::insert_global_memory_barrier(cmd);
++			f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
++			auto pass = vk::get_compute_task<vk::r2fg_hold_mv_pass>();
++			pass->count = fg_view(f.count.get());
++			pass->hold = fg_view(f.hold.get());
++			pass->out_mv = fg_view(f.mv.get());
++			const float km[12] = { k[0], k[1], k[2], k[3], static_cast<float>(f.rw), static_cast<float>(f.rh), k[10], split ? 1.f : 0.f,
++				hold_stamp, hold_max_age, 0.f, 0.f };
++			pass->run(cmd, km, f.rw, f.rh);
++			f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++		}
 +
 +		if (f.debug_view)
 +		{
