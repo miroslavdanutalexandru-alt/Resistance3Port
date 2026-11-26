@@ -338,6 +338,7 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
 void spu_coh_notify_write_except(uint32_t ea, const void* self)
 {
     uint32_t line = ea & ~127u;
+    if (__builtin_expect(g_spu_jw_on > 0, 0)) spu_jw_note_write(ea, self ? self : (const void*)1);
     ppu_resv_break_line(ea);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;
@@ -383,6 +384,7 @@ static void coh_note_kill(void)
 void spu_coh_notify_write(uint32_t ea)
 {
     uint32_t line = ea & ~127u;
+    if (__builtin_expect(g_spu_jw_on > 0, 0)) spu_jw_note_write(ea, NULL);
     ppu_resv_break_line(ea);
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next) {
         spu_context* c = entry->ctx;

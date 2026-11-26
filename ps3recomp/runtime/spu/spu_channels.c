@@ -1929,15 +1929,20 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     }
 
     if (channel_is_mfc(channel)) {
+        /* R3_JOBWATCH (spu_jobwatch.c): job 403's commands, before and after. */
+        const int jw = channel == MFC_Cmd && __builtin_expect(g_spu_jw_on != 0, 0) && spu_jw_cmd(ctx, v, 0);
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
          * not the plain GET/PUT the DMA engine would do. */
         if (channel == MFC_Cmd && __builtin_expect(g_cpurep_spu_live != 0, 0) &&
-            cpurep_spu_atomic(ctx, v, spu_mfc_atomic)) return; /* cpu-replay */
+            cpurep_spu_atomic(ctx, v, spu_mfc_atomic)) { if (jw) spu_jw_cmd(ctx, v, 1); return; } /* cpu-replay */
         if (channel == MFC_Cmd && (__builtin_expect(g_spu_jobcap_live != 0, 0)
-                                       ? spu_jobcap_atomic(ctx, v) : spu_mfc_atomic(ctx, v)))
+                                       ? spu_jobcap_atomic(ctx, v) : spu_mfc_atomic(ctx, v))) {
+            if (jw) spu_jw_cmd(ctx, v, 1);
             return;
+        }
         if (channel == MFC_Cmd) { SPU_PROF_ADD(ctx, dma, 1); SPU_PROF_ADD(ctx, dma_bytes, ctx->mfc_size); }
         mfc_channel_write(mfc_for(ctx), ctx, channel, v);
+        if (jw) spu_jw_cmd(ctx, v, 1);
         /* MFC tag-status-update EVENT producer (channel-stall milestone). Our
          * DMA completes synchronously, so the instant the program arms tag
          * notification (MFC_WrTagUpdate with a non-zero mode = any/all), the
@@ -5357,6 +5362,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
                    * SPU_BADCALL_EXIT, which takes precedence when set): returning
                    * into an arbitrary job carried its garbage on (v59).
                    * SPU_JOB_BADCALL_SKIP=0 halts here too. */
+                  if (__builtin_expect(g_spu_jw_on > 0, 0)) spu_jw_badcall(ctx, p0, lr);
                   { static int s_jbs = -1, s_jbx = -1;
                     if (s_jbs < 0) { const char* e = getenv("SPU_JOB_BADCALL_SKIP"); s_jbs = e ? atoi(e) : 1; }
                     if (s_jbx < 0) { const char* e = getenv("SPU_BADCALL_EXIT"); s_jbx = (e && strtoul(e, 0, 16)) ? 1 : 0; }
