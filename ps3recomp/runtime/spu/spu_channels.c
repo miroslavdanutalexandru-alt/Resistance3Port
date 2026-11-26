@@ -4619,10 +4619,76 @@ static int spu_ibfast_init(void)
  * only under R3_NATIVE_DOF / R3_DOF_TRACE / R3_DOF_CAPTURE). Returns 1 when it
  * performed the call itself and left ctx->pc at the return address. */
 int (*volatile g_spu_native_ib_hook)(spu_context*) = 0;
+static uint32_t spu_ls_be32(const spu_context* ctx, uint32_t lsa)
+{
+    const uint8_t* c = ctx->ls + (lsa & SPU_LS_MASK);
+    return ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
+}
+/* Resistance 3 job 403 (igjob_00D7A480, igPm): job 403's state-callback call
+ * at 0xF8F0 (bisl $r0,$r90, link 0xF8F4) with the code that loads its target
+ * (0xF8C0..0xF8F0) still in LS. */
+static const uint32_t k_j403_f8c0[13] = {
+    0x42A61005u, 0x4080062Cu, 0x3F81982Fu, 0x183417AEu, 0x0F60972Du,
+    0x180156ABu, 0x1C0315D9u, 0x388B15D8u, 0x3B966C5Au, 0x2000025Au,
+    0x1C100283u, 0x3FE02904u, 0x35202D00u };   /* ila $r5,0x14C20 ... bisl $r0,$r90 */
+static int spu_j403_site(const spu_context* ctx, uint32_t target)
+{
+    if ((ctx->gpr[0]._u32[0] & SPU_LS_MASK) != 0xF8F4u ||
+        (ctx->gpr[90]._u32[0] & SPU_LS_MASK & ~3u) != (target & SPU_LS_MASK & ~3u))
+        return 0;
+    for (int k = 0; k < 13; k++)
+        if (spu_ls_be32(ctx, 0xF8C0u + 4u * (uint32_t)k) != k_j403_f8c0[k]) return 0;
+    return 1;
+}
+/* Resistance 3 job 403 bad-state guard. The callback comes from LS
+ * 0x14C2C + 4*state, state = the claimed object's halfword +0x18 (LS 0x14C78).
+ * The table lies inside the job's parameter block (0x14C20..0x14C5F); a state
+ * that indexes past it (>= 13: the SPU's own "done" mark 0x8000 shows up here)
+ * reads the object itself or whatever stale LS lies beyond, never a callback.
+ * Seen three ways: 0x8D (#42, Haven evacuation: unaligned, nothing at it),
+ * 0x32800 holding 03FF2800 (tunnels ladder: interpreter halted on the first
+ * word, 3e78242 resumes) and 0x32800 holding 05FF2800 (end of Haven: the first
+ * 47 words decode, the interpreter ran them, halted at 0x328BC and the lane
+ * stopped -- neither earlier skip matched). Decide from the state BEFORE the
+ * target is resolved: skip the call like the empty slot the job itself skips
+ * (brz at 0xF8E4) so it finishes its pass and reports the object done.
+ * SPU_JOB_BADCALL_SKIP=0 keeps the old handling. */
+static int spu_j403_bad_state_skip(spu_context* ctx)
+{
+    static int s_on = -1;
+    if (s_on < 0) {
+        const char* e = getenv("SPU_JOB_BADCALL_SKIP");
+        const char* x = getenv("SPU_BADCALL_EXIT");   /* set: that handling wins, as at the #42 site below */
+        s_on = (e ? atoi(e) : 1) && !(x && strtoul(x, 0, 16));
+    }
+    if (!s_on) return 0;
+    const uint32_t tgt = (uint32_t)ctx->pc & SPU_LS_MASK;
+    const uint32_t state = (uint32_t)ctx->ls[0x14C78] << 8 | ctx->ls[0x14C79];
+    if (state < 13u || !spu_j403_site(ctx, tgt)) return 0;
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    if (k <= 8 || (k & (k - 1)) == 0) {
+        fprintf(stderr, "[spu] WARNING: img=%d job 403 bad object state 0x%04X (callback slot LS 0x%05X -> 0x%05X) "
+                        "-- call skipped, pass finished (#%ld; SPU_JOB_BADCALL_SKIP=0 off)\n",
+                ctx->image_id, state, 0x14C2Cu + 4u * state, tgt, (long)k);
+        for (uint32_t a = 0x14C60u; a < 0x14CA0u; a += 16u)
+            fprintf(stderr, "      object LS[0x%05X]: %08X %08X %08X %08X\n", a, spu_ls_be32(ctx, a),
+                    spu_ls_be32(ctx, a + 4u), spu_ls_be32(ctx, a + 8u), spu_ls_be32(ctx, a + 12u));
+        fprintf(stderr, "      queue  LS[0x14D00]: %08X %08X %08X %08X\n", spu_ls_be32(ctx, 0x14D00u),
+                spu_ls_be32(ctx, 0x14D04u), spu_ls_be32(ctx, 0x14D08u), spu_ls_be32(ctx, 0x14D0Cu));
+        fflush(stderr);
+    }
+    ctx->pc = 0xF8F4u;
+    g_spu_trampoline_fn = spu_indirect_branch;
+    return 1;
+}
 void spu_indirect_branch(spu_context* ctx)
 {
     SPU_PROF_ADD(ctx, ib, 1);
     if (__builtin_expect(g_spu_native_ib_hook != 0, 0) && g_spu_native_ib_hook(ctx)) return;
+    if (__builtin_expect(ctx->policy_mode && (ctx->gpr[0]._u32[0] & SPU_LS_MASK) == 0xF8F4u, 0) &&
+        spu_j403_bad_state_skip(ctx))
+        return;
     {   /* [spu-jobs] job entry (spu_drain.c) */
         extern uint32_t g_sjt_link_a, g_sjt_link_b;
         extern void spu_jobtime_begin(spu_context*, uint32_t);
@@ -5366,16 +5432,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
                   { static int s_jbs = -1, s_jbx = -1;
                     if (s_jbs < 0) { const char* e = getenv("SPU_JOB_BADCALL_SKIP"); s_jbs = e ? atoi(e) : 1; }
                     if (s_jbx < 0) { const char* e = getenv("SPU_BADCALL_EXIT"); s_jbx = (e && strtoul(e, 0, 16)) ? 1 : 0; }
-                    static const uint32_t k_j403_f8c0[13] = {
-                        0x42A61005u, 0x4080062Cu, 0x3F81982Fu, 0x183417AEu, 0x0F60972Du,
-                        0x180156ABu, 0x1C0315D9u, 0x388B15D8u, 0x3B966C5Au, 0x2000025Au,
-                        0x1C100283u, 0x3FE02904u, 0x35202D00u };   /* ila $r5,0x14C20 ... bisl $r0,$r90 */
-                    int site = s_jbs && !s_jbx && lr == 0xF8F4u &&
-                               (ctx->gpr[90]._u32[0] & SPU_LS_MASK & ~3u) == p0;
-                    for (int k = 0; site && k < 13; k++) {
-                        const uint8_t* c = ctx->ls + 0xF8C0u + 4u * (uint32_t)k;
-                        site = (((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3]) == k_j403_f8c0[k];
-                    }
+                    const int site = s_jbs && !s_jbx && lr == 0xF8F4u && spu_j403_site(ctx, p0);
                     if (site) {
                         static volatile LONG n_jbs = 0;
                         if (InterlockedIncrement(&n_jbs) == 1)
