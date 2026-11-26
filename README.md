@@ -255,6 +255,8 @@ All of these are in the launcher (on the Display, Graphics, Upscaling & Frame Ge
   | Object (per-moby) motion blur | `func_00855A98` | p+0x0C, sample scale | < 0.01 |
   | Depth of field | `func_008557A8` | p+0x28 / p+0x38, near / far max blur (block 0xC4 / 0xD0) | both < 0.01 |
 
+  `R3_FG_MBLUR_SCALE=0.5` (default `1` = unchanged) multiplies the two motion-blur fields instead while frame generation is selected, per NVIDIA's DLSS-G guide (blur baked into the image is interpolated as smear).
+
   Only the stack copy is changed, so turning an effect back on restores the level's exact values. The Lua `pfx_set_node_*` natives (registered at 0x8EA7E0 through `lis`/`addic` pairs, which is why a plain pointer search finds no references) feed the same block, so script-driven effects are covered too.
 - **Colour-blind filter** — `R3_COLORBLIND=1|2|3` (protanopia / deuteranopia / tritanopia): daltonization in the final output pass (Compatible renderer). Applies at once. The filter decodes sRGB to linear light, daltonizes (ReShade *Daltonize* matrices: simulate the deficiency, shift the lost red/green error into green/blue), re-encodes, and runs before HDR encoding. Strength is fixed at full.
 - **Game crosshair / hit markers** — `R3_RETICLE=0` hides the game's own crosshair, `R3_HITMARKER=0` its hit markers (see *Aiming and sticks*); live in F9, Options > PC Controls & HUD and the launcher.
