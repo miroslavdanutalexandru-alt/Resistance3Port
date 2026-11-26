@@ -94,7 +94,8 @@ static std::vector<Setting> g_set = {
       "40 / 45 suit 120 Hz / 90 Hz screens and handhelds. 72 to 240 / Match display / Uncapped go further (uncapped: as fast as the PC allows; "
       "best with VSync Auto or Off and a G-Sync / FreeSync monitor). WARNING: above about 75 fps Resistance 3's "
       "engine can miss the left stick (standing still you may have to jump before you can move; ladders need "
-      "retries). 60 is recommended.",
+      "retries). 60 is recommended."
+      " On a fixed-refresh screen (Display sync) the limit becomes an even share of the refresh rate (60 -> 72 at 144 Hz) and steps down one share (48) while the PC can't hold it, back up when it can.",
       { {"30 fps  (PS3 original)", "30"}, {"40 fps  (Steam Deck / 120 Hz screens)", "40"}, {"45 fps  (90 Hz screens)", "45"},
         {"60 fps  (recommended)", "60"}, {"72 fps  (144 Hz screens)", "72"}, {"90 fps  (may break movement)", "90"},
         {"120 fps  (may break movement)", "120"}, {"144 fps  (may break movement)", "144"}, {"165 fps  (may break movement)", "165"},
