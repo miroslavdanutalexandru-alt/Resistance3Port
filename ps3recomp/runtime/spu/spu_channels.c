@@ -4673,6 +4673,14 @@ void spu_indirect_branch(spu_context* ctx)
     spu_indirect_branch_full(ctx);
 #endif
 }
+/* The word before lr is `bisl $0,$ra` (bisl -- 0x1A9, rt 0) whose ra still holds target (low bits ignored). */
+static int spu_is_bisl_to(const spu_context* ctx, uint32_t lr, uint32_t target)
+{
+    const uint8_t* c = ctx->ls + ((lr - 4u) & SPU_LS_MASK);
+    const uint32_t w = ((uint32_t)c[0] << 24) | ((uint32_t)c[1] << 16) | ((uint32_t)c[2] << 8) | c[3];
+    const uint32_t ra = (w >> 7) & 0x7Fu;
+    return (w >> 21) == 0x1A9u && (w & 0x7Fu) == 0u && (ctx->gpr[ra]._u32[0] & SPU_LS_MASK & ~3u) == target;
+}
 static void spu_indirect_branch_full(spu_context* ctx)
 {
     /* Real SPU bi/bisl mask the target to the 256 KB local store; the high bits
@@ -4687,13 +4695,16 @@ static void spu_indirect_branch_full(spu_context* ctx)
      * 0x20200); looking the raw value up found nothing and halted the policy
      * module (York's "Physics SPU Collision Timed Out!" freeze).
      * SPU_BRANCH_ALIGN=0 disables. */
+    uint32_t unaligned_pc = 0xFFFFFFFFu;   /* the aligned target of an unaligned branch (bad-call check below) */
     { static int al = -1; if (al < 0) { const char* e = getenv("SPU_BRANCH_ALIGN"); al = e ? atoi(e) : 1; }
       if (al && (ctx->pc & 3u)) {
           static volatile LONG _n = 0;
           if (InterlockedIncrement(&_n) <= 8)
-              fprintf(stderr, "[spu] img=%d indirect branch to unaligned 0x%05X -> 0x%05X\n",
-                      ctx->image_id, ctx->pc, ctx->pc & ~3u);
+              fprintf(stderr, "[spu] img=%d indirect branch to unaligned 0x%05X -> 0x%05X (lr=0x%05X r3=0x%05X)\n",
+                      ctx->image_id, ctx->pc, ctx->pc & ~3u, ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                      ctx->gpr[3]._u32[0] & SPU_LS_MASK);
           ctx->pc &= ~3u;
+          unaligned_pc = (uint32_t)ctx->pc;
       } }
     /* Resistance port: raw SPU 0 (image 300, the sound engine) calls each PPU
      * command's handler through a table (rawspu0 0xD8E0: index from the
@@ -5278,7 +5289,17 @@ static void spu_indirect_branch_full(spu_context* ctx)
                               (ctx->gpr[0]._u32[0] & SPU_LS_MASK) >= 0x4000u &&
                               (ctx->gpr[0]._u32[0] & SPU_LS_MASK) < 0x3E000u) ||
                              (skip >= 1 && p0 > 0 && p0 < 0x30000u && (w >> 21) != 0u &&
-                              spu_image_of_function(p0) < 0);
+                              spu_image_of_function(p0) < 0) ||
+                             /* R3 St. Louis (report 130789): job 403 called 0x27D7, the
+                              * middle of its own func_2788 (0x27D4 is 3 words into the
+                              * prologue). Another image registers a function at 0x27D4, so
+                              * the global lookup above said "code" and the call went to the
+                              * microstep / interpreter, which ran the half prologue with
+                              * garbage registers and never came back: no job done, no frame.
+                              * An unaligned `bisl` target inside a resident image that has no
+                              * lifted entry there is a bad pointer, not code. */
+                             (skip >= 1 && code_owner && p0 == unaligned_pc && p0 >= 0x100u && p0 < 0x30000u &&
+                              (w >> 21) != 0u && lr >= 4u && spu_is_bisl_to(ctx, lr, p0));
               if (skip && bad_call && ctx->policy_mode && lr && lr != p0) {
                   static volatile LONG _nn = 0;
                   LONG nth = InterlockedIncrement(&_nn);
