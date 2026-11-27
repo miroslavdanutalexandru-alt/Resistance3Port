@@ -19042,10 +19042,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..06ffcf2
+index 0000000..3ac00bc
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2802 @@
+@@ -0,0 +1,2829 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -19165,6 +19165,9 @@ index 0000000..06ffcf2
 +		bool cam_ident = false; // R2_DLSS_FG_CAM_IDENT=1: identity clipToPrevClip (R1's constants; the vectors carry all motion)
 +		float depth_sep = 40.f; // R2_DLSS_FG_DEPTH_SEP: minRelativeLinearDepthObjectSeparation (Streamline default 40)
 +		int limit_fps = 0; // R2_DLSS_FG_LIMIT_FPS: cap on presented fps with DLSS-G on (0 = refresh-based cap); evens out an uneven base rate
++		// R3_DLSS_FG_REAL_CAMERA=1: camera position / axes / projection from the game's view-projection instead of fixed defaults.
++		// Off by default in R3 until checked on an R3 RSX_MV_DUMP (R3's dumps carry no game_vp yet; R2's validate it)
++		bool real_cam = false;
 +		unsigned gap = 2; // R?_DLSS_FG_GAP: scene-less frames mid-play that resume without the warm-up (pfg_streak_gap; 0 = old)
 +		int pace = PFG_PACE_VRR; // FSR 3 present pacer (PORT_FG_PACE)
 +		// R?_DLSS_FG_REFLEX_IDS: Reflex / PCL frame id of a present. 1: the game frame it shows (finished game frames are
@@ -19207,6 +19210,7 @@ index 0000000..06ffcf2
 +			r.cut_reset = penv_int("DLSS_FG_CUT_RESET", 1);
 +			r.gap = static_cast<unsigned>(std::clamp(penv_int("DLSS_FG_GAP", 2), 0, 8));
 +			r.cam_ident = penv_int("DLSS_FG_CAM_IDENT", 0) != 0;
++			r.real_cam = penv_int("DLSS_FG_REAL_CAMERA", 0) != 0;
 +		r.limit_fps = std::clamp(penv_int("DLSS_FG_LIMIT_FPS", 0), 0, 1000);
 +		if (r.limit_fps) std::fprintf(stderr, "[fg-vk] DLSS_FG_LIMIT_FPS=%d (presented frames)\n", r.limit_fps);
 +			if (const char* e = penv("DLSS_FG_DEPTH_SEP")) { const float v = static_cast<float>(std::atof(e)); if (v > 0.f && v < 10000.f) r.depth_sep = v; }
@@ -19249,7 +19253,18 @@ index 0000000..06ffcf2
 +		if (fgcfg().want) r2fgdiag::note_upscaler(upscaler_reset, why, cut_kind, cut_reset);
 +#endif
 +	}
-+}
++
++	// R3_DLSS_FG_REAL_CAMERA: the camera of the game's view-projection; a frame without one keeps the last (a jump back
++	// to fixed axes would look like a cut to DLSS-G's scene change detection)
++	static pfg_camera g_fg_cam{};
++	static bool g_fg_cam_ok = false;
++	void r2fg_game_vp(const double* V)
++	{
++		pfg_camera c;
++		if (!fgcfg().want || !fgcfg().real_cam || !pfg_camera_from_vp(V, &c)) return;
++		g_fg_cam = c;
++		g_fg_cam_ok = true;
++	}}
 +
 +#if defined(_WIN32) && defined(R2PORT_HAVE_SL)
 +
@@ -20880,9 +20895,11 @@ index 0000000..06ffcf2
 +		vk::r2aa_camera(cn, cf, cv);
 +		const double n = cn, fa = cf, fov = cv, aspect = f.rh ? static_cast<double>(f.rw) / f.rh : 16.0 / 9.0;
 +		const double ys = 1.0 / std::tan(fov * 0.5), xs = ys / aspect;
++		// R3_DLSS_FG_REAL_CAMERA (default off): position, axes and x / y scales of the game's camera (vk::r2fg_game_vp)
++		const pfg_camera* rc = fgcfg().real_cam && vk::g_fg_cam_ok ? &vk::g_fg_cam : nullptr;
 +		mat4 P{};
-+		P[0][0] = xs;
-+		P[1][1] = ys;
++		P[0][0] = rc ? rc->xs : xs;
++		P[1][1] = rc ? rc->ys : ys;
 +		P[2][3] = 1.0;
 +		if (f.inverted)
 +		{
@@ -20913,6 +20930,16 @@ index 0000000..06ffcf2
 +		c.cameraFar = static_cast<float>(fa);
 +		c.cameraFOV = static_cast<float>(fov);
 +		c.cameraAspectRatio = static_cast<float>(aspect);
++		if (rc)
++		{
++			const auto f3 = [](const double* v) { return sl::float3(static_cast<float>(v[0]), static_cast<float>(v[1]), static_cast<float>(v[2])); };
++			c.cameraPos = f3(rc->pos);
++			c.cameraUp = f3(rc->up);
++			c.cameraRight = f3(rc->right);
++			c.cameraFwd = f3(rc->fwd);
++			c.cameraFOV = static_cast<float>(2.0 * std::atan(1.0 / rc->ys));
++			c.cameraAspectRatio = static_cast<float>(rc->ys / rc->xs);
++		}
 +		c.motionVectorsInvalidValue = 0.f;
 +		c.depthInverted = f.inverted ? sl::Boolean::eTrue : sl::Boolean::eFalse;
 +		c.cameraMotionIncluded = sl::Boolean::eTrue;
@@ -21850,10 +21877,10 @@ index 0000000..06ffcf2
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.h b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
 new file mode 100644
-index 0000000..1c8fd36
+index 0000000..7e9e564
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,75 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation: NVIDIA DLSS Frame Generation (2x, 3x/4x Multi Frame Generation) through Streamline
 +// (sl.interposer.dll and its plugins), or AMD FSR 3 frame interpolation (2x, amd_fidelityfx_vk.dll) for GPUs
@@ -21905,6 +21932,9 @@ index 0000000..1c8fd36
 +	// frame-generation-tagged frame the upscaler's reset (reset_why bits), held cut kind and whether FG reset on it
 +	void r2fg_diag_cut(double motion, double parallax, u32 members, u32 matched);
 +	void r2fg_diag_upscaler(bool upscaler_reset, u32 why, int cut_kind, bool cut_reset);
++	// VKR2Upscaler.cpp: the game's view-projection of this frame (16 doubles, row-major, column vectors) once it is known to
++	// be the camera's (shared by most draws or confirmed by them): frame generation's camera constants (R3_DLSS_FG_REAL_CAMERA)
++	void r2fg_game_vp(const double* V);
 +
 +	// VKPresent.cpp present_frame. phase 0: after the game image is on the swapchain image, before RPCS3/port
 +	// overlays; phase 1: after the overlays, before the transition to the present layout. 'src' is the flipped
@@ -21928,10 +21958,10 @@ index 0000000..1c8fd36
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
 new file mode 100644
-index 0000000..fc62095
+index 0000000..3bdd047
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGenLogic.h
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,239 @@
 +/* R2PORT: Resistance 1/2/3 port addition (not upstream RPCS3).
 + * Frame generation decisions without any graphics API: the PORT_FG / PORT_FG_HUDLESS / PORT_FG_PACE selectors,
 + * the FSR 3 present pacer, the Reflex frame cap, the FSR 3 enable hold and the per-frame on/off gate.
@@ -21943,6 +21973,7 @@ index 0000000..fc62095
 +#define PORT_FG_LOGIC_H
 +
 +#include <stdlib.h>
++#include <math.h>
 +#include <ctype.h>
 +
 +/* case-insensitive equality; NULL never matches */
@@ -22101,6 +22132,58 @@ index 0000000..fc62095
 +    const int bridge = *gap && *gap <= max_gap;
 +    *gap = 0u;
 +    return bridge ? PFG_WARMUP_FRAMES : streak + 1u;
++}
++
++/* R?_DLSS_FG_REAL_CAMERA: Streamline's camera constants (cameraPos / Right / Up / Fwd, FOV, aspect) from a
++   view-projection V (16 doubles, row-major, column vectors: clip = V * (x, y, z, 1), clip w = distance along the view
++   direction). Forward = the w row; right / up = the x / y rows made orthonormal to it (Gram-Schmidt in double, so the
++   [right up fwd] matrix DLSS-G's scene change detection checks is orthonormal to float precision); position = the point
++   where clip x = y = w = 0; xs / ys = the projection's x / y scales (vertical FOV 2 atan(1 / ys), aspect ys / xs).
++   Returns 0 and leaves *c alone for a degenerate V. */
++typedef struct { double pos[3], right[3], up[3], fwd[3], xs, ys; } pfg_camera;
++static inline double pfg_dot3(const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
++static inline double pfg_det3(const double m[3][3])
++{
++    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
++        m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
++}
++static inline int pfg_camera_from_vp(const double* V, pfg_camera* c)
++{
++    double fw[3], rt[3], up[3], M[3][3], rhs[3], pos[3], lw, lr, lu, a, det;
++    int i, k, r, q;
++    for (i = 0; i < 16; ++i)
++        if (!(V[i] == V[i]) || V[i] > 1e30 || V[i] < -1e30) return 0;
++    for (i = 0; i < 3; ++i) { rt[i] = V[i]; up[i] = V[4 + i]; fw[i] = V[12 + i]; }
++    lw = sqrt(pfg_dot3(fw, fw));
++    if (!(lw > 1e-12)) return 0;
++    for (i = 0; i < 3; ++i) fw[i] /= lw;
++    a = pfg_dot3(rt, fw);
++    for (i = 0; i < 3; ++i) rt[i] -= a * fw[i];
++    lr = sqrt(pfg_dot3(rt, rt));
++    if (!(lr > 1e-12 * lw)) return 0;
++    for (i = 0; i < 3; ++i) rt[i] /= lr;
++    a = pfg_dot3(up, fw);
++    for (i = 0; i < 3; ++i) up[i] -= a * fw[i];
++    a = pfg_dot3(up, rt);
++    for (i = 0; i < 3; ++i) up[i] -= a * rt[i];
++    lu = sqrt(pfg_dot3(up, up));
++    if (!(lu > 1e-12 * lw)) return 0;
++    for (i = 0; i < 3; ++i) up[i] /= lu;
++    for (i = 0; i < 3; ++i) { M[0][i] = V[i]; M[1][i] = V[4 + i]; M[2][i] = V[12 + i]; }
++    rhs[0] = -V[3]; rhs[1] = -V[7]; rhs[2] = -V[15];
++    det = pfg_det3(M);
++    if (!(fabs(det) > 1e-30)) return 0;
++    for (k = 0; k < 3; ++k)
++    {
++        double m[3][3];
++        for (r = 0; r < 3; ++r)
++            for (q = 0; q < 3; ++q) m[r][q] = q == k ? rhs[r] : M[r][q];
++        pos[k] = pfg_det3(m) / det;
++    }
++    for (i = 0; i < 3; ++i) { c->pos[i] = pos[i]; c->right[i] = rt[i]; c->up[i] = up[i]; c->fwd[i] = fw[i]; }
++    c->xs = lr / lw;
++    c->ys = lu / lw;
++    return 1;
 +}
 +
 +static inline int pfg_gate(const pfg_gate_in* g)
@@ -28375,10 +28458,10 @@ index 0000000..3cb23c0
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..d5956d6
+index 0000000..b13ecf9
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12315 @@
+@@ -0,0 +1,12316 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -38350,6 +38433,7 @@ index 0000000..d5956d6
 +					{
 +						ps_vp = std::memcmp(&Vc, &Vp, sizeof(m4)) == 0 ? 1 : 2;
 +						ps_vp_T = Te;
++						vk::r2fg_game_vp(&Vc.m[0][0]); // R3_DLSS_FG_REAL_CAMERA
 +					}
 +					ex_vp_same = supported && std::memcmp(&Vc, &Vp, sizeof(m4)) == 0;
 +					ex_have = true;
