@@ -758,6 +758,7 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
 #include "port_mem.h"         /* PORT_LARGE_PAGES: reported unavailable here, see main() */
 #include "r3_native_dof.h"   /* R3_NATIVE_DOF_DEFAULT for the [native] line */
 #include "r3_disc.h"         /* [boot] disc: which disc / program, unknown-program error */
+#include "port_fastboot.h"   /* PORT_FAST_BOOT / PORT_BOOT_LEVEL */
 #endif
 
 extern "C" void vm_inline_refresh(void);
@@ -1020,6 +1021,8 @@ int main(int argc, char** argv)
         setenv("PS3_MAPPER_BASE", "30000000", 1);
 #endif
     }
+
+    port_fastboot_init();   /* PORT_FAST_BOOT / PORT_BOOT_LEVEL (developer test runs) */
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");

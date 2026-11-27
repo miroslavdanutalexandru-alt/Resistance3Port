@@ -52,6 +52,7 @@
 #include <mutex>
 #include <set>
 #include "port_osd.h"
+#include "port_fastboot.h"
 #include "ps3emu/port_pc_extras2.h"
 #pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -1409,6 +1410,82 @@ static void crosshair_tick(int show)
 /* ======================================================================
  * The per-tick driver, called at the end of r3_pcport.cpp ui_tick */
 static int s_init = 0, s_disc_paused = 0, s_photo_ov = 0, s_photo_hide = 0;
+/* developer fast boot (port_fastboot.h): s_fb = PORT_FAST_BOOT or PORT_BOOT_LEVEL (prints when gameplay
+ * starts), s_fb_cut = PORT_FAST_BOOT_CUTSCENES (every story movie is skipped as if Space were held) */
+static int s_fb = 0, s_fb_cut = 0;
+static double proc_uptime_s(void)
+{
+    FILETIME c, e, k, u; GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
+    FILETIME nowft; GetSystemTimeAsFileTime(&nowft);
+    return ((double)((((ULONGLONG)nowft.dwHighDateTime) << 32 | nowft.dwLowDateTime) -
+                     (((ULONGLONG)c.dwHighDateTime) << 32 | c.dwLowDateTime))) / 1e7;
+}
+static volatile int s_fb_trace = 0;
+/* the menu screens seen (r3_fb_invoke), for the PORT_BOOT_LEVEL menu driver */
+static volatile int s_fb_seen_install = 0, s_fb_seen_title = 0, s_fb_seen_main = 0, s_fb_seen_campaign = 0;
+/* every Scaleform Invoke (r3_menurows.cpp, func_0032D788 entry): the menu screens the fast boot driver waits for */
+extern "C" void r3_fb_invoke(uint32_t menu, const char* name, int nargs)
+{
+    if (!s_fb_trace) return;
+    char n[64]; int i = 0;
+    for (; i < 63 && name[i] && (unsigned char)name[i] >= 0x20 && (unsigned char)name[i] < 0x7F; i++) n[i] = name[i];
+    n[i] = 0;
+    if (!strcmp(n, "InstallProgress")) s_fb_seen_install = 1;
+    else if (!strcmp(n, "AllowInput")) s_fb_seen_title = 1;            /* Press START (and the main menu) */
+    else if (strstr(n, "main_menu.ticker")) s_fb_seen_main = 1;
+    else if (!strcmp(n, "ToggleContinue")) s_fb_seen_campaign = 1;     /* Campaign: Continue / Load Level / ... */
+    if (s_fb_trace < 2) return;                                         /* PORT_FAST_BOOT_TRACE=1: log them */
+    static std::mutex mu; static std::set<std::string> seen; static int lines = 0;
+    std::lock_guard<std::mutex> g(mu);
+    if (lines < 500 && seen.insert(n).second) { lines++; fprintf(stderr, "[fastboot] invoke %08X %s (%d)\n", menu, n, nargs); }
+}
+/* PORT_BOOT_LEVEL: presses the pad through the front end (port_fastboot.h). Every step waits for its screen
+ * (Invoke names above) or, inside the Load Level pages that have none, for a fixed settle time. */
+static int s_fb_city = 0, s_fb_cp = 0, s_fb_step = 0;
+static ULONGLONG s_fb_next = 0;
+static void fb_press(uint32_t b, ULONGLONG now)
+{
+    g_pad_inj_sticks = 0x80808080u; g_pad_inj_clear = 0; g_pad_inj_btn = b; g_pad_inj_until = now + 150;
+}
+static void fb_drive_tick(ULONGLONG now)
+{
+    if (!s_fb_city || s_fb_step < 0 || now < s_fb_next) return;
+    enum { CROSS = 0x4000, START = 0x8, DOWN = 0x40, LEFT = 0x80, RIGHT = 0x20 };
+    static int sub = 0;
+    const int st = s_fb_step;
+    auto go = [&](int step, ULONGLONG wait) { s_fb_step = step; sub = 0; s_fb_next = now + wait; };
+    switch (st) {
+    case 0:     /* the install notice: Cross until Press START */
+        if (s_fb_seen_title) { LOG("fast boot: title screen at %.1f s", proc_uptime_s()); go(1, 300); break; }
+        if (s_fb_seen_install) fb_press(CROSS, now);
+        s_fb_next = now + 1500; break;
+    case 1:     /* Press START */
+        if (s_fb_seen_main) { go(2, 1000); break; }
+        fb_press(START, now); s_fb_next = now + 1500; break;
+    case 2:     /* main menu: Campaign is the first row */
+        if (s_fb_seen_campaign) { LOG("fast boot: campaign menu at %.1f s", proc_uptime_s()); go(3, 1500); break; }
+        fb_press(CROSS, now); s_fb_next = now + 2000; break;
+    case 3:     /* Continue -> Load Level (never Cross on Continue) */
+        fb_press(DOWN, now); go(4, 900); break;
+    case 4:
+        fb_press(CROSS, now); go(5, 2500); break;
+    case 5:     /* the map: Left to Haven, then Right to the location */
+        if (sub < 6) { fb_press(LEFT, now); sub++; s_fb_next = now + 500; break; }
+        if (sub < 6 + s_fb_city - 1) { fb_press(RIGHT, now); sub++; s_fb_next = now + 500; break; }
+        s_fb_step = 6; s_fb_next = now + 700; break;
+    case 6:
+        fb_press(CROSS, now); go(7, 2000); break;
+    case 7:     /* the checkpoint list */
+        if (sub < s_fb_cp - 1) { fb_press(DOWN, now); sub++; s_fb_next = now + 450; break; }
+        s_fb_step = 8; s_fb_next = now + 700; break;
+    case 8:
+        fb_press(CROSS, now); go(9, 2000); break;
+    case 9:     /* difficulty: Normal is preselected */
+        fb_press(CROSS, now);
+        LOG("fast boot: level picked at %.1f s (location %d, checkpoint %d)", proc_uptime_s(), s_fb_city, s_fb_cp);
+        s_fb_step = -1; break;
+    }
+}
 /* R3_PHOTO_HIDE_HUD: 1 = enabled, 2 = enabled and photo mode on (VKR2FrameGen.cpp r2fg_photo_source) */
 extern "C" { volatile int g_port_photo_hud = 0; }
 static void init_once(void)
@@ -1425,13 +1502,17 @@ static void init_once(void)
     if (s_bench) {
         bench_parse();
         s_bench_secs = std::max(5.0, atof(envs("BENCH_SECONDS", "60").c_str()));
-        FILETIME c, e, k, u; GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u);
-        FILETIME nowft; GetSystemTimeAsFileTime(&nowft);
-        const double since = ((double)((((ULONGLONG)nowft.dwHighDateTime) << 32 | nowft.dwLowDateTime) -
-                                       (((ULONGLONG)c.dwHighDateTime) << 32 | c.dwLowDateTime))) / 1e7;
-        s_bench_t0 = now_s() - since;            /* the script is timed from process start */
+        s_bench_t0 = now_s() - proc_uptime_s();  /* the script is timed from process start */
         LOG("benchmark mode: %zu steps, then %.0f s", s_bench_steps.size(), s_bench_secs);
     }
+    { const char* fb = getenv("PORT_FAST_BOOT"); const char* lv = getenv("PORT_BOOT_LEVEL");
+      const char* fc = getenv("PORT_FAST_BOOT_CUTSCENES");
+      s_fb = (fb && *fb && *fb != '0') || (lv && *lv);
+      s_fb_cut = fc && *fc && *fc != '0';
+      const char* tr = getenv("PORT_FAST_BOOT_TRACE");
+      if (port_fastboot_target(&s_fb_city, &s_fb_cp)) s_fb_trace = 1;
+      if (tr && *tr && *tr != '0') s_fb_trace = 2;
+      if (s_fb_cut) { s_cut_skip = 1; s_cut_skip_all = 1; LOG("fast boot: story movies are skipped (PORT_FAST_BOOT_CUTSCENES=1)"); } }
     LOG("extras: F9 / PC menu -> More PC Options; photo mode %s (F7); cutscene skip %s (unwatched movies %s); crosshair %d; pause on pad loss %s",
         s_photo_allowed ? "on" : "off", s_cut_skip ? "on" : "off", s_cut_skip_all ? "on" : "off", s_crosshair, s_disc_pause_on ? "on" : "off");
     if (skip_test_unseen())
@@ -1492,6 +1573,7 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
     init_once();
     const ULONGLONG now = GetTickCount64();
     bench_tick(hwnd);
+    if (!s_bench) fb_drive_tick(now);
     bench_key_tick(focused, other_prompt);
 
     /* F9: the extras menu directly; F10 -> More PC Options opens it from the PC menu */
@@ -1552,7 +1634,7 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
     else {
         static ULONGLONG told = 0;
         const WORD b = xi_raw(NULL);
-        const int held = (focused && ((GetAsyncKeyState(VK_SPACE) & 0x8000) || (GetAsyncKeyState(VK_RETURN) & 0x8000))) ||
+        const int held = s_fb_cut || (focused && ((GetAsyncKeyState(VK_SPACE) & 0x8000) || (GetAsyncKeyState(VK_RETURN) & 0x8000))) ||
                          (b & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_START));
         if (told != s_movie_t0 && now - s_movie_t0 > 500) { told = s_movie_t0; if (skip_hint_on()) r2pf_hint("Cutscene", "Hold Space / A to skip", 4000); }
         if (!held) held_since = 0;
@@ -1584,6 +1666,15 @@ extern "C" void r2x_ui_tick(void* hwnd_, int focused, int other_prompt)
     }
 
     const int on_foot = g_r2_look_ms && now - g_r2_look_ms < 250;
+    if (s_fb && on_foot) {
+        static int told = 0;
+        if (!told) {
+            told = 1;
+            std::string lv; { std::lock_guard<std::mutex> g(s_lvl_mu); lv = s_level; }
+            fprintf(stderr, "[fastboot] gameplay: level %s, %.1f s after start\n", lv.empty() ? "?" : lv.c_str(), proc_uptime_s());
+            fflush(stderr);
+        }
+    }
     crosshair_tick(s_crosshair && focused && on_foot && !s_open && !s_photo_on && !other_prompt);
 
     ov_follow();
