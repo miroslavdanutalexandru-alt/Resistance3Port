@@ -671,6 +671,88 @@ int32_t sys_net_bnet_recvfrom(int32_t s, void* buf, uint32_t len, int32_t flags,
     return n;
 }
 
+/* libnet's user-side msghdr / iovec (ILP32, big-endian): msg_name, namelen,
+ * msg_iov, iovlen, msg_control, controllen, msg_flags; iovec = {base, len}.
+ * libnet widens these to the lv2 layout (RPCS3 sys_net_msghdr) itself, and
+ * the port answers libnet's exports, so the guest hands over this one. */
+#define NET_MSG_MAX_IOV 64
+
+int32_t sys_net_bnet_sendmsg(int32_t s, const void* msg, int32_t flags)
+{
+    uint32_t m = EA(msg);
+    if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (!m) return fail(SYS_NET_EFAULT);
+    uint32_t name = vm_read32(m + 0), iov = vm_read32(m + 8);
+    int32_t iovlen = (int32_t)vm_read32(m + 12);
+    if (iovlen < 0 || iovlen > NET_MSG_MAX_IOV || (iovlen && !iov)) return fail(SYS_NET_EINVAL);
+    if (iovlen == 1)
+        return sys_net_bnet_sendto(s, (const void*)(uintptr_t)vm_read32(iov), vm_read32(iov + 4), flags,
+                                   (const sys_net_sockaddr*)(uintptr_t)name, vm_read32(m + 4));
+    size_t total = 0;
+    for (int32_t i = 0; i < iovlen; i++) total += vm_read32(iov + 8 * i + 4);
+    char* buf = (char*)malloc(total ? total : 1);
+    if (!buf) return fail(SYS_NET_ENOMEM);
+    size_t o = 0;
+    for (int32_t i = 0; i < iovlen; i++) {
+        uint32_t len = vm_read32(iov + 8 * i + 4);
+        if (len) memcpy(buf + o, GUEST_PTR(vm_read32(iov + 8 * i), const char*), len);
+        o += len;
+    }
+    int n;
+    struct sockaddr_in a;
+    if (would_block(s, flags, POLLOUT)) { free(buf); return fail(SYS_NET_EWOULDBLOCK); }
+    if (name) {
+        if (read_sockaddr(name, &a)) { free(buf); return fail(SYS_NET_EINVAL); }
+        n = sendto(s_sockets[s].host_fd, buf, (int)total, PS3_NET_HOST_SEND_FLAGS, (struct sockaddr*)&a, sizeof(a));
+    } else {
+        n = send(s_sockets[s].host_fd, buf, (int)total, PS3_NET_HOST_SEND_FLAGS);
+    }
+    free(buf);
+    if (net_trace()) trace("sendmsg", s, n, name ? &a : NULL);
+    return n == HOST_SOCKET_ERROR ? host_fail() : n;
+}
+
+int32_t sys_net_bnet_recvmsg(int32_t s, void* msg, int32_t flags)
+{
+    uint32_t m = EA(msg);
+    if (!valid_socket(s)) return fail(SYS_NET_EBADF);
+    if (!m) return fail(SYS_NET_EFAULT);
+    uint32_t name = vm_read32(m + 0), iov = vm_read32(m + 8);
+    int32_t iovlen = (int32_t)vm_read32(m + 12);
+    if (iovlen < 0 || iovlen > NET_MSG_MAX_IOV || (iovlen && !iov)) return fail(SYS_NET_EINVAL);
+    int n;
+    if (iovlen == 1) {
+        /* recvfrom writes the 16-byte name and the length; namelen is in place. */
+        n = sys_net_bnet_recvfrom(s, (void*)(uintptr_t)vm_read32(iov), vm_read32(iov + 4), flags,
+                                  (sys_net_sockaddr*)(uintptr_t)name,
+                                  name ? (uint32_t*)(uintptr_t)(m + 4) : NULL);
+    } else {
+        size_t total = 0;
+        for (int32_t i = 0; i < iovlen; i++) total += vm_read32(iov + 8 * i + 4);
+        char* buf = (char*)malloc(total ? total : 1);
+        if (!buf) return fail(SYS_NET_ENOMEM);
+        struct sockaddr_in a;
+        socklen_t alen = sizeof(a);
+        memset(&a, 0, sizeof(a));
+        if (would_block(s, flags, POLLIN)) { free(buf); return fail(SYS_NET_EWOULDBLOCK); }
+        n = recvfrom(s_sockets[s].host_fd, buf, (int)total, host_recv_flags(flags), (struct sockaddr*)&a, &alen);
+        if (n == HOST_SOCKET_ERROR) { free(buf); return host_fail(); }
+        size_t o = 0;
+        for (int32_t i = 0; i < iovlen && o < (size_t)n; i++) {
+            uint32_t len = vm_read32(iov + 8 * i + 4);
+            if (len > (size_t)n - o) len = (uint32_t)((size_t)n - o);
+            if (len) memcpy(GUEST_PTR(vm_read32(iov + 8 * i), char*), buf + o, len);
+            o += len;
+        }
+        free(buf);
+        if (net_trace()) trace("recvmsg", s, n, &a);
+        if (name) write_sockaddr(name, m + 4, &a);
+    }
+    if (n >= 0) vm_write32(m + 20, 0);   /* no ancillary data */
+    if (n >= 0) vm_write32(m + 24, 0);   /* msg_flags */
+    return n;
+}
+
 /* ---------------------------------------------------------------------------
  * Socket options
  * -----------------------------------------------------------------------*/
@@ -986,14 +1068,56 @@ uint32_t sys_net_bnet_inet_ntoa(uint32_t addr)
 /* PORT_ONLINE (port_online.c): online.ini host.* / dns= redirection. */
 int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out) = NULL;
 
+uint32_t sys_net_bnet_inet_ntop(int32_t family, const void* src, char* dst, uint32_t size)
+{
+    char text[16];
+    if (family != SYS_NET_AF_INET) { (void)fail(SYS_NET_EAFNOSUPPORT); return 0; }
+    if (!EA(src) || !EA(dst)) { (void)fail(SYS_NET_EFAULT); return 0; }
+    const uint8_t* b = GUEST_PTR(EA(src), const uint8_t*);   /* network order */
+    int n = snprintf(text, sizeof(text), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    if ((uint32_t)n + 1 > size) { (void)fail(28 /* ENOSPC */); return 0; }
+    memcpy(GUEST_PTR(EA(dst), char*), text, (size_t)n + 1);
+    return EA(dst);
+}
+
+static uint32_t fill_hostent(const char* name, const struct in_addr* addr)
+{
+    uint32_t h = scratch(&s_hostent_ea, HOSTENT_SCRATCH);
+    if (!h) return 0;
+    memset(vm_ptr8(h), 0, HOSTENT_SCRATCH);
+    vm_write32(h + 0,  h + 64);           /* h_name */
+    vm_write32(h + 4,  h + 32);           /* h_aliases -> { NULL } */
+    vm_write32(h + 8,  SYS_NET_AF_INET);  /* h_addrtype */
+    vm_write32(h + 12, 4);                /* h_length */
+    vm_write32(h + 16, h + 40);           /* h_addr_list -> { &addr, NULL } */
+    vm_write32(h + 40, h + 48);
+    memcpy(vm_ptr8(h + 48), addr, 4);
+    strncpy((char*)vm_ptr8(h + 64), name, HOSTENT_SCRATCH - 65);
+    return h;
+}
+
+/* Reverse lookups answer with the dotted address as the name: no PTR query
+ * goes out (LAN peers rarely have one, and a timeout would stall the title). */
+uint32_t sys_net_bnet_gethostbyaddr(const void* addr, uint32_t len, int32_t type)
+{
+    struct in_addr a;
+    char name[16];
+    if (!EA(addr) || len < 4 || type != SYS_NET_AF_INET) {
+        if (scratch(&s_h_errno_ea, 4)) vm_write32(s_h_errno_ea, SYS_NET_HOST_NOT_FOUND);
+        return 0;
+    }
+    memcpy(&a, GUEST_PTR(EA(addr), const void*), 4);
+    return fill_hostent(ip_str(&a, name), &a);
+}
+
 uint32_t sys_net_bnet_gethostbyname(const char* name)
 {
     const char* host = GUEST_PTR(EA(name), const char*);
-    uint32_t h = scratch(&s_hostent_ea, HOSTENT_SCRATCH);
+    uint32_t h;
     struct addrinfo hints, *res = NULL;
     struct sockaddr_in redirected;
     const struct sockaddr_in* sa;
-    if (!host || !h) return 0;
+    if (!host || !scratch(&s_hostent_ea, HOSTENT_SCRATCH)) return 0;
 
     memset(&redirected, 0, sizeof(redirected));
     if (g_net_resolve_hook && g_net_resolve_hook(host, (uint32_t*)&redirected.sin_addr)) {
@@ -1009,15 +1133,7 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
         sa = (const struct sockaddr_in*)res->ai_addr;
     }
 
-    memset(vm_ptr8(h), 0, HOSTENT_SCRATCH);
-    vm_write32(h + 0,  h + 64);           /* h_name */
-    vm_write32(h + 4,  h + 32);           /* h_aliases -> { NULL } */
-    vm_write32(h + 8,  SYS_NET_AF_INET);  /* h_addrtype */
-    vm_write32(h + 12, 4);                /* h_length */
-    vm_write32(h + 16, h + 40);           /* h_addr_list -> { &addr, NULL } */
-    vm_write32(h + 40, h + 48);
-    memcpy(vm_ptr8(h + 48), &sa->sin_addr, 4);
-    strncpy((char*)vm_ptr8(h + 64), host, HOSTENT_SCRATCH - 65);
+    h = fill_hostent(host, &sa->sin_addr);
 
     char ip[16];
     printf("[sys_net] gethostbyname('%s') -> %s\n", host, ip_str(&sa->sin_addr, ip));
@@ -1063,6 +1179,10 @@ static void h_inet_aton(ppu_context* ctx)   { RET_S(sys_net_bnet_inet_aton(PTR(3
 static void h_inet_addr(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_addr(PTR(3))); }
 static void h_inet_ntoa(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntoa(R32(3))); }
 static void h_gethostbyname(ppu_context* ctx) { RET_U(sys_net_bnet_gethostbyname(PTR(3))); }
+static void h_gethostbyaddr(ppu_context* ctx) { RET_U(sys_net_bnet_gethostbyaddr(PTR(3), R32(4), S32(5))); }
+static void h_inet_ntop(ppu_context* ctx)   { RET_U(sys_net_bnet_inet_ntop(S32(3), PTR(4), PTR(5), R32(6))); }
+static void h_sendmsg(ppu_context* ctx)     { RET_S(sys_net_bnet_sendmsg(S32(3), PTR(4), S32(5))); }
+static void h_recvmsg(ppu_context* ctx)     { RET_S(sys_net_bnet_recvmsg(S32(3), PTR(4), S32(5))); }
 static void h_errno_loc(ppu_context* ctx)   { RET_U(sys_net_errno_loc()); }
 static void h_h_errno_loc(ppu_context* ctx) { RET_U(scratch(&s_h_errno_ea, 4)); }
 static void h_init(ppu_context* ctx)        { RET_S(sys_net_initialize_network_ex(PTR(3))); }
@@ -1084,6 +1204,9 @@ void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int size, unsign
         { "inet_addr", h_inet_addr },     { "inet_ntoa", h_inet_ntoa },
         { "inet_pton", h_inet_pton },
         { "gethostbyname", h_gethostbyname },
+        { "gethostbyaddr", h_gethostbyaddr },
+        { "inet_ntop", h_inet_ntop },
+        { "sendmsg", h_sendmsg },         { "recvmsg", h_recvmsg },
         { "_sys_net_errno_loc", h_errno_loc },
         { "_sys_net_h_errno_loc", h_h_errno_loc },
         { "sys_net_initialize_network_ex", h_init },

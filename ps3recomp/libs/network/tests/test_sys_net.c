@@ -222,6 +222,65 @@ int main(void)
     assert(h && vm_read32(vm_read32(vm_read32(h + 16))) == 0xC0000207u);   /* 192.0.2.7 */
     g_net_resolve_hook = NULL;
 
+    /* inet_ntop / gethostbyaddr: network-order bytes in, dotted text out. */
+    {
+        const uint8_t ip[4] = { 10, 0, 0, 42 };
+        memcpy(vm_base + ADDR_B, ip, 4);
+        memset(vm_base + STR, 0xA5, 32);
+        assert((uint32_t)C5("inet_ntop", SYS_NET_AF_INET, ADDR_B, STR, 16, 0) == STR);
+        assert(!strcmp((const char*)vm_base + STR, "10.0.0.42"));
+        assert(C5("inet_ntop", SYS_NET_AF_INET, ADDR_B, STR, 9, 0) == 0 && errno_cell() == 28);
+        assert(C5("inet_ntop", 99, ADDR_B, STR, 16, 0) == 0 && errno_cell() == 47);
+        h = (uint32_t)call("gethostbyaddr", ADDR_B, 4, SYS_NET_AF_INET, 0, 0, 0);
+        assert(h && !strcmp((const char*)vm_base + vm_read32(h), "10.0.0.42"));
+        assert(vm_read32(vm_read32(vm_read32(h + 16))) == 0x0A00002Au);
+        assert(call("gethostbyaddr", ADDR_B, 4, 99, 0, 0, 0) == 0);
+    }
+
+    /* sendmsg / recvmsg with libnet's ILP32 msghdr {name, namelen, iov,
+     * iovlen, control, controllen, flags} and iovec {base, len}: two iovecs
+     * gathered into one datagram, scattered back over three. */
+    {
+        enum { MSG = 0x6000, IOV = 0x6100, D1 = 0x6200, D2 = 0x6300, D3 = 0x6400 };
+        int32_t u1 = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        int32_t u2 = C3("socket", SYS_NET_AF_INET, SYS_NET_SOCK_DGRAM, 0);
+        put_sockaddr(ADDR_A, LOOP, 0);
+        assert(C3("bind", u1, ADDR_A, 16) == 0);
+        vm_write32(LEN, 16);
+        assert(C3("getsockname", u1, ADDR_A, LEN) == 0);
+        memcpy(vm_base + D1, "abc", 3);
+        memcpy(vm_base + D2, "defgh", 5);
+        vm_write32(IOV + 0, D1); vm_write32(IOV + 4, 3);
+        vm_write32(IOV + 8, D2); vm_write32(IOV + 12, 5);
+        memset(vm_base + MSG, 0, 28);
+        vm_write32(MSG + 0, ADDR_A); vm_write32(MSG + 4, 16);
+        vm_write32(MSG + 8, IOV);    vm_write32(MSG + 12, 2);
+        assert(C3("sendmsg", u2, MSG, 0) == 8);
+        memset(vm_base + D1, 0, 0x300);
+        vm_write32(IOV + 0, D1); vm_write32(IOV + 4, 2);
+        vm_write32(IOV + 8, D2); vm_write32(IOV + 12, 4);
+        vm_write32(IOV + 16, D3); vm_write32(IOV + 20, 16);
+        memset(vm_base + MSG, 0, 28);
+        vm_write32(MSG + 0, ADDR_B); vm_write32(MSG + 4, 16);
+        vm_write32(MSG + 8, IOV);    vm_write32(MSG + 12, 3);
+        vm_write32(MSG + 24, 0xFFFFFFFFu);
+        assert(C3("recvmsg", u1, MSG, 0) == 8);
+        assert(!memcmp(vm_base + D1, "ab", 2) && !memcmp(vm_base + D2, "cdef", 4) && !memcmp(vm_base + D3, "gh", 2));
+        assert(vm_read32(ADDR_B + 4) == LOOP && vm_read32(MSG + 4) == 16 && vm_read32(MSG + 24) == 0);
+        /* One iovec takes the sendto / recvfrom path. */
+        memcpy(vm_base + D1, "one", 3);
+        vm_write32(IOV + 0, D1); vm_write32(IOV + 4, 3);
+        vm_write32(MSG + 0, ADDR_A); vm_write32(MSG + 12, 1);
+        assert(C3("sendmsg", u2, MSG, 0) == 3);
+        memset(vm_base + D1, 0, 8);
+        vm_write32(IOV + 4, 8);
+        vm_write32(MSG + 0, 0);
+        assert(C3("recvmsg", u1, MSG, 0) == 3 && !memcmp(vm_base + D1, "one", 3));
+        vm_write32(MSG + 12, 1000);
+        assert(C3("sendmsg", u2, MSG, 0) == (int32_t)0x80010216u);   /* EINVAL */
+        assert(C1("socketclose", u1) == 0 && C1("socketclose", u2) == 0);
+    }
+
     /* P2P: the title binds its own IP and port 3658 with vport 1000; the host
      * socket lands on this instance's P2P port on every interface, so a peer
      * on loopback reaches it, and received addresses carry the vport back. */

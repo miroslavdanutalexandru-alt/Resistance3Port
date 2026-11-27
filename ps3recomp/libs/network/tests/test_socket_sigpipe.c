@@ -6,6 +6,7 @@
 #elif defined(TEST_HTTP)
 #include "../cellHttp.c"
 uint8_t* vm_base;
+int (*g_net_resolve_hook)(const char*, uint32_t*);   /* sysNet.c's, unused here */
 #elif defined(TEST_PSNR)
 #include "../psnr/psnr.c"
 #else

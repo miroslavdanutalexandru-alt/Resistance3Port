@@ -19,6 +19,7 @@ int main(void) { puts("SKIP: POSIX sockets only"); return 0; }
 #include <arpa/inet.h>
 
 uint8_t* vm_base;
+int (*g_net_resolve_hook)(const char*, uint32_t*);   /* sysNet.c's, unused here */
 uint32_t ppu_vm_size;
 int g_resv_store_active;
 uint32_t g_ww_lo, g_ww_hi;

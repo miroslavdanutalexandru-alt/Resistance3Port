@@ -41,6 +41,9 @@ typedef int http_socket_t;
 extern uint8_t* vm_base;
 #define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
 
+/* sysNet.c: PORT_ONLINE's online.ini host.* / dns= resolver, NULL when off. */
+extern int (*g_net_resolve_hook)(const char* name, uint32_t* ip_out);
+
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
@@ -497,7 +500,17 @@ s32 cellHttpSendRequest(CellHttpTransId transId, const void* buf, u32 size,
     hints.ai_protocol = IPPROTO_TCP;
 
     struct addrinfo* result = NULL;
-    int gai = getaddrinfo(t->hostname, port_str, &hints, &result);
+    /* PORT_ONLINE: online.ini host.* / dns= answers win, as in gethostbyname. */
+    const char* connect_host = t->hostname;
+    char redirected[16];
+    uint32_t rip;
+    if (g_net_resolve_hook && g_net_resolve_hook(t->hostname, &rip)) {
+        const uint8_t* b = (const uint8_t*)&rip;
+        snprintf(redirected, sizeof(redirected), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        connect_host = redirected;
+        printf("[cellHttp]   %s redirected to %s\n", t->hostname, redirected);
+    }
+    int gai = getaddrinfo(connect_host, port_str, &hints, &result);
     if (gai != 0 || !result) {
         printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
         if (result) freeaddrinfo(result);
