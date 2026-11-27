@@ -24,7 +24,7 @@ static const CatGroup g_cat[] = {
     { P_CONTROLS, "GYRO",                          "gyro gyrosens gyroinvy gyrospace gyrocal" },
     { P_CONTROLS, "LOCAL CO-OP",                   "coop p2pad p2kb" },
     { P_CONTROLS, "CONTROLLER BUTTONS",            "padmap_*" },
-    { P_AUDIO,    "SOUND",                         "volume audio_mono speakers audio_buffer" },
+    { P_AUDIO,    "SOUND",                         "volume audio_mono speakers audio_channels audio_buffer" },
     { P_AUDIO,    "IN THE BACKGROUND",             "background padbg" },
     { P_UI,       "NOTIFICATIONS",                 "trophytoast trophystyle" },
     { P_UI,       "MOVIES",                        "cutscene_skip cutscene_skip_all skiphint" },
