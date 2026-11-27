@@ -25,12 +25,14 @@ static inline int ps3_diag_enabled(void)
 static __inline int ps3_diag_enabled(void)
 #endif
 {
-    /* Resistance port: R2_DIAG=1 turns on the debug diagnostics (periodic
-     * audio/SPURS stats, logs\*.txt side files, per-wait tracing). Off by
-     * default so release runs stay quiet. */
+    /* Resistance port: PORT_DIAG=1 (or the older R2_DIAG=1) turns on the debug
+     * diagnostics (periodic stats lines, per-event traces, logs\*.txt side files,
+     * per-wait tracing). Off by default so release runs stay quiet and the
+     * statistics' timers and string formatting are skipped. */
     static int d = -1;
     if (d < 0) {
-        const char* e = getenv("R2_DIAG");
+        const char* e = getenv("PORT_DIAG");
+        if (!(e && e[0])) e = getenv("R2_DIAG");
         d = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
     return d;

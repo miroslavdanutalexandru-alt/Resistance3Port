@@ -1183,8 +1183,9 @@ extern "C" int r2rsx_context_allocate(uint32_t dma_control_ea, uint32_t label_ea
 	ec.clear();
 	s_log = logs::make_file_listener(root + "\\logs\\rpcs3_rsx.log", 256ull << 20);
 	{
-		// RSX log verbosity: errors only unless R2_DIAG=1 (RPCS3's notice level) or R2_RSX_LOG=<level>.
-		const char* d = std::getenv("R2_DIAG");
+		// RSX log verbosity: errors only unless PORT_DIAG=1 / R2_DIAG=1 (RPCS3's notice level) or R2_RSX_LOG=<level>.
+		const char* d = std::getenv("PORT_DIAG");
+		if (!(d && *d)) d = std::getenv("R2_DIAG");
 		logs::level lv = d && *d && *d != '0' ? logs::level::notice : logs::level::error;
 		if (const char* e = std::getenv("R2_RSX_LOG"); e && *e)
 		{

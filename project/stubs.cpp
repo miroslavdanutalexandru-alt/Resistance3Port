@@ -46,11 +46,11 @@
 #endif
 #include <string>
 
-/* Debug side files in logs\ (cameras, sndsetup, gore, ...) are written only with R2_DIAG=1. */
+/* Debug side files in logs\ (cameras, sndsetup, gore, ...) are written only with PORT_DIAG=1 (or R2_DIAG=1). */
 static int r2_diag(void)
 {
     static int d = -1;
-    if (d < 0) { const char* e = getenv("R2_DIAG"); d = (e && e[0] && e[0] != '0') ? 1 : 0; }
+    if (d < 0) { const char* e = getenv("PORT_DIAG"); if (!(e && e[0])) e = getenv("R2_DIAG"); d = (e && e[0] && e[0] != '0') ? 1 : 0; }
     return d;
 }
 

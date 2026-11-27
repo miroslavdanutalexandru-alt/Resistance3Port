@@ -107,6 +107,7 @@ static __inline void port_hitch_add_ticks(int cat, int64_t d)
 /* Time since port_hitch_t0() into a category. */
 static __inline void port_hitch_end(int cat, uint64_t t0)
 {
+    if (g_port_hitch.off) return;   /* PORT_HITCH_LOG unset: no second rdtsc */
     port_hitch_add_ticks(cat, (int64_t)(__rdtsc() - t0));
 }
 
@@ -159,6 +160,7 @@ static __inline int port_hitch_on_main(void)
  * loop's share read as "game" (PPU) time in the [hitch] line. */
 static __inline void port_hitch_end_ppu_rsx(int cat, uint64_t t0)
 {
+    if (g_port_hitch.off) return;
     const int64_t d = (int64_t)(__rdtsc() - t0);
     port_hitch_add_ticks(cat, d);
     if (port_hitch_on_main()) port_hitch_add_ticks(PH_MAINRSX, d);

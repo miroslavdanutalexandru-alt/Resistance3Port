@@ -82,6 +82,7 @@ extern "C" void     vm_write32(uint64_t a, uint32_t v);
 extern "C" void     vm_write64(uint64_t a, uint64_t v);
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/log_first.h"
+#include "../ps3_log.h"   /* ps3_diag_enabled (PORT_DIAG) */
 /* Perf pass 9: the PS3_FSLOG* / FS_* diagnostic switches were a getenv() (UCRT environment lock + a
  * linear scan) several times per cellFsRead/Stat/Fstat while the game streams. Each call site now
  * reads its switch once (thread-safe function-local static, a copy so a later putenv cannot dangle);
@@ -100,11 +101,12 @@ static const char* fs_env_dup(const char* n)
 /* Successful opens: the first FS_OPEN_LOG_FIRST are logged, then one summary line
  * at most every 60 s (the game reopens its sound banks hundreds of times, which
  * made these lines ~40% of run.log). PS3_FSLOG=1 or FS_CALLER=1 log every open;
- * failed opens are always logged. */
+ * failed opens are always logged. Successful opens are listed only with PORT_DIAG=1. */
 #define FS_OPEN_LOG_FIRST 200
 static bool fs_open_log_ok(void)
 {
     if (FS_DBG_ENV("PS3_FSLOG")) return true;
+    if (!ps3_diag_enabled()) return false;
     static std::atomic<unsigned> s_n{0};
     static std::atomic<unsigned> s_quiet{0};
     static std::atomic<long long> s_next_ms{0};
@@ -638,8 +640,8 @@ static void cellFsRead(ppu_context* ctx)
      * opened and never read" unfalsifiable: reads on a later-opened fd fall off
      * the end of the log and look identical to reads that never happen.
      * FS_READ_ALL=1 logs every read; otherwise a per-fd first-read line plus a
-     * periodic summary is enough to tell the two apart. */
-    { static uint64_t tot=0; static int _n=0;
+     * periodic summary is enough to tell the two apart. PORT_DIAG=1 or FS_READ_ALL=1 only. */
+    if (ps3_diag_enabled() || FS_DBG_ENV("FS_READ_ALL")) { static uint64_t tot=0; static int _n=0;
       static uint64_t per_fd[64]; static uint32_t cnt_fd[64];
       tot+=n;
       if (fd>=0 && fd<64) { per_fd[fd]+=n; cnt_fd[fd]++; }
