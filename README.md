@@ -852,6 +852,10 @@ What's planned after this beta, and how it relates to the issues above: [docs/RO
 - `tools/art/make_r3_art.py` draws the launcher's and the game's icons and the launcher artwork (Python + Pillow).
 - `tools/r3_regen.py` runs the lifters on your decrypted `EBOOT.elf`, then re-applies this port's own edits to the generated code (`tools/hooks/`).
 
+### Developer fast boot (automated test runs)
+
+Opt-in environment variables, all off by default: `PORT_FAST_BOOT=1` skips the start-up logo and intro movies; `PORT_BOOT_LEVEL=<level>` starts a level without touching the pad: the retail game ignores its own `-level` option, so the port presses through the install notice, Press START, Campaign > Load Level, the map location, the checkpoint and Normal by itself (`haven_town_ridge`, or `<location>[:<checkpoint>]` with location 1-5 or `haven`, `stlouis`, `mtpleasant`, `graterford`, `newyork`; set `R3_UNLOCK_ALL=1` so every location is open); `PORT_FAST_BOOT_CUTSCENES=1` also skips cutscenes (off by default, because some tests need them); `PORT_FAST_BOOT_TRACE=1` logs the menu screens. The log prints `[fastboot] gameplay: ...` when the player gets control. `tools\fastboot.ps1 -Level <level> [-Exe <path>] [-Seconds N] [-Cutscenes]` starts a build with these and your `settings.bat`, copies the saves and puts them back when the game exits (Load Level writes the save), prints the game's PID, and with `-Seconds` waits for gameplay and prints the boot time; `-List` prints the locations and level names.
+
 ## GPU offload switches
 
 Graphics work runs on the GPU and game logic runs on the CPU. At startup the game prints one `[gpu-offload] <name> ON` line for each GPU path that is active.

@@ -546,8 +546,13 @@ uint16_t rd16(uint32_t a) { return (uint16_t)((vm_base[a] << 8) | vm_base[a + 1]
 
 /* func_0032D788 (GFx Invoke) entry: r3 menu, r4 method name, r5 GFxValue args, r6 count, lr the caller.
  * Returns the menu when r3_menu_rows_after must run after the call. */
+extern "C" void r3_fb_invoke(uint32_t menu, const char* name, int nargs);   /* r3_pcextra.cpp: fast boot menu driver */
 extern "C" uint32_t r3_menu_rows_append(ppu_context* ctx)
 {
+    if (vm_base && !t_nest) {
+        const uint32_t nm = (uint32_t)ctx->gpr[4];
+        if (nm && nm < 0xF0000000u) r3_fb_invoke((uint32_t)ctx->gpr[3], (const char*)(vm_base + nm), (int)ctx->gpr[6]);
+    }
     if (!vm_base || t_nest || (uint32_t)ctx->lr != kRetRefresh || (uint32_t)ctx->gpr[6] != 1 || !enabled()) return 0;
     const uint32_t menu = (uint32_t)ctx->gpr[3], name = (uint32_t)ctx->gpr[4], outer = (uint32_t)ctx->gpr[5];
     if (!name || !outer || name >= 0xF0000000u || outer >= 0xF0000000u) return 0;
