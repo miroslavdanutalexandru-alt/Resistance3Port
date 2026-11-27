@@ -12,7 +12,7 @@
  *   R2_CRASH_DUMPS=full (or CRASH_DUMP_FULL=1)      full-memory dumps (several GB)
  *   PORT_HANG_DUMP=1   strict watchdog: 20 s (PORT_HANG_S) without a game frame,
  *                      or without an RSX flip while frames run (not when paused)
- *   PORT_HANG_DUMP=0   no watchdog; unset: game frames only, R2_HANG_S (90) s
+ *   PORT_HANG_DUMP=0   no watchdog; unset: game frames only, R2_HANG_S (60) s
  * Included after vm_commit_veh: the guest arena (vm_base) is known. */
 #ifdef _WIN32
 #include "port_crash.h"

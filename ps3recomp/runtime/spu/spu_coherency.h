@@ -110,6 +110,14 @@ void spu_coh_notify_range(uint32_t ea, uint32_t size);
 extern volatile long long g_spu_coh_range_wakes;
 extern volatile long long g_spu_coh_range_deferred; /* ranges queued because the lock was taken */
 
+/* R3_JOBWATCH (spu_jobwatch.c, off by default): trace R3 job 403's object
+ * state from the writers' side. g_spu_jw_on stays 0 unless the variable is
+ * set, so every hook below is one predictable branch when off. */
+extern volatile int g_spu_jw_on;
+int  spu_jw_cmd(spu_context* ctx, uint32_t cmd, int post);    /* MFC_Cmd, pre (0) / post (1) */
+void spu_jw_note_write(uint32_t ea, const void* self_spu);    /* under the lock-line lock */
+void spu_jw_badcall(spu_context* ctx, uint32_t target, uint32_t lr);
+
 /* Count of LR events delivered. A parked SPURS service that never wakes with
  * this at zero is a coherence miss; nonzero moves the question downstream. */
 extern unsigned long g_spu_lr_raise;

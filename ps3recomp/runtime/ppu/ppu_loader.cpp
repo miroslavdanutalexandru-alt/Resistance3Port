@@ -956,6 +956,14 @@ extern "C" void ppu_resv_break_line(uint32_t ea)
     }
 }
 static inline volatile LONG* resv_slot(uint64_t ea) { return &g_resv_locks[((uint32_t)ea >> 4) & (PPU_RESV_LOCKS - 1)]; }
+/* R3_JOBWATCH (spu_jobwatch.c): the PPU thread behind a coherent store. */
+extern "C" int ppu_jw_who(uint32_t* lr, uint32_t* tid)
+{
+    ppu_context* c = g_active_ctx;
+    if (!c) return 0;
+    *lr = (uint32_t)c->lr; *tid = (uint32_t)c->thread_id;
+    return 1;
+}
 static inline void resv_lock(volatile LONG* L)   { while (_InterlockedExchange(L, 1)) { while (*L) YieldProcessor(); } }
 static inline void resv_unlock(volatile LONG* L) { _InterlockedExchange(L, 0); }
 static inline void ppu_resv_break(uint64_t addr)   /* MUST hold g_resv_lock */

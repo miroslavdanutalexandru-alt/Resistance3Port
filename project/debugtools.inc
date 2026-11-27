@@ -1690,6 +1690,7 @@ static DWORD WINAPI debug_console(LPVOID param)
  * program with the same command line, environment and console, and end this
  * one -- so a freeze costs a restart, not a person at the keyboard. */
 extern "C" volatile int g_r2pc_paused;   /* r3_pcport.cpp: paused on purpose (not a freeze) */
+extern "C" volatile LONG r2_game_frames; /* r3_crash.inc: game-loop counter */
 static DWORD WINAPI freeze_relauncher(LPVOID)
 {
     const char* e = getenv("FREEZE_RELAUNCH");
@@ -1700,11 +1701,17 @@ static DWORD WINAPI freeze_relauncher(LPVOID)
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        (LPCSTR)&freeze_relauncher, &self);
-    unsigned last = 0, still = 0;
+    unsigned last = 0, still = 0; LONG lastg = 0;
     for (;;) {
         Sleep(1000);
         const unsigned f = cellGcm_flip_request_count();
-        if (f != last || f < 200 || g_r2pc_paused) { last = f; still = 0; continue; }
+        /* Progress is the GAME LOOP (r2_game_frames, fed by the frame limiter
+         * even while it is parked for a pause), not flips: a hung loop can
+         * leave flips running. A pause holds the count rather than restarting
+         * it -- alt-tabbing out of a frozen game reset it on every focus change. */
+        const LONG g = r2_game_frames;
+        if (g != lastg || f < 200) { lastg = g; last = f; still = 0; continue; }
+        if (g_r2pc_paused) continue;
         if (++still < secs) continue;
         static int n = 0;
         { char fn[64]; snprintf(fn, sizeof fn, "logs\\freeze_%lu_%d.txt", (unsigned long)GetTickCount(), n++);

@@ -184,11 +184,15 @@ static int child(const char* mode)
         WaitForMultipleObjects(4, h, TRUE, INFINITE);
         return 0;
     }
-    if (!strcmp(mode, "hang") || !strcmp(mode, "rsxhang") || !strcmp(mode, "paused") || !strcmp(mode, "nohang")) {
+    if (!strcmp(mode, "hang") || !strcmp(mode, "rsxhang") || !strcmp(mode, "paused") || !strcmp(mode, "nohang") ||
+        !strcmp(mode, "pausehang")) {
         const int m = !strcmp(mode, "rsxhang") ? 1 : !strcmp(mode, "nohang") ? 2 : 0;
         CloseHandle((HANDLE)_beginthreadex(NULL, 0, ticker, (void*)(intptr_t)m, 0, NULL));
         if (!strcmp(mode, "paused")) { Sleep(1500); g_paused = 1; }
-        Sleep(11000);
+        /* a hung loop whose window loses focus for 5 s (alt-tab) and gets it back:
+         * 2 s stalled before + 4 s after the pause must add up to the 5 s limit */
+        if (!strcmp(mode, "pausehang")) { Sleep(4000); g_paused = 1; Sleep(5000); g_paused = 0; Sleep(4000); }
+        else Sleep(11000);
         printf("hang child done\n"); fflush(stdout);
         return 0;
     }
@@ -651,12 +655,16 @@ int main(int argc, char** argv)
         check(rh.dumps.size() == 1 && has(rh.txt, "no renderer flip for 5 s"), "rsxhang: renderer stall detected while the loop runs");
         Run pz = run_child(work, "paused", "PORT_HANG_DUMP=1\0PORT_HANG_S=5\0");
         check(pz.dumps.empty() && pz.code == 0, "paused: no hang report while paused");
+        Run ph = run_child(work, "pausehang", "PORT_HANG_DUMP=1\0PORT_HANG_S=5\0");
+        check(ph.dumps.size() == 1 && has(ph.txt, "no game-loop progress for 5 s"),
+              "pausehang: a pause holds the stall count instead of restarting it",
+              port_report::fmt("%zu dumps", ph.dumps.size()));
         Run nh = run_child(work, "nohang", "PORT_HANG_DUMP=1\0PORT_HANG_S=5\0");
         check(nh.dumps.empty() && has(nh.log, "hang watchdog strict"), "nohang: no report while both progress");
         Run off = run_child(work, "hang", "PORT_HANG_DUMP=0\0", "hang_off");
         check(off.dumps.empty() && has(off.log, "hang watchdog off"), "PORT_HANG_DUMP=0: watchdog off");
         Run def = run_child(work, "hang", NULL, "hang_default");
-        check(def.dumps.empty() && has(def.log, "hang limit 90 s"), "unset: the old 90 s watchdog (no dump within 11 s)");
+        check(def.dumps.empty() && has(def.log, "hang limit 60 s"), "unset: the default 60 s watchdog (no dump within 11 s)");
     }
     Run dis = run_child(work, "av", "TESTPFX_CRASH_DUMPS=0\0", "av_disabled");
     check(dis.dumps.empty() && dis.txts.empty() && dis.code == EXCEPTION_ACCESS_VIOLATION, "<prefix>_CRASH_DUMPS=0: reporter off, crash unchanged");
