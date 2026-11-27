@@ -11995,7 +11995,7 @@ index 439cd37..f33ec7d 100644
  	decompiler.device_props.has_low_precision_rounding = vk::is_NVIDIA(vk::get_driver_vendor());
  	decompiler.Task();
 diff --git a/rpcs3/Emu/RSX/VK/VKGSRender.cpp b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
-index b101a27..58312f5 100644
+index b101a27..3defed8 100644
 --- a/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKGSRender.cpp
 @@ -21,10 +21,26 @@
@@ -12523,7 +12523,7 @@ index b101a27..58312f5 100644
  	// Now we properly initialize the pipe compiler as per the user's configuration
  	if (!g_cfg.video.shader_compiler_threads_count)
  	{
-@@ -1305,14 +1607,295 @@ void VKGSRender::on_init()
+@@ -1305,14 +1607,339 @@ void VKGSRender::on_init()
  
  	// If we survived init - loading shaders, etc, then we can re-enable protection.
  	vk::arm_device_loss_protection();
@@ -12566,6 +12566,7 @@ index b101a27..58312f5 100644
 +		u32 last_pct[2]{ ~0u, ~0u };
 +		std::chrono::steady_clock::time_point t0[2]{};
 +		std::chrono::steady_clock::time_point last_status{};
++		std::chrono::steady_clock::time_point last_log{};
 +		bool skip_logged = false;
 +		u32 link_limit_calls = 0; // R2PORT (issue #23): set_limit(1) calls (before and after the entries are loaded)
 +		bool background = false; // R2PORT: skipped pipelines go to the background threads (R2_PRELOAD_ASYNC)
@@ -12578,13 +12579,44 @@ index b101a27..58312f5 100644
 +
 +		explicit r2_preload_log_dialog(rsx::shader_loading_dialog* in) : inner(in) {}
 +
++		// R3PORT: the ETA uses the rate over the last 15-30 s (eta_t/eta_v[i][0] is the older anchor, [1] the newer,
++		// both reset by set_limit): pipelines the driver already has on disk finish in a burst first, and the
++		// average since the start then says minutes where the cold rest takes half an hour
++		std::chrono::steady_clock::time_point eta_t[2][2]{};
++		u32 eta_v[2][2]{};
++
++		void eta_note(u32 index, u32 value, std::chrono::steady_clock::time_point now)
++		{
++			if (now - eta_t[index][1] < std::chrono::seconds(15)) return;
++			eta_t[index][0] = eta_t[index][1];
++			eta_v[index][0] = eta_v[index][1];
++			eta_t[index][1] = now;
++			eta_v[index][1] = value;
++		}
++
++		// "about 12 min left"; empty for the first 3 s / 8 pipelines of a window and at the end
++		std::string eta_text(u32 index, u32 value) const
++		{
++			if (index >= 2 || !limit[index] || value >= limit[index] || value < eta_v[index][0] + 8) return {};
++			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - eta_t[index][0]).count();
++			if (ms < 3000) return {};
++			const double left = ms / (value - eta_v[index][0]) * (limit[index] - value) / 1000.0;
++			char b[48];
++			if (left < 60) std::snprintf(b, sizeof(b), "about %u s left", std::max(5u, static_cast<u32>(std::ceil(left / 5.0)) * 5));
++			else if (left < 90 * 60) std::snprintf(b, sizeof(b), "about %u min left", static_cast<u32>(std::ceil(left / 60.0)));
++			else std::snprintf(b, sizeof(b), "about %.1f h left", left / 3600.0);
++			return b;
++		}
++
 +		// The progress for the GDI screen; the r2pf_status panel when there is no such window or in OSD mode,
 +		// with the skip keys on its second line (the window keeps handling them).
 +		void show_status(u32 index, u32 value)
 +		{
 +			if (rsx_null_backend_splash(static_cast<int>(index) + 1, 2, value, limit[index]) && !osd_present) return;
-+			char text[192];
-+			const int n = std::snprintf(text, sizeof(text), "%s shaders %u / %u", index == 0 ? "Loading" : "Compiling", value, limit[index]);
++			char text[224];
++			const std::string eta = eta_text(index, value);
++			const int n = std::snprintf(text, sizeof(text), "%s shaders %u / %u (%u%%)%s%s", index == 0 ? "Loading" : "Compiling", value, limit[index],
++				limit[index] ? static_cast<u32>(u64{std::min(value, limit[index])} * 100 / limit[index]) : 0u, eta.empty() ? "" : ", ", eta.c_str());
 +			if (osd_present && n > 0 && n < static_cast<int>(sizeof(text)))
 +				std::snprintf(text + n, sizeof(text) - n, "\n%s", *m_skip_requested
 +					? "Skipping: the rest compile while you play..."
@@ -12621,7 +12653,13 @@ index b101a27..58312f5 100644
 +		void set_limit(u32 index, u32 l) override
 +		{
 +			inner->set_limit(index, l);
-+			if (index < 2) { limit[index] = l; t0[index] = std::chrono::steady_clock::now(); }
++			if (index < 2)
++			{
++				limit[index] = l;
++				t0[index] = std::chrono::steady_clock::now();
++				eta_t[index][0] = eta_t[index][1] = t0[index];
++				eta_v[index][0] = eta_v[index][1] = 0;
++			}
 +			if (index == 0)
 +			{
 +				if (osd_present) { show_status(0, 0); osd_present(true); }
@@ -12643,6 +12681,7 @@ index b101a27..58312f5 100644
 +			if (index >= 2 || !limit[index]) return;
 +			this->value[index] = value;
 +			const auto now = std::chrono::steady_clock::now();
++			eta_note(index, value, now);
 +			if (value >= limit[index] || now - last_status >= std::chrono::milliseconds(50))
 +			{
 +				last_status = now;
@@ -12650,12 +12689,17 @@ index b101a27..58312f5 100644
 +			}
 +			poll_skip();
 +			if (osd_present) osd_present(value >= limit[index]); // R2PORT (issue #23): the final count is always presented
-+			const u32 pct = static_cast<u32>(u64{value} * 10 / limit[index]) * 10;
-+			if (pct == last_pct[index]) return;
-+			last_pct[index] = pct;
-+			const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0[index]).count();
-+			std::printf("[r2rsx] shader preload: %s %u/%u pipelines (%u%%, %.0f ms)\n",
-+				index == 0 ? "loading" : "compiling", value, limit[index], pct, ms);
++			// R3PORT: logged at every 10% and at least every 5 s in between (a cold driver cache on a slow GPU can
++			// take minutes per 10%), with the ETA
++			const u32 pct10 = static_cast<u32>(u64{value} * 10 / limit[index]) * 10;
++			if (pct10 == last_pct[index] && now - last_log < std::chrono::seconds(5)) return;
++			last_pct[index] = pct10;
++			last_log = now;
++			const double ms = std::chrono::duration<double, std::milli>(now - t0[index]).count();
++			const std::string eta = eta_text(index, value);
++			std::printf("[r2rsx] shader preload: %s %u/%u pipelines (%u%%, %.0f ms%s%s)\n",
++				index == 0 ? "loading" : "compiling", value, limit[index], static_cast<u32>(u64{std::min(value, limit[index])} * 100 / limit[index]), ms,
++				eta.empty() ? "" : ", ", eta.c_str());
 +			std::fflush(stdout);
 +		}
 +		void refresh() override { inner->refresh(); }
@@ -12820,7 +12864,7 @@ index b101a27..58312f5 100644
  			? std::make_unique<rsx::shader_loading_dialog_native>(RSX(m_ctx))
  			: std::make_unique<rsx::shader_loading_dialog>();
  		m_shader_interpreter.preload(dlg.get());
-@@ -1321,7 +1904,7 @@ void VKGSRender::preload_shaders()
+@@ -1321,7 +1948,7 @@ void VKGSRender::preload_shaders()
  
  	if (g_cfg.video.shadermode != shader_mode::interpreter_only)
  	{
@@ -12829,7 +12873,7 @@ index b101a27..58312f5 100644
  		{
  			m_frame->hide();
  			m_shaders_cache->load(nullptr);
-@@ -1334,6 +1917,7 @@ void VKGSRender::preload_shaders()
+@@ -1334,6 +1961,7 @@ void VKGSRender::preload_shaders()
  			// TODO: Handle window resize messages during loading on GPUs without OUT_OF_DATE_KHR support
  			m_shaders_cache->load(&dlg);
  		}
@@ -12837,7 +12881,7 @@ index b101a27..58312f5 100644
  	}
  }
  
-@@ -1350,6 +1934,13 @@ std::unique_ptr<rsx::context_resources> VKGSRender::create_context_resources(rsx
+@@ -1350,6 +1978,13 @@ std::unique_ptr<rsx::context_resources> VKGSRender::create_context_resources(rsx
  	resources->texture_cache.set_context(ctx);
  	resources->texture_cache.initialize(*m_device, m_device->get_graphics_queue(), m_texture_upload_buffer_ring_info);
  
@@ -12851,7 +12895,7 @@ index b101a27..58312f5 100644
  	return resources;
  }
  
-@@ -1414,6 +2005,7 @@ void VKGSRender::on_unbind_context(rsx::context* ctx)
+@@ -1414,6 +2049,7 @@ void VKGSRender::on_unbind_context(rsx::context* ctx)
  
  void VKGSRender::on_shutdown()
  {
@@ -12859,7 +12903,7 @@ index b101a27..58312f5 100644
  	// Flush DMA queue
  	while (!g_fxo->get<rsx::dma_manager>().sync())
  	{
-@@ -1421,6 +2013,8 @@ void VKGSRender::on_shutdown()
+@@ -1421,6 +2057,8 @@ void VKGSRender::on_shutdown()
  	}
  
  	destroy_frame_context();
@@ -12868,7 +12912,7 @@ index b101a27..58312f5 100644
  	vk::destroy_pipe_compiler(); // Ensure no pending shaders being compiled
  }
  
-@@ -1430,6 +2024,9 @@ void VKGSRender::clear()
+@@ -1430,6 +2068,9 @@ void VKGSRender::clear()
  	const auto& info = m_ctx->draw_state.clear;
  	const auto mask = info.mask;
  
@@ -12878,7 +12922,7 @@ index b101a27..58312f5 100644
  	set_scissor();
  
  	constexpr u32 stencil_clear = 0;
-@@ -1456,6 +2053,15 @@ void VKGSRender::clear()
+@@ -1456,6 +2097,15 @@ void VKGSRender::clear()
  
  	if (auto ds = std::get<1>(res()->surface_cache.m_bound_depth_stencil); ds && (mask & RSX_GCM_CLEAR_DEPTH_STENCIL_MASK))
  	{
@@ -12894,7 +12938,7 @@ index b101a27..58312f5 100644
  		if (mask & RSX_GCM_CLEAR_DEPTH_BIT)
  		{
  			f32 depth_clear = info.depth_value;
-@@ -1513,7 +2119,7 @@ void VKGSRender::clear()
+@@ -1513,7 +2163,7 @@ void VKGSRender::clear()
  			else
  			{
  				// Barrier required before any writes
@@ -12903,7 +12947,7 @@ index b101a27..58312f5 100644
  			}
  		}
  	}
-@@ -1598,10 +2204,34 @@ void VKGSRender::clear()
+@@ -1598,10 +2248,34 @@ void VKGSRender::clear()
  		begin_render_pass();
  		vkCmdClearAttachments(*m_current_command_buffer, ::size32(clear_descriptors), clear_descriptors.data(), 1, &region);
  	}
@@ -12938,7 +12982,7 @@ index b101a27..58312f5 100644
  	close_and_submit_command_buffer();
  
  	if (hard_sync)
-@@ -1643,6 +2273,9 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
+@@ -1643,6 +2317,9 @@ void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
  	}
  
  	m_current_command_buffer->begin();
@@ -12948,7 +12992,7 @@ index b101a27..58312f5 100644
  }
  
  std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data() const
-@@ -1779,6 +2412,7 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
+@@ -1779,6 +2456,7 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
  
  		// Unavoidable hard sync coming up, flush immediately
  		// This heavyweight hint should be used with caution
@@ -12956,7 +13000,7 @@ index b101a27..58312f5 100644
  		std::lock_guard lock(m_flush_queue_mutex);
  		flush_command_queue();
  
-@@ -1794,6 +2428,48 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
+@@ -1794,6 +2472,48 @@ void VKGSRender::on_sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync
  
  bool VKGSRender::on_local_task(rsx::FIFO::state state)
  {
@@ -13005,7 +13049,7 @@ index b101a27..58312f5 100644
  	if (m_queue_status & flush_queue_state::deadlock)
  	{
  		// Clear offloader deadlock
-@@ -1813,6 +2489,7 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
+@@ -1813,6 +2533,7 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
  	{
  		if (m_flush_queue_mutex.try_lock())
  		{
@@ -13013,7 +13057,7 @@ index b101a27..58312f5 100644
  			// TODO: Determine if a hard sync is necessary
  			// Pipeline barriers later may do a better job synchronizing than wholly stalling the pipeline
  			flush_command_queue();
-@@ -1834,6 +2511,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
+@@ -1834,6 +2555,8 @@ bool VKGSRender::on_local_task(rsx::FIFO::state state)
  			}
  			m_ctx->graphics_state.clear(rsx::pipeline_state::framebuffer_reads_dirty);
  		}
@@ -13022,7 +13066,7 @@ index b101a27..58312f5 100644
  	}
  
  	return true;
-@@ -1850,8 +2529,10 @@ bool VKGSRender::load_program()
+@@ -1850,8 +2573,10 @@ bool VKGSRender::load_program()
  	constexpr u32 pipeline_properties_invalidate_bits = (RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING | RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE);
  	const u32 pipeline_properties_ctrl = m_ctx->program.fragment_program.ctrl & pipeline_properties_invalidate_bits;
  
@@ -13033,7 +13077,7 @@ index b101a27..58312f5 100644
  		pipeline_properties_ctrl != m_pipeline_properties_ctrl ||
  		vk::get_renderpass_format_key(m_pipeline_properties.renderpass_key) != vk::get_renderpass_format_key(m_current_renderpass_key) || // We only care about RP format mismatch
  		m_pipeline_properties.state.cs.attachmentCount != m_draw_buffers.size();
-@@ -1902,10 +2583,11 @@ bool VKGSRender::load_program()
+@@ -1902,10 +2627,11 @@ bool VKGSRender::load_program()
  			u8((m_current_renderpass_key >> 16) & 0xF),
  			m_device->get_depth_bounds_support(),
  			!!(m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING),
@@ -13046,7 +13090,7 @@ index b101a27..58312f5 100644
  		m_pipeline_properties_ctrl = pipeline_properties_ctrl;
  
  		if (m_program &&
-@@ -1935,7 +2617,7 @@ bool VKGSRender::load_program()
+@@ -1935,7 +2661,7 @@ bool VKGSRender::load_program()
  	{
  		vk::enter_uninterruptible();
  
@@ -13055,7 +13099,7 @@ index b101a27..58312f5 100644
  		{
  			m_ctx->stats.program_cache_lookups_total += 2;
  			if (m_ctx->program.cache_hint.has_fragment_program())
-@@ -1953,12 +2635,99 @@ bool VKGSRender::load_program()
+@@ -1953,12 +2679,99 @@ bool VKGSRender::load_program()
  		const bool allow_async = shadermode != shader_mode::recompiler &&
  			!(fragment_program.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE);
  
@@ -13161,7 +13205,7 @@ index b101a27..58312f5 100644
  
  		vk::leave_uninterruptible();
  
-@@ -2027,6 +2796,7 @@ bool VKGSRender::load_program()
+@@ -2027,6 +2840,7 @@ bool VKGSRender::load_program()
  
  void VKGSRender::load_program_env()
  {
@@ -13169,7 +13213,7 @@ index b101a27..58312f5 100644
  	if (!m_program)
  	{
  		fmt::throw_exception("Unreachable right now");
-@@ -2042,21 +2812,81 @@ void VKGSRender::load_program_env()
+@@ -2042,21 +2856,81 @@ void VKGSRender::load_program_env()
  
  	const bool update_transform_constants = m_stale_constants.test(rsx::draw_state_t::group::transform_constants);
  	const bool update_fragment_constants = m_stale_constants.test(rsx::draw_state_t::group::fragment_constants);
@@ -13254,7 +13298,7 @@ index b101a27..58312f5 100644
  
  		m_vertex_env_ring_info.unmap();
  		m_vertex_env_dynamic_offset = mem;
-@@ -2067,6 +2897,7 @@ void VKGSRender::load_program_env()
+@@ -2067,6 +2941,7 @@ void VKGSRender::load_program_env()
  
  	if (update_instancing_data)
  	{
@@ -13262,7 +13306,7 @@ index b101a27..58312f5 100644
  		// Combines transform load + instancing lookup table
  		const auto alignment = m_device->gpu().get_limits().minStorageBufferOffsetAlignment;
  		usz indirection_table_offset = 0;
-@@ -2093,6 +2924,22 @@ void VKGSRender::load_program_env()
+@@ -2093,6 +2968,22 @@ void VKGSRender::load_program_env()
  	}
  	else if (update_transform_constants)
  	{
@@ -13285,7 +13329,7 @@ index b101a27..58312f5 100644
  		// Transform constants
  		usz mem_offset = 0;
  		auto alloc_storage = [&](usz size) -> std::pair<void*, usz>
-@@ -2102,15 +2949,44 @@ void VKGSRender::load_program_env()
+@@ -2102,15 +2993,44 @@ void VKGSRender::load_program_env()
  		};
  
  		auto io_buf = rsx::io_buffer(alloc_storage);
@@ -13331,7 +13375,7 @@ index b101a27..58312f5 100644
  		}
  	}
  
-@@ -2119,6 +2995,7 @@ void VKGSRender::load_program_env()
+@@ -2119,6 +3039,7 @@ void VKGSRender::load_program_env()
  		// Fragment constants
  		if (fragment_constants_size)
  		{
@@ -13339,7 +13383,7 @@ index b101a27..58312f5 100644
  			m_fragment_constants_dynamic_offset = m_fragment_constants_allocator->alloc_bytes(fragment_constants_size);
  			auto buf = m_fragment_constants_ring_info.map(m_fragment_constants_dynamic_offset, fragment_constants_size);
  
-@@ -2134,10 +3011,23 @@ void VKGSRender::load_program_env()
+@@ -2134,10 +3055,23 @@ void VKGSRender::load_program_env()
  
  	if (update_fragment_env)
  	{
@@ -13364,7 +13408,7 @@ index b101a27..58312f5 100644
  		m_fragment_env_ring_info.unmap();
  
  		m_fragment_env_buffer_info = m_fragment_env_ring_info.window<32>(m_fragment_env_dynamic_offset, 32, gpu_limits.maxUniformBufferRange);
-@@ -2146,10 +3036,12 @@ void VKGSRender::load_program_env()
+@@ -2146,10 +3080,12 @@ void VKGSRender::load_program_env()
  
  	if (update_fragment_texture_env)
  	{
@@ -13377,7 +13421,7 @@ index b101a27..58312f5 100644
  		m_fragment_texture_params_ring_info.unmap();
  
  		m_fragment_texture_params_buffer_info = m_fragment_texture_params_ring_info.window<768>(m_texture_parameters_dynamic_offset, 768, gpu_limits.maxUniformBufferRange);
-@@ -2198,6 +3090,7 @@ void VKGSRender::load_program_env()
+@@ -2198,6 +3134,7 @@ void VKGSRender::load_program_env()
  		}
  	}
  
@@ -13385,7 +13429,7 @@ index b101a27..58312f5 100644
  	m_program->bind_uniform(m_vertex_env_buffer_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->context_buffer_location);
  	m_program->bind_uniform(m_vertex_layout_stream_info, vk::glsl::binding_set_index_vertex, m_vs_binding_table->vertex_buffers_location + 2);
  	m_program->bind_uniform(m_fragment_env_buffer_info, vk::glsl::binding_set_index_fragment, m_fs_binding_table->context_buffer_location);
-@@ -2420,6 +3313,7 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
+@@ -2420,6 +3357,7 @@ void VKGSRender::patch_transform_constants(rsx::context* /*ctx*/, u32 index, u32
  void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
  {
  	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
@@ -13393,7 +13437,7 @@ index b101a27..58312f5 100644
  
  	// Host MM sync before executing anything on the GPU
  	rsx::mm_flush();
-@@ -2473,6 +3367,8 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2473,6 +3411,8 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		m_current_command_buffer->flags &= ~vk::command_buffer::cb_has_open_query;
  	}
  
@@ -13402,7 +13446,7 @@ index b101a27..58312f5 100644
  	if (m_host_dma_ctrl && m_host_dma_ctrl->host_ctx()->needs_label_release())
  	{
  		vkCmdUpdateBuffer(*m_current_command_buffer,
-@@ -2484,8 +3380,10 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2484,8 +3424,10 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		m_host_dma_ctrl->host_ctx()->on_label_release();
  	}
  
@@ -13413,7 +13457,7 @@ index b101a27..58312f5 100644
  
  	// Supporting concurrent access vastly simplifies this logic.
  	// Instead of doing CB slice injection, we can just chain these together logically with the async stream going first
-@@ -2518,7 +3416,12 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
+@@ -2518,7 +3460,12 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore
  		primary_submit_info.queue_signal(signal_semaphore);
  	}
  
@@ -13426,7 +13470,7 @@ index b101a27..58312f5 100644
  
  	m_queue_status.clear(flush_queue_state::flushing);
  }
-@@ -2533,9 +3436,46 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2533,9 +3480,46 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	if (m_draw_fbo && layout.ignore_change)
  	{
  		// Nothing has changed, we're still using the same framebuffer
@@ -13473,7 +13517,7 @@ index b101a27..58312f5 100644
  	res()->surface_cache.prepare_render_target(*m_current_command_buffer,
  		m_ctx->fb.layout.color_format, m_ctx->fb.layout.depth_format,
  		m_ctx->fb.layout.width, m_ctx->fb.layout.height,
-@@ -2544,18 +3484,69 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2544,18 +3528,69 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		m_ctx->fb.layout.actual_color_pitch, m_ctx->fb.layout.actual_zeta_pitch,
  		RSX(m_ctx)->resolution_scaling_config);
  
@@ -13547,7 +13591,7 @@ index b101a27..58312f5 100644
  		}
  
  		m_ctx->fb.surface_info[i].address = m_ctx->fb.surface_info[i].pitch = 0;
-@@ -2573,6 +3564,8 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2573,6 +3608,8 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  			const utils::address_range32 surface_range = m_ctx->fb.depth_surface_info.get_memory_range();
  			res()->texture_cache.set_memory_read_flags(surface_range, rsx::memory_read_flags::flush_once);
  			res()->texture_cache.flush_if_cache_miss_likely(*m_current_command_buffer, surface_range);
@@ -13556,7 +13600,7 @@ index b101a27..58312f5 100644
  		}
  
  		m_ctx->fb.depth_surface_info.address = m_ctx->fb.depth_surface_info.pitch = 0;
-@@ -2583,6 +3576,11 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2583,6 +3620,11 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		m_ctx->fb.depth_surface_info.samples = samples;
  	}
  
@@ -13568,7 +13612,7 @@ index b101a27..58312f5 100644
  	// Bind created rtts as current fbo...
  	const auto draw_buffers = rsx::utility::get_rtt_indexes(m_ctx->fb.layout.target);
  	m_draw_buffers.clear();
-@@ -2618,11 +3616,28 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2618,11 +3660,28 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	// Before messing with memory properties, flush command queue if there are dma transfers queued up
  	if (m_current_command_buffer->flags & vk::command_buffer::cb_has_dma_transfer)
  	{
@@ -13597,7 +13641,7 @@ index b101a27..58312f5 100644
  		for (auto& surface : res()->surface_cache.superseded_surfaces)
  		{
  			res()->texture_cache.discard_framebuffer_memory_region(*m_current_command_buffer, surface->get_memory_range());
-@@ -2630,13 +3645,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2630,13 +3689,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  
  		res()->surface_cache.superseded_surfaces.clear();
  	}
@@ -13613,7 +13657,7 @@ index b101a27..58312f5 100644
  
  			if (lock &&
  #ifdef TEXTURE_CACHE_DEBUG
-@@ -2666,13 +3682,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2666,13 +3726,14 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  
  		res()->surface_cache.orphaned_surfaces.clear();
  	}
@@ -13629,7 +13673,7 @@ index b101a27..58312f5 100644
  		{
  			res()->texture_cache.lock_memory_region(
  				*m_current_command_buffer, res()->surface_cache.m_bound_render_targets[index].second, surface_range, true,
-@@ -2684,6 +3701,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2684,6 +3745,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  			res()->texture_cache.commit_framebuffer_memory_region(*m_current_command_buffer, surface_range);
  		}
  	}
@@ -13637,7 +13681,7 @@ index b101a27..58312f5 100644
  
  	if (m_ctx->fb.depth_surface_info.address && m_ctx->fb.depth_surface_info.pitch)
  	{
-@@ -2701,6 +3719,16 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2701,6 +3763,16 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  		}
  	}
  
@@ -13654,7 +13698,7 @@ index b101a27..58312f5 100644
  	std::vector<u8> input_attachments{};
  	if ((m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) &&
  		!m_ctx->draw_state.dirty.test(rsx::draw_state_t::group::fragment_program))
-@@ -2737,6 +3765,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
+@@ -2737,6 +3809,7 @@ bool VKGSRender::on_framebuffer_bound(const rsx::framebuffer_layout& layout)
  	m_draw_fbo->add_ref();
  
  	set_viewport();
@@ -13662,7 +13706,7 @@ index b101a27..58312f5 100644
  	return true;
  }
  
-@@ -2758,11 +3787,28 @@ bool VKGSRender::on_renderctl(u32 request_code, void* args)
+@@ -2758,11 +3831,28 @@ bool VKGSRender::on_renderctl(u32 request_code, void* args)
  
  bool VKGSRender::scaled_image_from_memory(const rsx::blit_src_info& src, const rsx::blit_dst_info& dst, bool interpolate)
  {
@@ -13691,7 +13735,7 @@ index b101a27..58312f5 100644
  		if (m_current_command_buffer->flags & vk::command_buffer::cb_has_dma_transfer)
  		{
  			// A dma transfer has been queued onto this cb
-@@ -2826,20 +3872,65 @@ bool VKGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_info
+@@ -2826,20 +3916,65 @@ bool VKGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_info
  	if (data.is_current(m_current_command_buffer))
  		return false;
  
@@ -13757,7 +13801,7 @@ index b101a27..58312f5 100644
  			std::lock_guard lock(m_flush_queue_mutex);
  			flush_command_queue();
  
-@@ -2852,7 +3943,35 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info*
+@@ -2852,7 +3987,35 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info*
  			busy_wait();
  		}
  

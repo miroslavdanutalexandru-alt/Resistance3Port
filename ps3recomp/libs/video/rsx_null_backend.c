@@ -183,6 +183,27 @@ static int s_present_suppressed = 0;
 static volatile LONG s_splash_step = 0, s_splash_steps = 0, s_splash_done = 0, s_splash_total = 0;
 static volatile LONG s_splash_skip = 0, s_splash_blank_once = 0;
 static volatile LONGLONG s_splash_t0 = 0, s_splash_inval = 0;
+/* ETA window (as VKGSRender.cpp's preload dialog): the rate over the last 15-30 s, [0] the older anchor, [1] the
+ * newer, reset when the step changes; a burst of pipelines the driver already has on disk would otherwise make the
+ * cold rest look minutes long when it takes half an hour */
+static volatile LONGLONG s_splash_eta_t[2] = { 0, 0 };
+static volatile LONG s_splash_eta_v[2] = { 0, 0 };
+
+/* "about 12 min left"; empty for the first 3 s / 8 items of a window and at the end */
+static void nb_splash_eta(wchar_t* out, size_t n, unsigned done, unsigned total)
+{
+    out[0] = 0;
+    const unsigned v0 = (unsigned)s_splash_eta_v[0];
+    if (!total || done >= total || done < v0 + 8) return;
+    const double ms = (double)(GetTickCount64() - (ULONGLONG)s_splash_eta_t[0]);
+    if (ms < 3000) return;
+    const double left = ms / (done - v0) * (total - done) / 1000.0;
+    if (left < 60) {
+        unsigned s = (unsigned)ceil(left / 5.0) * 5; if (s < 5) s = 5;
+        swprintf(out, n, L"about %u s left", s);
+    } else if (left < 90 * 60) swprintf(out, n, L"about %u min left", (unsigned)ceil(left / 60.0));
+    else swprintf(out, n, L"about %.1f h left", left / 3600.0);
+}
 static HFONT s_splash_font[3];
 /* rsx_null_backend_splash_gdi(0): the renderer presents the start-up screen into its swap chain
  * (VKGSRender.cpp preload_shaders, PORT_OSD), which exclusive fullscreen shows and GDI does not.
@@ -230,8 +251,11 @@ static void nb_splash_paint(HWND hwnd, HDC hdc)
 
         SelectObject(mdc, s_splash_font[1]);
         SetTextColor(mdc, RGB(175, 180, 190));
-        swprintf(t, 192, L"Step %ld of %ld: %s   \u00B7   %u:%02u", (long)step, (long)(s_splash_steps ? s_splash_steps : step),
-                 step == 1 && s_splash_steps > 1 ? L"shader programs" : L"pipelines", secs / 60, secs % 60);
+        wchar_t eta[48];
+        nb_splash_eta(eta, 48, done, total);
+        swprintf(t, 192, L"Step %ld of %ld: %s   \u00B7   %u:%02u%s%s", (long)step, (long)(s_splash_steps ? s_splash_steps : step),
+                 step == 1 && s_splash_steps > 1 ? L"shader programs" : L"pipelines", secs / 60, secs % 60,
+                 eta[0] ? L"   \u00B7   " : L"", eta);
         RECT r2 = { bx, bar.bottom + fh / 2, bx + bw, bar.bottom + fh * 3 / 2 };
         DrawTextW(mdc, t, -1, &r2, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
 
@@ -789,11 +813,18 @@ int rsx_null_backend_pump_messages(void)
     ULONGLONG now = GetTickCount64();
     if (s_state.hwnd && s_splash_step > 0 && now - s_state.title_time >= 250) {
         const unsigned done = (unsigned)s_splash_done, total = (unsigned)s_splash_total;
+        wchar_t eta[48];
+        nb_splash_eta(eta, 48, done, total);
         char tb[256];
-        snprintf(tb, sizeof(tb), "%s | Compiling shaders %u%% (step %ld of %ld)", s_state.title,
+        snprintf(tb, sizeof(tb), "%s | Compiling shaders %u / %u (%u%%, step %ld of %ld%s%ls)", s_state.title, done, total,
                  total ? (unsigned)((unsigned long long)(done < total ? done : total) * 100 / total) : 0,
-                 (long)s_splash_step, (long)(s_splash_steps ? s_splash_steps : s_splash_step));
+                 (long)s_splash_step, (long)(s_splash_steps ? s_splash_steps : s_splash_step), eta[0] ? ", " : "", eta);
         SetWindowTextA(s_state.hwnd, tb);
+        /* the elapsed time and the ETA keep moving while one slow pipeline holds the count */
+        if (!s_splash_gdi_off && now - (ULONGLONG)s_splash_inval >= 1000) {
+            s_splash_inval = (LONGLONG)now;
+            InvalidateRect(s_state.hwnd, NULL, FALSE);
+        }
         s_state.title_time = now;
         s_state.title_frames = s_state.frame_count;
         return s_state.window_closed ? -1 : 0;
@@ -848,6 +879,16 @@ int rsx_null_backend_splash(int step, int steps, unsigned done, unsigned total)
     if (step > 0 && prev <= 0) {
         s_splash_t0 = (LONGLONG)GetTickCount64();
         InterlockedExchange(&s_splash_skip, 0);
+    }
+    {
+        const LONGLONG t = (LONGLONG)GetTickCount64();
+        if (step > 0 && step != prev) {
+            s_splash_eta_t[0] = s_splash_eta_t[1] = t;
+            s_splash_eta_v[0] = s_splash_eta_v[1] = 0;
+        } else if (step > 0 && t - s_splash_eta_t[1] >= 15000) {
+            s_splash_eta_t[0] = s_splash_eta_t[1]; s_splash_eta_v[0] = s_splash_eta_v[1];
+            s_splash_eta_v[1] = (LONG)done; s_splash_eta_t[1] = t;
+        }
     }
     InterlockedExchange(&s_splash_steps, steps);
     InterlockedExchange(&s_splash_done, (LONG)done);
