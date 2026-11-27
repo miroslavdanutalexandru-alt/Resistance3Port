@@ -276,6 +276,11 @@ int main(void)
         vm_write32(IOV + 4, 8);
         vm_write32(MSG + 0, 0);
         assert(C3("recvmsg", u1, MSG, 0) == 3 && !memcmp(vm_base + D1, "one", 3));
+        /* R3's MR net thread (func_008B8CF8) treats only an in-band
+         * 0x80010223 as "nothing queued"; anything else is logged as an error. */
+        assert((uint32_t)C3("recvmsg", u1, MSG, SYS_NET_MSG_DONTWAIT) == 0x80010223u);
+        vm_write32(MSG + 12, 3);
+        assert((uint32_t)C3("recvmsg", u1, MSG, SYS_NET_MSG_DONTWAIT) == 0x80010223u);
         vm_write32(MSG + 12, 1000);
         assert(C3("sendmsg", u2, MSG, 0) == (int32_t)0x80010216u);   /* EINVAL */
         assert(C1("socketclose", u1) == 0 && C1("socketclose", u2) == 0);

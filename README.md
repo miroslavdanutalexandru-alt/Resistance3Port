@@ -201,7 +201,8 @@ What it does with `PORT_ONLINE=1`:
 
 - Turns on real sockets for the game (`PS3_NET_ONLINE=1`).
 - With `rpcn_user` and `rpcn_password` set, the game is told it is signed in, as that RPCN name. When the game asks for a sign-in ticket, the port connects to `rpcn_host` (TLS, port 31313), logs in and gets the ticket from RPCN, as RPCS3 does.
-- Sends the game's server lookups (`gethostbyname`) to `host.<name> = <ip>` entries first, then to the `dns =` server (for community revival servers that are reached through a custom DNS), then to Windows' DNS.
+- Sends the game's server lookups (`gethostbyname`, and the HTTP requests the game makes through `cellHttp`) to `host.<name> = <ip>` entries first, then to the `dns =` server (for community revival servers that are reached through a custom DNS), then to Windows' DNS. HTTP keeps the original name in the `Host:` header.
+- Provides the socket calls the game's own server code imports (`sendmsg`, `recvmsg`, `inet_ntop`, `gethostbyaddr`) on top of the usual ones.
 
 | Variable / `online.ini` key | Meaning |
 |---|---|
@@ -213,7 +214,7 @@ What it does with `PORT_ONLINE=1`:
 | `host.<name>` | Fixed IPv4 address for one host name |
 
 `logs\run.log` lines start with `[online]` (config read, sign-in state, ticket requests) and `[sys_net] gethostbyname` (each server name the game looks up and where it went).
-**Limits:** Resistance 3's official servers are shut down and there is no known community server, so there is nothing to play online against yet. The port only signs in and fetches tickets; matchmaking, voice and NAT are untested and some online functions are still stubs.
+**Limits:** Resistance 3's official servers are shut down and there is no known community server, so there is nothing to play online against yet. The port only signs in and fetches tickets; matchmaking, voice and NAT are untested and some online functions are still stubs. R3 does not use RPCN rooms (NP Matching2) or Medius: it talks to Insomniac's own "MR" universe/galaxy servers (ports 12350/12351 by default) and to an HTTP login server, so a LAN mode needs a stand-in for those servers. That stand-in does not exist yet (the protocol is not reverse-engineered).
 
 ## PC features
 
