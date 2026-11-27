@@ -78,6 +78,18 @@ static void setup(uint16_t state, uint32_t target, int with_site)
     g_spu_trampoline_fn = 0;
 }
 
+/* The handler call at 0xF6AC: r65 = state index, r2 = LS 0x108D0 + 4*index, link 0xF6B0. */
+static void setup_handler(uint16_t state, uint32_t target, int with_site)
+{
+    setup(state, target, 0);
+    if (with_site)
+        for (int k = 0; k < 16; k++) ls_put32(0xF670u + 4u * (uint32_t)k, k_j403_f670[k]);
+    g_ctx.gpr[0]._u32[0] = 0xF6B0u;
+    g_ctx.gpr[65]._u32[0] = state;
+    g_ctx.gpr[2]._u32[0] = target;
+    g_ctx.gpr[90]._u32[0] = 0;
+}
+
 int main(void)
 {
     TEST("end of Haven: state 0x8003 -> slot past the table -> 0x32800 data");
@@ -111,6 +123,24 @@ int main(void)
     TEST("target not the one r90 holds (a return, not this call)");
     setup(0x8003, 0x32800u, 1);
     g_ctx.pc = 0xF8F4u;
+    CHECK(spu_j403_bad_state_skip(&g_ctx) == 0);
+
+    TEST("handler table: done state 0x8003 -> LS 0x308DC word -> skipped back to 0xF6B0");
+    setup_handler(0x8003, 0x32800u, 1);
+    spu_indirect_branch(&g_ctx);
+    CHECK((g_ctx.pc & SPU_LS_MASK) == 0xF6B0u);
+    CHECK(g_spu_trampoline_fn == spu_indirect_branch);
+    CHECK(!(g_ctx.status & (SPU_STATUS_STOPPED_BY_HALT | SPU_STATUS_STOPPED_BY_STOP)));
+
+    TEST("handler table: valid indexes are left to the call");
+    for (uint16_t s = 0; s < 13; s++) {
+        setup_handler(s, 0x32800u, 1);
+        CHECK(spu_j403_bad_state_skip(&g_ctx) == 0);
+        CHECK(g_ctx.pc == 0x32800u);
+    }
+
+    TEST("handler table: another job's call with link 0xF6B0 is left alone");
+    setup_handler(0x8003, 0x32800u, 0);
     CHECK(spu_j403_bad_state_skip(&g_ctx) == 0);
 
     printf("job 403 bad state: %d passed, %d failed\n", g_pass, g_fail);
