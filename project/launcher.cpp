@@ -433,6 +433,13 @@ static void register_pc_options()
                "In the game, Ctrl+F1 toggles God mode and Ctrl+F2 Infinite ammo and grenades. Off: only this page and "
                "the F9 menu change them.",
                "PORT_CHEAT_KEYS", { {"Off", ""}, {"On", "1"} }, 0);
+    // r3_cheats.cpp: the game's own unlocks answer "unlocked" (save not written; also an F9 row)
+    add_option(SEC_PC, "unlock_all", "Unlock all chapters and extras",
+               "Every chapter in Campaign > Load Level and every item in Extras: the game's own cheats (Bloody Hell, "
+               "Mirror mode, ...), skins, concept art and videos. Your save is not changed: turn it off and you have "
+               "your own unlocks again. Not online or in a benchmark run. Once you turn one of the game's cheats on, "
+               "trophies are off until the game is restarted.",
+               "R3_UNLOCK_ALL", { {"Off", ""}, {"On", "1"} }, 0);
     add_option(SEC_PC, "trophytoast", "Trophy notifications",
                "A small notification in the corner of the game window when you earn a trophy. Trophies are always "
                "recorded (see the Trophies page).",

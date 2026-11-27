@@ -33,7 +33,9 @@
  * PORT_CHEAT_GRENADES = 1) or, when PORT_CHEAT_KEYS=1, Ctrl+F1 / F2 (r3_pcextra.cpp).
  * Once any has been on, trophy unlocks are not recorded until the game is restarted
  * (g_trophy_unlocks_blocked, sceNpTrophy.c). In an R3_BENCH run and with PORT_ONLINE
- * on they all stay off. Every change is logged. */
+ * on they all stay off. Every change is logged.
+ *
+ * Also here: "Unlock all chapters and extras" (R3_UNLOCK_ALL), see below. */
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -291,6 +293,87 @@ static void god_restore(void)
     for (int k = 0; k < 4; k++) inv_release(k, "off");
 }
 
+/* ---- Unlock all chapters and extras (R3_UNLOCK_ALL, issue #10) ----
+ * Nothing is written to the save: the game's own queries answer "unlocked" while it is on.
+ *   Extras    func_00438230 IsUnlocked(manager, category, id) (bit id of stat 0xE4 in the
+ *             stats DB; categories 0 cheats, 1 skins, 2 concept art, 3 titles, 4 videos)
+ *             returns 1 for categories 0, 1, 2 and 4. Titles (3, stats 0xE5-0xE8) are left
+ *             alone, and so is the store's points total (func_004383EC, call at 0x0043849C).
+ *             Picking an item that reports unlocked makes the game's Purchase
+ *             (func_00438688) toggle it instead of buying it, so the game's cheats (Bloody
+ *             Hell included; the game itself still hides it on a low-violence system) turn
+ *             on and off exactly as with a real unlock.
+ *   Chapters  the profile's campaign block (profile + 0x2BE4: u16 location mask at +0x88,
+ *             11 x 64 chapter bytes at +0x8A, 0xFF = not reached, else the highest
+ *             difficulty reached) as read by the Load Level menu (SetCheckpointData,
+ *             func_0034A558), the Load Level entry (func_0034AE78, func_00357DE0): every
+ *             location is unlocked and an unreached chapter reads as reached on the first
+ *             difficulty. The game's progress code, hasCompletedCampaign and the trophy
+ *             checks still read the real bytes.
+ * Trophies: once the option has been on, turning one of the game's Extras cheats on
+ * (cheat object table 0x011FDDC0, enabled byte +4) stops trophy unlocks until the game is
+ * restarted, as with the port's own cheats. Off in an R3_BENCH run and with PORT_ONLINE. */
+extern "C" volatile int g_r3_unlock_all = 0;
+static int s_unlock_init = 0, s_unlock_used = 0;
+static void unlock_init(void)
+{
+    if (s_unlock_init) return;
+    s_unlock_init = 1;
+    if (!env_on("R3_UNLOCK_ALL")) return;
+    if (const int why = cheats_blocked()) {
+        fprintf(stderr, "[unlock] %s: unlock all chapters and extras is off\n", why == 1 ? "benchmark run" : "online (PORT_ONLINE)");
+        return;
+    }
+    g_r3_unlock_all = s_unlock_used = 1;
+    fprintf(stderr, "[unlock] all chapters and extras unlocked (R3_UNLOCK_ALL, nothing is written to the save)\n");
+}
+/* on: 1 / 0. Returns the new state, -1 in a benchmark run, -2 with online on (F9 row). */
+extern "C" int r3_unlock_all_set(int on)
+{
+    unlock_init();
+    if (const int why = cheats_blocked()) return -why;
+    on = on ? 1 : 0;
+    if (g_r3_unlock_all != on)
+        fprintf(stderr, "[unlock] all chapters and extras %s\n", on ? "unlocked (nothing is written to the save)" : "back to the save's own unlocks");
+    g_r3_unlock_all = on;
+    if (on) s_unlock_used = 1;
+    return on;
+}
+static inline int unlock_on(void)
+{
+    if (!s_unlock_init) unlock_init();
+    return g_r3_unlock_all;
+}
+/* func_00438230 hook: 1 = report the item unlocked. lr = the caller's return address. */
+extern "C" int r3_unlock_extra(uint32_t lr, uint32_t category)
+{
+    if (!unlock_on() || category > 4 || category == 3 || lr == 0x004384A0u) return 0;
+    static int told_cat[5];
+    if (!told_cat[category]) {
+        told_cat[category] = 1;
+        static const char* const nm[5] = { "cheats", "skins", "concept art", "titles", "videos" };
+        fprintf(stderr, "[unlock] Extras %s report unlocked\n", nm[category]);
+    }
+    return 1;
+}
+/* func_0034A558 / func_0034AE78 / func_00357DE0 hooks: the location mask and chapter bytes */
+extern "C" uint32_t r3_unlock_locmask(uint32_t mask) { return unlock_on() ? (mask | 0x7FFu) : mask; }
+extern "C" uint32_t r3_unlock_chapter(uint32_t v) { return unlock_on() && (v & 0xFFu) == 0xFFu ? 0u : v; }
+static const uint32_t GAME_CHEATS = 0x011FDDC0u;   /* category 0: 8 cheat objects, byte +4 = on */
+static void unlock_watch(void)
+{
+    if (!s_unlock_used || g_trophy_unlocks_blocked) return;
+    for (uint32_t id = 0; id < 8; id++) {
+        const uint32_t o = vm_read32(GAME_CHEATS + id * 4u);
+        if (!main_ok(o) && !heap_ok(o, 8)) continue;
+        if (vm_read8(o + 4)) {
+            fprintf(stderr, "[unlock] the game's Extras cheat %u is on\n", id);
+            block_trophies();
+            return;
+        }
+    }
+}
+
 /* Every gameplay frame, per hero (stubs.cpp r3_mouselook_pre); local = the hero has a
  * local controller / keyboard (r3_hero_input). */
 extern "C" void r3_cheats_hero(uint32_t hero, int local)
@@ -308,6 +391,7 @@ extern "C" void r3_cheats_hero(uint32_t hero, int local)
         }
     }
     if (cheats_blocked()) return;
+    unlock_watch();
     static int hold_was = 0, god_was = 0;
     const int god = g_r3_cheat_god, ammo = g_r3_cheat_ammo, gren = g_r3_cheat_gren;
     if (god || ammo || gren) block_trophies();
