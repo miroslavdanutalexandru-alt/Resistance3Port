@@ -173,6 +173,21 @@ static void test_hold()
 	CHECK(pfg_fx_reset(prev, 0, 1, 1));   // camera cut
 	CHECK(pfg_cut_reset(1, PFG_CUT_UNTRUSTED) && !pfg_cut_reset(1, PFG_CUT_HELD) && !pfg_cut_reset(1, PFG_CUT_NONE));
 	CHECK(pfg_cut_reset(2, PFG_CUT_HELD) && !pfg_cut_reset(0, PFG_CUT_UNTRUSTED));
+#ifndef PFG_R1
+	// R3_DLSS_FG_CAM_RESET (from R2): untrusted camera motion resets only while the camera moves; held only with mode 2
+	CHECK(pfg_cam_reset(1, PFG_CAM_ZEROED, 3.0) && pfg_cam_reset(1, PFG_CAM_GUESSED, 1.0) && pfg_cam_reset(1, PFG_CAM_ZEROED, 1e9));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_ZEROED, 0.5) && !pfg_cam_reset(1, PFG_CAM_GUESSED, 0.0) && !pfg_cam_reset(1, PFG_CAM_TRUSTED, 50.0));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_HELD, 50.0) && pfg_cam_reset(2, PFG_CAM_HELD, 50.0) && !pfg_cam_reset(2, PFG_CAM_HELD, 0.2));
+	CHECK(!pfg_cam_reset(0, PFG_CAM_ZEROED, 50.0) && !pfg_cam_reset(1, PFG_CAM_ZEROED, std::nan("")));
+	// movement evidence: a stale latch expires (still camera after the turn: no reset), a still largest group (Tp ~ 0)
+	// wins over a moving latch, the game VP over the latch, a moving stand-in over a still VP
+	CHECK(pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(-1.0, -1.0, 12.0, PFG_CAM_LATCH)));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(-1.0, -1.0, 12.0, PFG_CAM_LATCH + 1)));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_GUESSED, pfg_cam_moving_px(-1.0, 0.05, 12.0, 1)));
+	CHECK(pfg_cam_reset(1, PFG_CAM_GUESSED, pfg_cam_moving_px(-1.0, -1.0, 12.0, 2)));
+	CHECK(!pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(0.0, -1.0, 12.0, 0)) && pfg_cam_reset(1, PFG_CAM_ZEROED, pfg_cam_moving_px(4.0, -1.0, 0.0, 30)));
+	CHECK(pfg_cam_reset(1, PFG_CAM_GUESSED, pfg_cam_moving_px(0.0, 6.0, 0.0, 0)));
+#endif
 	prev = gen;
 	// pause / short gap: held enabled (as reset frames) for PFG_FX_HOLD - 1 frames, then off
 	int held = 0;
