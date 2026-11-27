@@ -4711,6 +4711,48 @@ static int spu_j403_bad_state_skip(spu_context* ctx)
     g_spu_trampoline_fn = spu_indirect_branch;
     return 1;
 }
+/* Resistance 3 issue #41 (Haven, "Death Squad" / haven_town_ridge): job 406
+ * (igjob_00D9F800, loaded at LS 0x100 under igPm) claims an object under a
+ * lock line (GETLLAR/PUTLLC at 0xEB8..0xF7C), then calls its handler through
+ * a 12-entry table at LS 0xBE00 indexed by the object's state halfword
+ * (bisl $0,$r76 at 0xFC4, lr 0xFC8). An object with a bad state reads past the
+ * table into the job's shuffle constants (0x090A0B0C -> LS 0x20B0C, zeroed),
+ * which the generic path turns into a synthesised `stop` (lr 0xFC8 is below the
+ * 0x4000 job-code window of the bad-call guards) and halts the PM run while the
+ * object's lock is held: the job never finishes, and the next job that needs
+ * that object spins on the lock -- the game froze at the start of Death Squad,
+ * or (reporter) kept running with the object never updated again. Treat it like
+ * a handler that had nothing to do (r3 = 0, as the handlers' early return): the
+ * job releases the lock and finishes. Only for this call site, with the job's
+ * table still in LS. SPU_JOB_BADCALL_SKIP=0 halts as before. */
+static const uint32_t k_j406_be00[12] = {
+    0x35C0u, 0x3698u, 0x3748u, 0x3850u, 0x4578u, 0x4720u, 0x43C0u, 0x4720u, 0x3220u, 0x3250u, 0x31F0u, 0x3250u };
+static int spu_is_bisl_to(const spu_context* ctx, uint32_t lr, uint32_t target);
+static int spu_j406_bad_dispatch_skip(spu_context* ctx)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("SPU_JOB_BADCALL_SKIP"); on = e ? atoi(e) : 1; }
+    if (!on) return 0;
+    const uint32_t tgt = (uint32_t)ctx->pc & SPU_LS_MASK & ~3u;
+    for (int k = 0; k < 12; k++) if (tgt == k_j406_be00[k]) return 0;
+    for (int k = 0; k < 12; k++) if (spu_ls_be32(ctx, 0xBE00u + 4u * (uint32_t)k) != k_j406_be00[k]) return 0;
+    if (!spu_is_bisl_to(ctx, 0xFC8u, tgt)) return 0;
+    static volatile LONG n = 0;
+    const LONG k = InterlockedIncrement(&n);
+    if (k <= 8 || (k & (k - 1)) == 0) {
+        fprintf(stderr, "[spu] WARNING: img=%d job 406 bad object state 0x%04X (handler LS 0x%05X) object ea=0x%08X "
+                        "-- call skipped, job finished (#%ld; SPU_JOB_BADCALL_SKIP=0 halts)\n",
+                ctx->image_id, spu_ls_be32(ctx, 0xC70Cu) >> 16, tgt, ctx->gpr[81]._u32[0], (long)k);
+        for (uint32_t a = 0xC700u; a < 0xC7A0u; a += 16u)
+            fprintf(stderr, "      object LS[0x%05X]: %08X %08X %08X %08X\n", a, spu_ls_be32(ctx, a),
+                    spu_ls_be32(ctx, a + 4u), spu_ls_be32(ctx, a + 8u), spu_ls_be32(ctx, a + 12u));
+        fflush(stderr);
+    }
+    for (int w = 0; w < 4; w++) ctx->gpr[3]._u32[w] = 0;
+    ctx->pc = 0xFC8u;
+    g_spu_trampoline_fn = spu_indirect_branch;
+    return 1;
+}
 void spu_indirect_branch(spu_context* ctx)
 {
     SPU_PROF_ADD(ctx, ib, 1);
@@ -4718,6 +4760,9 @@ void spu_indirect_branch(spu_context* ctx)
     if (__builtin_expect(ctx->policy_mode && ((ctx->gpr[0]._u32[0] & SPU_LS_MASK) == 0xF8F4u ||
                                               (ctx->gpr[0]._u32[0] & SPU_LS_MASK) == 0xF6B0u), 0) &&
         spu_j403_bad_state_skip(ctx))
+        return;
+    if (__builtin_expect(ctx->policy_mode && (ctx->gpr[0]._u32[0] & SPU_LS_MASK) == 0xFC8u, 0) &&
+        spu_j406_bad_dispatch_skip(ctx))
         return;
     {   /* [spu-jobs] job entry (spu_drain.c) */
         extern uint32_t g_sjt_link_a, g_sjt_link_b;
