@@ -277,13 +277,30 @@ extern "C" int r3_fx_dof_aim_skip(uint32_t player)
     last_skip = skip; last_player = player; last_t = t;
     return skip;
 }
+/* R3_FG_MBLUR_SCALE (default 1 = unchanged): multiplies the camera blur strength (p+0x14) and the object blur
+ * sample scale (p+0xC) while frame generation is selected (R3_DLSS_FG / R2_DLSS_FG set and not 0). NVIDIA's DLSS-G
+ * guide asks for half the motion-blur distance with FG on (0.5): blur already in the colour image is interpolated
+ * as smear. Frame generation is a restart setting, so the choice is made once. */
+static void fx_mb_scale(uint32_t ea)
+{
+    static float scale = -1.0f;
+    if (scale < 0.0f) {
+        std::string fg = envs("DLSS_FG", "");
+        if (fg.empty()) { const char* e = getenv("R2_DLSS_FG"); if (e) fg = e; }
+        const std::string v = envs("FG_MBLUR_SCALE", "");
+        scale = 1.0f;
+        if (!fg.empty() && fg != "0" && !v.empty()) scale = std::clamp((float)atof(v.c_str()), 0.0f, 1.0f);
+        if (scale != 1.0f) LOG("[fx] motion blur x%.2f under frame generation (R3_FG_MBLUR_SCALE)", scale);
+    }
+    if (scale != 1.0f && ea && vm_base) fx_setf(ea, fx_getf(ea) * scale);
+}
 extern "C" void r3_fx_pass(int kind, uint32_t p)   /* r3.json hooks, game thread */
 {
     if (!s_fx_init) fx_init();
     switch (kind) {
     case 0: if (!s_fx_grain) fx_zero(p + 0x8); break;
-    case 1: if (!s_fx_mb) fx_zero(p + 0x14); break;
-    case 2: if (!s_fx_mb) fx_zero(p + 0xC); break;
+    case 1: if (!s_fx_mb) fx_zero(p + 0x14); else fx_mb_scale(p + 0x14); break;
+    case 2: if (!s_fx_mb) fx_zero(p + 0xC); else fx_mb_scale(p + 0xC); break;
     case 3: fx_dof_debug(p); if (!s_fx_dof) { fx_zero(p + 0x28); fx_zero(p + 0x38); } break;
     }
 }

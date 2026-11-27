@@ -19587,10 +19587,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..4100a4d
+index 0000000..d7f0dc0
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2665 @@
+@@ -0,0 +1,2817 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -19613,6 +19613,7 @@ index 0000000..4100a4d
 +#include "VKR2Upscaler.h"
 +#include "VKR2PcExtras.h"
 +#include "Emu/RSX/port_r2preload.h" // R2PORT: r2preload::stage_scope (issue #10/#23)
++#include "../../../../../../include/ps3emu/port_latency.h" // port_latency_render_id
 +#include "vkutils/sampler.h"
 +#include "Emu/RSX/rsx_methods.h"
 +#include "Emu/RSX/NV47/HW/context_accessors.define.h"
@@ -19699,6 +19700,7 @@ index 0000000..4100a4d
 +		int backend = 0;       // R2_FG_BACKEND: 0 auto (DLSS-G, else FSR 3), 1 DLSS-G only, 2 FSR 3 only
 +		bool hud = true;       // split the HUD from the scene (R2_DLSS_FG_HUD)
 +		bool hud_debug = false; // tint the detected HUD / overlays on screen (R2_DLSS_FG_HUD_DEBUG)
++		bool hud_hold = true;  // R3_DLSS_FG_HUD_HOLD: frames without a HUD split keep the last split's HUD area as UI
 +		bool debug = false;    // verbose Streamline log (R2_DLSS_FG_DEBUG)
 +		int debug_level = 0;   // R2_DLSS_FG_DEBUG=2: FSR 3 tear lines and reset indicators
 +		bool menu_off = true;  // off while the game's look code is idle (menus, movies, loading)
@@ -19711,6 +19713,12 @@ index 0000000..4100a4d
 +		int limit_fps = 0; // R2_DLSS_FG_LIMIT_FPS: cap on presented fps with DLSS-G on (0 = refresh-based cap); evens out an uneven base rate
 +		unsigned gap = 2; // R?_DLSS_FG_GAP: scene-less frames mid-play that resume without the warm-up (pfg_streak_gap; 0 = old)
 +		int pace = PFG_PACE_VRR; // FSR 3 present pacer (PORT_FG_PACE)
++		// R?_DLSS_FG_REFLEX_IDS: Reflex / PCL frame id of a present. 1: the game frame it shows (finished game frames are
++		// queued at SIMULATION_END, as VKR2PcExtras.cpp's own Reflex markers do); 0: the newest game frame (old). The RSX
++		// thread runs behind the game thread, so the old id labelled a present with the game frame still being simulated
++		// (or one not started yet): Reflex then slept the game thread for the GPU time on top of the frame (ported from R2).
++		int reflex_ids = 1;
++		bool reflex_sleep = true; // R?_DLSS_FG_REFLEX_SLEEP=0: Reflex markers only, no slReflexSleep (A/B)
 +	};
 +
 +	const fg_config& fgcfg()
@@ -19735,6 +19743,8 @@ index 0000000..4100a4d
 +			r.pace = pfg_parse_pace(std::getenv("PORT_FG_PACE"));
 +			r.hud = pfg_hudless(std::getenv("PORT_FG_HUDLESS"), penv_int("DLSS_FG_HUD", 1) != 0);
 +			r.hud_debug = penv_int("DLSS_FG_HUD_DEBUG", 0) != 0;
++			r.hud_hold = penv_int("DLSS_FG_HUD_HOLD", 1) != 0;
++			if (r.want && !r.hud_hold) std::fprintf(stderr, "[fg-vk] DLSS_FG_HUD_HOLD=0 (no HUD hold on frames without a HUD split)\n");
 +			r.debug_level = penv_int("DLSS_FG_DEBUG", 0);
 +			r.debug = r.debug_level != 0;
 +			r.menu_off = penv_int("DLSS_FG_MENU_OFF", 1) != 0;
@@ -19748,6 +19758,10 @@ index 0000000..4100a4d
 +		if (r.limit_fps) std::fprintf(stderr, "[fg-vk] DLSS_FG_LIMIT_FPS=%d (presented frames)\n", r.limit_fps);
 +			if (const char* e = penv("DLSS_FG_DEPTH_SEP")) { const float v = static_cast<float>(std::atof(e)); if (v > 0.f && v < 10000.f) r.depth_sep = v; }
 +			if (r.cam_ident || r.depth_sep != 40.f) std::fprintf(stderr, "[fg-vk] DLSS_FG_CAM_IDENT=%d DLSS_FG_DEPTH_SEP=%.1f\n", r.cam_ident ? 1 : 0, r.depth_sep);
++			r.reflex_ids = penv_int("DLSS_FG_REFLEX_IDS", 1) != 0 ? 1 : 0;
++			r.reflex_sleep = penv_int("DLSS_FG_REFLEX_SLEEP", 1) != 0;
++			if (r.want && (!r.reflex_ids || !r.reflex_sleep))
++				std::fprintf(stderr, "[fg-vk] DLSS_FG_REFLEX_IDS=%d DLSS_FG_REFLEX_SLEEP=%d\n", r.reflex_ids, r.reflex_sleep ? 1 : 0);
 +			return r;
 +		}();
 +		return c;
@@ -20579,14 +20593,15 @@ index 0000000..4100a4d
 +	// draw, FlipIn = the same buffer at flip (scene + HUD), B0 = the swapchain image before the port overlays,
 +	// B1 = after them. a: game rectangle on the swapchain (x, y, w, h); b: uv scale of the used buffer region
 +	// (x, y), swapchain size (z, w); c: HUD threshold, overlay threshold, HUD pixel limit, flags
-+	// (1 = split the HUD this frame, 2 = HDR10 output, 4 = debug view).
++	// (1 = split the HUD this frame, 2 = HDR10 output, 4 = debug view, 8 / 16 = HUD hold record / use);
++	// hd.x: HUD hold time stamp (1/8 s units, >= 1), hd.y: its maximum age in those units.
 +	const char* r2fg_hud_common =
 +		"layout(set=0, binding=0) uniform sampler2D HudIn;\n"
 +		"layout(set=0, binding=1) uniform sampler2D FlipIn;\n"
 +		"layout(set=0, binding=2) uniform sampler2D B0;\n"
 +		"layout(set=0, binding=3) uniform sampler2D B1;\n"
 +		"layout(set=0, binding=4, r32ui) uniform uimage2D Count;\n"
-+		"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; };\n"
++		"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; vec4 hd; };\n"
 +		"float maxdiff(vec3 x, vec3 y) { vec3 d = abs(x - y); return max(d.x, max(d.y, d.z)); }\n"
 +		"bool game_uv(ivec2 p, out vec2 uv)\n"
 +		"{\n"
@@ -20613,7 +20628,7 @@ index 0000000..4100a4d
 +			m_src = std::string("#version 450\nlayout(local_size_x = 8, local_size_y = 8) in;\n") + r2fg_hud_common + body;
 +			ssbo_count = 0;
 +			use_push_constants = true;
-+			push_constants_size = 48;
++			push_constants_size = 64;
 +			create();
 +		}
 +
@@ -20673,6 +20688,7 @@ index 0000000..4100a4d
 +	{
 +		const vk::image_view* out_hudless = nullptr;
 +		const vk::image_view* out_ui = nullptr;
++		const vk::image_view* hold = nullptr;
 +
 +		r2fg_compose_pass()
 +		{
@@ -20680,6 +20696,7 @@ index 0000000..4100a4d
 +			init(
 +				"layout(set=0, binding=5, " + fmt + ") uniform writeonly image2D HudlessOut;\n"
 +				"layout(set=0, binding=6, " + fmt + ") uniform writeonly image2D UiOut;\n"
++				"layout(set=0, binding=7, r32ui) uniform uimage2D Hold;\n"
 +				"void main()\n"
 +				"{\n"
 +				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
@@ -20697,17 +20714,25 @@ index 0000000..4100a4d
 +				"	}\n"
 +				"	vec4 b0 = texelFetch(B0, p, 0);\n"
 +				"	vec4 b1 = texelFetch(B1, p, 0);\n"
++				// R3_DLSS_FG_HUD_HOLD: a split frame the coverage limit accepted records its HUD area with the time stamp hd.x
++				// (flags 8); a frame without one (the classifier was unsure, or the coverage limit tripped) keeps an area
++				// recorded at most hd.y ago as UI (flags 16), see r2fg_hold_mv_pass. Only accepted splits refresh the stamp.
++				"	bool held = false;\n"
++				"	uint now = uint(hd.x + 0.5);\n"
++				"	if (split && (flags & 8u) != 0u) imageStore(Hold, p, uvec4(hud ? now : 0u));\n"
++				"	else if (!split && (flags & 16u) != 0u) { uint h = imageLoad(Hold, p).r; held = h != 0u && now - h <= uint(hd.y + 0.5); }\n"
 +				"	vec3 hl = b0.rgb;\n"
 +				"	vec2 uv;\n"
 +				// SDR: take the HUD's own contribution back out of the presented scene. HDR10 (PQ) is not additive:
 +				// the scene under the HUD keeps the HUD there, the opaque UI layer covers it on every frame.
 +				"	if (hud_c && (flags & 2u) == 0u && game_uv(p, uv))\n"
 +				"		hl = clamp(b0.rgb + textureLod(HudIn, uv, 0.0).rgb - textureLod(FlipIn, uv, 0.0).rgb, 0.0, 1.0);\n"
-+				"	vec4 ui = (hud || ovl) ? vec4(b1.rgb, 1.0) : vec4(0.0);\n"
++				"	vec4 ui = (hud || ovl || held) ? vec4(b1.rgb, 1.0) : vec4(0.0);\n"
 +				"	if ((flags & 4u) != 0u)\n"
 +				"	{\n"
 +				"		vec3 d = b1.rgb;\n"
 +				"		if (hud) d = mix(d, vec3(1.0, 0.0, 1.0), 0.5);\n"
++				"		else if (held) d = mix(d, vec3(1.0, 1.0, 0.0), 0.5);\n"
 +				"		else if (ovl) d = mix(d, vec3(0.0, 1.0, 1.0), 0.5);\n"
 +				"		hl = d;\n"
 +				"	}\n"
@@ -20721,6 +20746,7 @@ index 0000000..4100a4d
 +			auto r = r2fg_hud_pass_base::get_inputs();
 +			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "HudlessOut", vk::glsl::input_type_storage_texture, 0, 5));
 +			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "UiOut", vk::glsl::input_type_storage_texture, 0, 6));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Hold", vk::glsl::input_type_storage_texture, 0, 7));
 +			return r;
 +		}
 +
@@ -20729,6 +20755,66 @@ index 0000000..4100a4d
 +			r2fg_hud_pass_base::bind_resources(cmd);
 +			m_program->bind_uniform({ *out_hudless }, 0, 5);
 +			m_program->bind_uniform({ *out_ui }, 0, 6);
++			m_program->bind_uniform({ *hold }, 0, 7);
++		}
++	};
++
++	// R3_DLSS_FG_HUD_HOLD, on a frame without a HUD split: zero frame generation's motion vectors under the held HUD
++	// area so the HUD still baked into the HUD-less colour is not dragged along with the scene behind it (from R2).
++	// a: game rectangle on the swapchain; b: motion-vector size (w, h), HUD pixel limit, flags (1 = split attempted);
++	// c: the HUD hold time stamp and maximum age (as hd in r2fg_compose_pass).
++	struct r2fg_hold_mv_pass : compute_task
++	{
++		const vk::image_view* count = nullptr;
++		const vk::image_view* hold = nullptr;
++		const vk::image_view* out_mv = nullptr;
++
++		r2fg_hold_mv_pass()
++		{
++			m_src =
++				"#version 450\n"
++				"layout(local_size_x = 8, local_size_y = 8) in;\n"
++				"layout(set=0, binding=0, r32ui) uniform uimage2D Count;\n"
++				"layout(set=0, binding=1, r32ui) uniform uimage2D Hold;\n"
++				"layout(set=0, binding=2, rg16f) uniform writeonly image2D MvOut;\n"
++				"layout(push_constant) uniform PC { vec4 a; vec4 b; vec4 c; };\n"
++				"void main()\n"
++				"{\n"
++				"	ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
++				"	if (p.x >= int(b.x) || p.y >= int(b.y)) return;\n"
++				"	if ((uint(b.w + 0.5) & 1u) != 0u && float(imageLoad(Count, ivec2(0, 0)).r) < b.z) return;\n"
++				"	ivec2 hs = imageSize(Hold);\n"
++				"	ivec2 s = clamp(ivec2(a.xy + (vec2(p) + 0.5) / b.xy * a.zw), ivec2(0), hs - 1);\n"
++				"	uint h = imageLoad(Hold, s).r;\n"
++				"	if (h != 0u && uint(c.x + 0.5) - h <= uint(c.y + 0.5)) imageStore(MvOut, p, vec4(0.0));\n"
++				"}\n";
++			ssbo_count = 0;
++			use_push_constants = true;
++			push_constants_size = 48;
++			create();
++		}
++
++		std::vector<glsl::program_input> get_inputs() override
++		{
++			auto r = compute_task::get_inputs();
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Count", vk::glsl::input_type_storage_texture, 0, 0));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "Hold", vk::glsl::input_type_storage_texture, 0, 1));
++			r.push_back(glsl::program_input::make(::glsl::program_domain::glsl_compute_program, "MvOut", vk::glsl::input_type_storage_texture, 0, 2));
++			return r;
++		}
++
++		void bind_resources(const vk::command_buffer&) override
++		{
++			m_program->bind_uniform({ *count }, 0, 0);
++			m_program->bind_uniform({ *hold }, 0, 1);
++			m_program->bind_uniform({ *out_mv }, 0, 2);
++		}
++
++		void run(const vk::command_buffer& cmd, const float* k, u32 w, u32 h)
++		{
++			if (!m_program) load_program(cmd);
++			vkCmdPushConstants(cmd, m_program->layout(), VK_SHADER_STAGE_COMPUTE_BIT, 0, push_constants_size, k);
++			compute_task::run(cmd, (w + 7) / 8, (h + 7) / 8, 1);
 +		}
 +	};
 +}
@@ -20772,6 +20858,10 @@ index 0000000..4100a4d
 +
 +		// present phases
 +		image_ptr b0, b1, hudless, ui, count;
++		// R3_DLSS_FG_HUD_HOLD: HUD area of the last accepted split (swapchain-sized r32ui time stamps, 1/8 s units
++		// since hold_base); hold_ms: the last CPU-side split attempt
++		image_ptr hold;
++		unsigned long long hold_ms = 0, hold_base = 0;
 +		VkFormat out_fmt = VK_FORMAT_UNDEFINED;
 +		bool have_b0 = false, have_ui = false, split = false;
 +		s32 rx = 0, ry = 0, rwid = 0, rhei = 0; // game rectangle on the swapchain
@@ -20794,6 +20884,25 @@ index 0000000..4100a4d
 +		std::mutex mu;
 +		u32 sim_id = 0, present_id = 0, cur_rid = 0;
 +		bool sim_open = false, render_open = false;
++		u32 done_ids[8] = {};           // finished game frames not presented yet (R?_DLSS_FG_REFLEX_IDS=1)
++		u32 done_head = 0, done_tail = 0;
++
++		// id of the present that is starting (f.mu held)
++		u32 render_id()
++		{
++			const u32 old = std::max(present_id + 1, sim_id);
++			if (!fgcfg().reflex_ids) return old;
++			while (done_tail != done_head && done_ids[done_tail % 8] <= present_id) ++done_tail;
++			const bool queued = done_tail != done_head;
++			const u32 id = static_cast<u32>(port_latency_render_id(queued, queued ? done_ids[done_tail % 8] : 0, sim_id, present_id));
++			// Streamline tags every present (frame generation needs the token): no finished frame -> the old id
++			return id ? id : old;
++		}
++		void sim_done(u32 id)
++		{
++			if (done_head - done_tail >= 8) ++done_tail;
++			done_ids[done_head++ % 8] = id;
++		}
 +
 +		// menu detection: last camera change (tag_scene) / last mouse or right-stick input
 +		unsigned long long cam_ms = 0, input_ms = 0;
@@ -20832,7 +20941,7 @@ index 0000000..4100a4d
 +	{
 +		auto& f = g_fg;
 +		f.depth.reset(); f.mv.reset(); f.hud.reset();
-+		f.b0.reset(); f.b1.reset(); f.hudless.reset(); f.ui.reset(); f.count.reset();
++		f.b0.reset(); f.b1.reset(); f.hudless.reset(); f.ui.reset(); f.count.reset(); f.hold.reset();
 +		f.scene = f.hud_started = f.have_b0 = f.ready = false;
 +	}
 +
@@ -20938,7 +21047,7 @@ index 0000000..4100a4d
 +	if (sl_device() && g_sl.reflex && !f.render_open)
 +	{
 +		std::lock_guard lk(f.mu);
-+		f.cur_rid = std::max(f.present_id + 1, f.sim_id);
++		f.cur_rid = f.render_id();
 +		sl::FrameToken* tok = nullptr;
 +		if (g_sl.fn_token(tok, &f.cur_rid) == sl::Result::eOk && tok) g_sl.fn_marker(sl::PCLMarker::eRenderSubmitStart, *tok);
 +		f.render_open = true;
@@ -21132,6 +21241,33 @@ index 0000000..4100a4d
 +		const bool split = fgcfg().hud && f.hud && f.hud_rt == src && !f.unsure && f.hud_draws &&
 +			f.hud->info.format == src->info.format && f.hud->width() == src->width() && f.hud->height() == src->height();
 +
++		// R3_DLSS_FG_HUD_HOLD (ported from R2): the HUD area of the last split frame the GPU accepted (under 2 s old)
++		// stays UI on frames without one, and frame generation's motion vectors there are zeroed. Without it such a
++		// frame hands DLSS-G a HUD-less colour that still holds the HUD, with the scene's motion under it: the
++		// generated frames drag the HUD. The age is checked on the GPU against the stamp each accepted split writes
++		// (r2fg_compose_pass); hold_ms (the last CPU-side split attempt) skips the hold passes once no split was even
++		// tried for 2 s.
++		const unsigned long long t_now = now_ms();
++		const bool hold_on = fgcfg().hud_hold && fgcfg().hud;
++		{
++			vk::viewable_image* old = f.hold.get();
++			fg_ensure(f.hold, VK_FORMAT_R32_UINT, hold_on ? W : 1, hold_on ? H : 1, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++			// stamps stay exact in a float push constant: restart (clear) long before 2^24
++			if (f.hold.get() != old || (t_now - f.hold_base) / 125 > (1u << 22))
++			{
++				f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++				const VkClearColorValue z{};
++				vkCmdClearColorImage(cmd, f.hold->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &k_color_range);
++				f.hold_ms = 0;
++				f.hold_base = t_now;
++			}
++			f.hold->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
++		}
++		const bool hold_use = hold_on && f.hold_ms && t_now - f.hold_ms < 2000;
++		if (hold_on && split) f.hold_ms = t_now;
++		const float hold_stamp = static_cast<float>((t_now - f.hold_base) / 125 + 1);
++		constexpr float hold_max_age = 15.f; // 1/8 s units: elapsed < 2 s since the last accepted split
++
 +		f.count->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 +		const VkClearColorValue zero{};
 +		vkCmdClearColorImage(cmd, f.count->value, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &k_color_range);
@@ -21139,13 +21275,14 @@ index 0000000..4100a4d
 +		src->push_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 +
 +		const float rect_w = static_cast<float>(x2 - x1), rect_h = static_cast<float>(y2 - y1);
-+		const float k[12] = {
++		const float k[16] = {
 +			static_cast<float>(x1), static_cast<float>(y1), rect_w, rect_h,
 +			static_cast<float>(std::min(buffer_w, src->width())) / static_cast<float>(src->width()),
 +			static_cast<float>(std::min(buffer_h, src->height())) / static_cast<float>(src->height()),
 +			static_cast<float>(W), static_cast<float>(H),
 +			0.5f / 255.f, 0.25f / 1023.f, 0.3f * rect_w * rect_h,
-+			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0)) };
++			static_cast<float>((split ? 1 : 0) | (hdr10 ? 2 : 0) | (f.debug_view ? 4 : 0) | (hold_on ? 8 : 0) | (hold_use ? 16 : 0)),
++			hold_stamp, hold_max_age, 0.f, 0.f };
 +		const auto bind = [&](vk::r2fg_hud_pass_base* pass)
 +		{
 +			pass->in[0] = split ? fg_view(f.hud.get()) : fg_view(f.b0.get());
@@ -21168,12 +21305,26 @@ index 0000000..4100a4d
 +			bind(pass);
 +			pass->out_hudless = fg_view(f.hudless.get());
 +			pass->out_ui = fg_view(f.ui.get());
++			pass->hold = fg_view(f.hold.get());
 +			pass->run(cmd, k, W, H);
 +		};
 +		if (hdr10) compose(vk::get_compute_task<vk::r2fg_compose_pass<true>>());
 +		else compose(vk::get_compute_task<vk::r2fg_compose_pass<false>>());
 +		src->pop_layout(cmd);
 +		f.ui->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++		if (hold_use && f.mv && f.rw && f.rh)
++		{
++			vk::insert_global_memory_barrier(cmd);
++			f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_GENERAL);
++			auto pass = vk::get_compute_task<vk::r2fg_hold_mv_pass>();
++			pass->count = fg_view(f.count.get());
++			pass->hold = fg_view(f.hold.get());
++			pass->out_mv = fg_view(f.mv.get());
++			const float km[12] = { k[0], k[1], k[2], k[3], static_cast<float>(f.rw), static_cast<float>(f.rh), k[10], split ? 1.f : 0.f,
++				hold_stamp, hold_max_age, 0.f, 0.f };
++			pass->run(cmd, km, f.rw, f.rh);
++			f.mv->change_layout(cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++		}
 +
 +		if (f.debug_view)
 +		{
@@ -21484,7 +21635,7 @@ index 0000000..4100a4d
 +		sl::FrameToken* tok = nullptr;
 +		{
 +			std::lock_guard lk(f.mu);
-+			if (!f.render_open) f.cur_rid = std::max(f.present_id + 1, f.sim_id);
++			if (!f.render_open) f.cur_rid = f.render_id();
 +			if (g_sl.fn_token(tok, &f.cur_rid) != sl::Result::eOk) tok = nullptr;
 +			if (f.render_open) sl_marker(sl::PCLMarker::eRenderSubmitEnd, tok);
 +			sl_marker(sl::PCLMarker::ePresentStart, tok);
@@ -22178,12 +22329,13 @@ index 0000000..4100a4d
 +		std::lock_guard lk(f.mu);
 +		sl::FrameToken* tok = nullptr;
 +		if (f.sim_open && g_sl.fn_token(tok, &f.sim_id) == sl::Result::eOk && tok) sl_marker(sl::PCLMarker::eSimulationEnd, tok);
++		if (f.sim_open) f.sim_done(f.sim_id);
 +		f.sim_open = false;
 +		f.sim_id = std::max(f.sim_id + 1, f.present_id + 1);
 +		id = f.sim_id;
 +	}
 +	sl::FrameToken* tok = nullptr;
-+	if (g_sl.fn_token(tok, &id) == sl::Result::eOk && tok)
++	if (fgcfg().reflex_sleep && g_sl.fn_token(tok, &id) == sl::Result::eOk && tok)
 +	{
 +		const double t0 = r2fgdiag::on() ? r2fgdiag::now_ms() : 0.0;
 +		g_sl.fn_r_sleep(*tok);
@@ -29184,10 +29336,10 @@ index 0000000..3cb23c0
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..5178015
+index 0000000..027c8e9
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12166 @@
+@@ -0,0 +1,12394 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -29700,6 +29852,20 @@ index 0000000..5178015
 +		bool camera_exact = true;
 +		// RSX_DLSS_OBJMV_NONAFFINE (default 1; 0 = old): see om_classify (wind-swayed foliage got camera motion only)
 +		bool om_nonaffine = true;
++		// RSX_DLSS_OBJMV_SWAY (default 1; 0 = old): see om_sway_moves (attribute-weighted wind sway got camera motion only)
++		bool om_sway = true;
++		// RSX_DLSS_OBJMV_LOCKED (default 1; 0 = old): see om_locked (camera-locked first-person meshes got camera motion)
++		bool om_locked = true;
++		// RSX_DLSS_OBJMV_MULTI (default 1; 0 = old): onepass also covers multi-range draws (one clause drawn as several index
++		// ranges) and trivially instanced draws: they are issued right after the velocity variant is bound, all with it, so
++		// they get their own velocity too (they were skipped: camera motion only). Instanced constants stay skipped (one
++		// constants history per draw).
++		bool om_multi = true;
++		// RSX_DLSS_OBJMV_DEFORM_REBASE (default 1; 0 = old): a CPU/SPU-rewritten mesh whose last-frame vertex copy has the same
++		// attribute layout, vertex count and size but another vertex range / base (the mesh written elsewhere in the
++		// game's buffers) uses that copy: vertex k of the copy is vertex k of this draw (vertex_id = index - vertex base).
++		// It used to fall back to camera motion ("layout" in the objmv2 detail line).
++		bool om_rebase = true;
 +		// RSX_DLSS_OBJMV_PAIR_NEAREST (default 16; 0 = off): a matched skinned or non-affine draw whose constants changed
 +		// since its ordinal pair is re-paired with the closest previous occurrence of the same draw within +-n ordinals
 +		// (r2om_pair_nearest: R2 1120 foliage drawn as instances of one mesh paired with the neighbouring instance's bone
@@ -29734,7 +29900,7 @@ index 0000000..5178015
 +		// this many render pixels is written as exactly zero (float noise of the per-draw previous-frame evaluation)
 +		float om_deadzone = 0.01f;
 +		// RSX_AA_EVALS (default 2048; 1024 / 640 before, 384 originally): scene draws captured per frame (matrix vote + object motion)
-+		u32 evals_max = 2048; // RSX_AA_EVALS 16..4096; was 1024 (R3 t2: draw-cap in 239 of 278 frames: later moving draws got camera motion only, the vote saw part of the frame); 640 before: R2 jungle intro / R3 battles hit it every frame (later draws: no capture, no object motion)
++		u32 evals_max = 4096; // RSX_AA_EVALS 16..4096 (RSX_AA_EVALS=2048: the previous default; FB3 run.log iceland: draw cap hit in 193 of 1040 frames, the later draws got camera motion only); was 1024 (R3 t2: draw-cap in 239 of 278 frames: later moving draws got camera motion only, the vote saw part of the frame); 640 before: R2 jungle intro / R3 battles hit it every frame (later draws: no capture, no object motion)
 +		// RSX_AA_VOTE_ROBUST=1 (default 0; R2's camera-vote fix, opt-in on R3 until checked in game) sets the defaults
 +		// of the next three and of RSX_AA_EXACT_WEAK to R2's values; each can still be set on its own.
 +		// RSX_AA_VOTE_HOLD=<n> (default 6; R2: 1; -1 = forever): frames a failed camera vote keeps the last voted
@@ -29784,6 +29950,11 @@ index 0000000..5178015
 +		// are copied to the history at the flip, so it has its own velocity from the next frame (as inline classification).
 +		int om_defer = 1;
 +		bool om_defer_hist = true;
++		// RSX_AA_OBJMV_DEFER_HOLD (default 8; 0 = old): a draw that moved in any of the last n frames is not predicted
++		// static. Objects the game moves on alternate frames (30 Hz animation at 60 fps, doors, swaying foliage instances)
++		// were static last frame on every moving frame: each move was a late start with camera motion only (R2 FB3/FB6/FB7
++		// run.log: 30-40 late starts per frame).
++		u32 om_defer_hold = 8;
 +		// RSX_AA_FAST_EXIT (default: on with RSX_AA_OBJMV_DEFER; 1 / 0 force): a draw outside the scene surfaces with the
 +		// targets, depth / stencil / colour state and frame state of the previous draw, which needed nothing (no jitter,
 +		// no capture, no run), returns right after the target tally.
@@ -30057,6 +30228,10 @@ index 0000000..5178015
 +			if (const char* e = std::getenv("RSX_AA_MATCH_LOOSE")) r.match_loose = std::clamp(std::atoi(e), 0, 2);
 +		if (const char* e = std::getenv("RSX_AA_CAMERA_EXACT")) r.camera_exact = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_NONAFFINE")) r.om_nonaffine = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_SWAY"); e && *e) r.om_sway = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_LOCKED"); e && *e) r.om_locked = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_MULTI"); e && *e) r.om_multi = std::atoi(e) != 0;
++		if (const char* e = std::getenv("RSX_DLSS_OBJMV_DEFORM_REBASE"); e && *e) r.om_rebase = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_DLSS_OBJMV_PAIR_NEAREST"); e && *e) r.om_pair_near = static_cast<u32>(std::clamp(std::atoi(e), 0, 64));
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_SPEC"); e && *e) r.om_late_spec = *e != '0';
 +		if (const char* e = std::getenv("RSX_AA_STATIC_SNAP"); e && *e) r.static_snap = std::atoi(e) != 0;
@@ -30093,6 +30268,7 @@ index 0000000..5178015
 +			if (const char* e = std::getenv("RSX_DLSS_OBJMV_FAST_STATIC"); e && *e) r.om_fast_static = std::atoi(e) != 0;
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER"); e && *e) r.om_defer = std::clamp(std::atoi(e), 0, 2);
 +		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_HIST"); e && *e) r.om_defer_hist = *e != '0';
++		if (const char* e = std::getenv("RSX_AA_OBJMV_DEFER_HOLD"); e && *e) r.om_defer_hold = static_cast<u32>(std::clamp(std::atoi(e), 0, 250));
 +		if (const char* e = std::getenv("RSX_AA_FAST_EXIT"); e && *e) r.fast_exit = std::atoi(e) != 0 ? 1 : 0;
 +			if (const char* e = std::getenv("RSX_DLSS_OBJMV_NEW_HIST")) r.om_new_hist = static_cast<u32>(std::max(0, std::min(100, std::atoi(e))));
 +			if (const char* e = std::getenv("RSX_DLSS_OBJMV_PREWARM"); e && *e) r.om_prewarm = std::atoi(e) != 0;
@@ -30336,6 +30512,8 @@ index 0000000..5178015
 +	// does exactly the arithmetic a separate single-point run would do. Control flow depends only on the branch
 +	// bits (condition-code tests are not interpreted), so all lanes follow the same path.
 +	constexpr int VPL = 5;
++	// RSX_DLSS_OBJMV_SWAY: value every non-position input reads during vp_run on this thread (nullptr = zero, the default)
++	thread_local const float* t_vp_attr = nullptr;
 +
 +	struct vp_code
 +	{
@@ -30444,7 +30622,7 @@ index 0000000..5178015
 +					if (d1.input_src == 0)
 +						for (int l = 0; l < VPL; ++l) put(v[l], in0[l]);
 +					else
-+						put_all(zero);
++						put_all(t_vp_attr ? t_vp_attr : zero);
 +					break;
 +				case RSX_VP_REGISTER_TYPE_CONSTANT:
 +					if (!d3.index_const)
@@ -30674,7 +30852,7 @@ index 0000000..5178015
 +					switch (s.reg_type)
 +					{
 +					case RSX_VP_REGISTER_TYPE_TEMP: p = ((rinit >> s.tmp_src) & 1) ? r[s.tmp_src][l] : zero; break;
-+					case RSX_VP_REGISTER_TYPE_INPUT: p = d1.input_src == 0 ? in0[l] : zero; break;
++					case RSX_VP_REGISTER_TYPE_INPUT: p = d1.input_src == 0 ? in0[l] : (t_vp_attr ? t_vp_attr : zero); break;
 +					case RSX_VP_REGISTER_TYPE_CONSTANT:
 +						if (!d3.index_const)
 +						{
@@ -30891,6 +31069,11 @@ index 0000000..5178015
 +		mutable u8 om_rows_sep = 0, om_rows_whole = 0;
 +		// RSX_DLSS_OBJMV_DEFORM_NEW: a paired draw of this program had rewritten vertex data (CPU / SPU deformed mesh)
 +		mutable u8 om_deforms = 0;
++		// RSX_DLSS_OBJMV_SWAY: 0 unknown, 1 position independent of the other inputs (after om_attr_n checks), 2 dependent;
++		// om_attr_quiet: dependent checks in a row that found no own motion, om_attr_next: frame of the next check after a quiet run
++		mutable u8 om_attr = 0, om_attr_n = 0;
++		mutable u16 om_attr_quiet = 0;
++		mutable u32 om_attr_next = 0;
 +		vp_code code() const { return { data.data(), static_cast<u32>(data.size() / 4), pc0 }; }
 +	};
 +
@@ -32247,7 +32430,10 @@ index 0000000..5178015
 +		// RSX_DLSS_OBJMV_DEFORM: its persistent vertex stream copied (with the om_hslot copy) to the deform history
 +		u32 om_doff = 0, om_dsize = 0; // offset in the history buffer, bytes (0: none)
 +		u64 om_dkey = 0;               // vertex layout + range
++		u64 om_dlkey = 0;              // RSX_DLSS_OBJMV_DEFORM_REBASE: vertex layout only
++		u32 om_dcnt = 0;               // vertices copied
 +		u8 om_dage = 255;              // RSX_DLSS_OBJMV_DEFORM_CARRY: frames since its vertex data last changed (255: never seen changing)
++		u8 om_mage = 255;              // RSX_AA_OBJMV_DEFER_HOLD: frames since it last moved (255: never seen moving)
 +		const void* vkvp = nullptr; // the VKVertexProgram that drew it
 +		m4 M;
 +	};
@@ -32446,7 +32632,8 @@ index 0000000..5178015
 +		float om_vh = 0.f;             // the scene viewport height, set by scene draws only (!aa_done): om_pick_nearest reads it
 +		                               // after the scene (RSX_AA_OBJMV_DEFER) while post passes rewrite vh
 +		std::vector<u32> om_defer_q;   // RSX_AA_OBJMV_DEFER: cur_F entries predicted static, classified after the scene
-+		u32 om_def_draws = 0, om_late_start = 0, om_def_frames = 0;
++		u32 om_def_draws = 0, om_late_start = 0, om_def_frames = 0, om_def_held = 0; // om_def_held: RSX_AA_OBJMV_DEFER_HOLD
++		u32 om_ls_age[3] = {}; // late starts by frames since the draw last moved: 2 (alternate frames), 3-8, longer / never
 +		u64 om_def_ns = 0;
 +		bool fast_ok = false;          // RSX_AA_FAST_EXIT: the previous draw needed nothing
 +		u64 fast_sig = 0;
@@ -32552,6 +32739,8 @@ index 0000000..5178015
 +		u32 om_loose = 0, om_loose_bad = 0; // classifier: loose pairs, loose pairs rejected (implausible motion)
 +		u32 om_nw_n = 0;              // RSX_DLSS_OBJMV_NOWRITE: matched non-depth-writing draws given their own velocity
 +		u32 om_nonaffine = 0;          // RSX_DLSS_OBJMV_NONAFFINE: matched draws without a matrix whose constants changed (moving)
++		u32 om_sway_n = 0, om_locked_n = 0; // RSX_DLSS_OBJMV_SWAY / _LOCKED: draws given their own velocity
++		u32 om_sway_frame = 0, om_sway_runs = 0, om_sway_chk = 0; // RSX_DLSS_OBJMV_SWAY: probe checks this frame (bounded) / per log window
 +		u32 om_pn_checked = 0, om_pn_repaired = 0, om_pn_static = 0; // RSX_DLSS_OBJMV_PAIR_NEAREST
 +		u32 vote_fail_logged = 0;
 +		// RSX_AA_CAMERA_EXACT (since the last fps line, except ex_proven)
@@ -33595,6 +33784,112 @@ index 0000000..5178015
 +		return true;
 +	}
 +
++	// RSX_DLSS_OBJMV_SWAY (default 1; 0 = old): wind sway weighted by a vertex attribute (position + colour.a * sin(t) *
++	// dir) vanished from the matrix extraction (it feeds only the position, every other input reads zero), so the draw's
++	// matrix moved exactly like the camera and it got camera motion only, while the onepass redraw runs the real shader
++	// on the real attributes. Runs the program with every other input at a probe value on both frames' constants: when
++	// last frame's output is not this frame's carried by r (the draw's position-only motion), the attribute-dependent
++	// part moved on its own -> own velocity. A static attribute term (normal offset) moves with r and stays static.
++	bool om_sway_moves(const mvp_entry& e, const mvp_entry& p, const m4& r)
++	{
++		if (!r2cfg().om_sway || e.prog->indexed || p.prog != e.prog || p.branch_bits != e.branch_bits || e.state != 1) return false;
++		const vp_info& pi = *e.prog;
++		auto& st = g_r2;
++		if (pi.om_attr == 1 || (pi.om_attr == 2 && st.frame < pi.om_attr_next)) return false;
++		// bounded CPU cost: the probe runs the vertex program twice (FB3 run.log: unbounded, objmv cpu 1-5.5 ms/frame)
++		if (st.om_sway_frame != st.frame)
++		{
++			st.om_sway_frame = st.frame;
++			st.om_sway_runs = 0;
++		}
++		if (st.om_sway_runs >= 64) return false;
++		st.om_sway_runs++;
++		st.om_sway_chk++;
++		static const float pts[VPL][4] = { {0, 0, 0, 1}, {1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}, {0.37f, -1.3f, 2.1f, 1} };
++		static const float probe[4] = { 0.73f, 0.41f, 0.59f, 1.f };
++		alignas(16) thread_local float buf[512 * 4];
++		const auto run = [&](const mvp_frame& f, const mvp_entry& x, float out[VPL][4]) -> bool
++		{
++			const float* src = f.consts.data() + x.const_off;
++			for (usz k = 0; k < pi.reads.size(); ++k) std::memcpy(buf + pi.reads[k] * 4, src + k * 4, 4 * sizeof(float));
++			t_vp_attr = probe;
++			const bool ok = vp_run(pi.code(), buf, x.branch_bits, pts, out);
++			t_vp_attr = nullptr;
++			return ok;
++		};
++		float qe[VPL][4], qp[VPL][4];
++		if (!run(g_r2.cur_F, e, qe)) return false;
++		if (pi.om_attr == 0)
++		{
++			// does the position depend on the other inputs at all? (e.M is the zero-input run)
++			double mx = 0, d = 0;
++			for (int l = 0; l < VPL; ++l)
++				for (int k = 0; k < 4; ++k)
++				{
++					double z = e.M.m[k][3];
++					for (int c = 0; c < 3; ++c) z += e.M.m[k][c] * pts[l][c];
++					mx = std::fmax(mx, std::fabs(z));
++					d = std::fmax(d, std::fabs(z - qe[l][k]));
++				}
++			if (!(d > 1e-4 * (1.0 + mx)))
++			{
++				if (++pi.om_attr_n >= 8) pi.om_attr = 1;
++				return false;
++			}
++			pi.om_attr = 2;
++		}
++		if (!run(g_r2.prev_F, p, qp)) return false;
++		const double eps = std::fmax(r2cfg().om_static_px, 0.25f) / std::fmax(g_r2.om_vh, 1.f);
++		for (int l = 0; l < VPL; ++l)
++		{
++			double a[4];
++			for (int k = 0; k < 4; ++k)
++				a[k] = r.m[k][0] * qe[l][0] + r.m[k][1] * qe[l][1] + r.m[k][2] * qe[l][2] + r.m[k][3] * qe[l][3];
++			if (!(a[3] > 1e-9) || !(qp[l][3] > 1e-9)) continue;
++			const double d = std::hypot(a[0] / a[3] - qp[l][0] / qp[l][3], a[1] / a[3] - qp[l][1] / qp[l][3]) * 0.5;
++			if (std::isfinite(d) && d > eps)
++			{
++				pi.om_attr_quiet = 0;
++				return true;
++			}
++		}
++		// a static attribute term (normal offset, packed position): after 32 quiet checks, look again in 120 frames
++		if (++pi.om_attr_quiet >= 32)
++		{
++			pi.om_attr_quiet = 0;
++			pi.om_attr_next = st.frame + 120;
++		}
++		return false;
++	}
++
++	// RSX_DLSS_OBJMV_LOCKED (default 1; 0 = old): a first-person mesh (weapon, arms) drawn with its own view-space
++	// transform keeps the same constants while the camera turns: it stands still on screen, but camera motion (from its
++	// depth) gave it the world's motion, so frame generation smeared the background around the gun. A matched draw whose
++	// constants are all identical to its pair's while the camera moved gets its own velocity (zero). Skinned (indexed)
++	// draws only: a non-indexed one with identical constants already gets its own velocity from om_pick_nearest / the vote.
++	bool om_cam_moved()
++	{
++		auto& st = g_r2;
++		if (st.om_cam_cur && st.prev_F.cam_h) return st.om_cam_cur != st.prev_F.cam_h;
++		if (!st.om_nclus) return false;
++		u32 best = 0;
++		for (u32 c = 1; c < st.om_nclus; ++c) if (st.om_clus[c].n > st.om_clus[best].n) best = c;
++		if (st.om_clus[best].n < 3) return false;
++		const m4& R = st.om_clus[best].R;
++		return m4_maxdiff(R, m4_identity()) > 1e-5 * (1.0 + m4_maxabs(R));
++	}
++	bool om_locked(const mvp_entry& e, const mvp_entry& p)
++	{
++		auto& st = g_r2;
++		if (!r2cfg().om_locked || !e.prog->indexed || p.prog != e.prog || p.branch_bits != e.branch_bits) return false;
++		// the frame stores only the constants the program reads (pi.reads), packed per draw
++		const usz n = e.prog->reads.size();
++		if (!n || e.const_off + n * 4 > st.cur_F.consts.size() || p.const_off + n * 4 > st.prev_F.consts.size()) return false;
++		if (std::memcmp(st.cur_F.consts.data() + e.const_off, st.prev_F.consts.data() + p.const_off, n * 4 * sizeof(float)) != 0)
++			return false;
++		return om_cam_moved();
++	}
++
 +	// RSX_DLSS_OBJMV: classify a depth-writing scene draw right after its capture. Draws that may need their own
 +	// motion (or the bias mask) get om_want flags; r2aa_objmv_after_draw redraws them into the ID target.
 +	void om_classify(u32 i, const om_finds* hint = nullptr)
@@ -33744,6 +34039,11 @@ index 0000000..5178015
 +					e.om |= om_skin;
 +					return;
 +				}
++			if (om_locked(e, p))
++			{
++				e.om |= om_rigid;
++				st.om_locked_n++;
++			}
 +			return;
 +		}
 +		if (!resolve_entry(st.cur_F, i) || !resolve_entry(st.prev_F, *pp))
@@ -33793,6 +34093,12 @@ index 0000000..5178015
 +			{
 +				if (m4_maxdiff(Rx, r) <= 1e-3 * (1.0 + m4_maxabs(r)))
 +				{
++					if (om_sway_moves(e, p, r))
++					{
++						e.om |= om_rigid;
++						st.om_sway_n++;
++						return;
++					}
 +					st.om_nr_exact++;
 +					st.om_nr_static++;
 +					return;
@@ -33890,6 +34196,11 @@ index 0000000..5178015
 +			}
 +			e.om |= om_rigid;
 +		}
++		else if (om_sway_moves(e, p, r))
++		{
++			e.om |= om_rigid;
++			st.om_sway_n++;
++		}
 +	}
 +
 +	// RSX_DLSS_OBJMV=1 (v2, see r2_config::objmv): draws recorded during the frame, redrawn once by om2_replay
@@ -33949,6 +34260,8 @@ index 0000000..5178015
 +		u32 dg_nohash = 0, dg_same = 0, dg_noprev = 0, dg_stream = 0, dg_budget = 0, t_new_refused = 0, n_new_hist = 0;
 +		u32 t_slot_full = 0; // moving draws refused a history slot because all o.cap were taken
 +		u32 dn_new = 0, dg_new = 0, dg_new_bytes = 0, dm_id = 0, dm_np_unp = 0, dm_np_first = 0, dm_np_aged = 0, dm_at = 0; // RSX_DLSS_OBJMV_DEFORM_NEW / no-previous-copy reasons / alpha-tested fallbacks
++		u32 dm_key_lay = 0, dm_key_cnt = 0, dm_key_base = 0, dm_rebase = 0; // "layout" fallbacks: attribute layout / vertex count or size / range only; RSX_DLSS_OBJMV_DEFORM_REBASE uses
++		u32 sk_ds = 0, sk_multi = 0, sk_inst = 0, sk_iconst = 0, sk_cond = 0, sk_blend = 0, sk_misc = 0, op_multi = 0; // velocity redraw skipped: why; RSX_DLSS_OBJMV_MULTI draws
 +		u32 dg_carry = 0, dm_noprev = 0, dm_key = 0, dm_hist = 0, dm_nocap = 0; // RSX_DLSS_OBJMV_DEFORM_CARRY / fallback reasons
 +		bool vel_live = false;        // R3: vel was cleared this frame (a segment replay already wrote into it)
 +		// counters: this frame / since the last fps line
@@ -34031,6 +34344,11 @@ index 0000000..5178015
 +		if (p.prog != e.prog || !(p.om & om_matched) || (p.om & (om_new | om_skin | om_dyn | om_rigid)) || p.om_hslot || p.om_dsize ||
 +			p.om_dage <= r2cfg().om_deform_carry)
 +			return false;
++		if (p.om_mage < r2cfg().om_defer_hold)
++		{
++			st.om_def_held++;
++			return false;
++		}
 +		e.om = static_cast<decltype(e.om)>(e.om | om_matched);
 +		e.prev = *pp;
 +		e.loose = loose;
@@ -34420,7 +34738,12 @@ index 0000000..5178015
 +			e.om = static_cast<decltype(e.om)>(e.om & ~(om_matched | om_new));
 +			e.loose = false;
 +			om_classify(i);
-+			if (e.om & (om_skin | om_rigid)) st.om_late_start++;
++			if (e.om & (om_skin | om_rigid))
++			{
++				st.om_late_start++;
++				const u32 pm = e.prev < st.prev_F.e.size() ? st.prev_F.e[e.prev].om_mage : 255u;
++				st.om_ls_age[pm <= 1 ? 0 : pm <= 7 ? 1 : 2]++;
++			}
 +		}
 +		st.om_def_draws += size32(st.om_defer_q);
 +		st.om_def_frames++;
@@ -36698,6 +37021,16 @@ index 0000000..5178015
 +		}
 +
 +		// Next frame
++		// RSX_AA_OBJMV_DEFER_HOLD: frames since each draw last moved (after om_defer_late_flush classified the deferred ones)
++		if (r2cfg().om_defer)
++		{
++			const u32 np = size32(st.prev_F.e);
++			for (auto& e : st.cur_F.e)
++			{
++				if (e.om & (om_skin | om_rigid | om_dyn)) e.om_mage = 0;
++				else if ((e.om & om_matched) && e.prev < np) e.om_mage = static_cast<u8>(std::min<u32>(st.prev_F.e[e.prev].om_mage + 1u, 255u));
++			}
++		}
 +		g_evp_swaps++; // RSX_AA_EXACT_MEMO
 +		st.prev_F.e.swap(st.cur_F.e);
 +		st.prev_F.consts.swap(st.cur_F.consts);
@@ -37016,7 +37349,16 @@ index 0000000..5178015
 +				o.dg_nohash = o.dg_same = o.dg_noprev = o.dg_stream = o.dg_budget = 0;
 +				o.dg_carry = o.dm_noprev = o.dm_key = o.dm_hist = o.dm_nocap = 0;
 +				o.dm_np_unp = o.dm_np_first = o.dm_np_aged = o.dm_at = o.dg_new = o.dg_new_bytes = o.dm_id = 0;
++				r2log("objmv2 fallbacks: velocity redraw skipped: other depth target %u, multi-range %u, instanced %u, instanced constants %u, conditional render %u, programmable blending %u, other %u; multi-range / instanced draws given velocity %u (RSX_DLSS_OBJMV_MULTI=%d); deform layout fallback: attribute layout %u, vertex count / size %u, range only %u; range-moved copies used %u (RSX_DLSS_OBJMV_DEFORM_REBASE=%d)",
++					o.sk_ds, o.sk_multi, o.sk_inst, o.sk_iconst, o.sk_cond, o.sk_blend, o.sk_misc, o.op_multi, r2cfg().om_multi ? 1 : 0,
++					o.dm_key_lay, o.dm_key_cnt, o.dm_key_base, o.dm_rebase, r2cfg().om_rebase ? 1 : 0);
++				o.sk_ds = o.sk_multi = o.sk_inst = o.sk_iconst = o.sk_cond = o.sk_blend = o.sk_misc = o.op_multi = 0;
++				o.dm_key_lay = o.dm_key_cnt = o.dm_key_base = o.dm_rebase = 0;
 +				st.om_loose = st.om_loose_bad = st.om_nonaffine = 0;
++				if ((r2cfg().om_sway || r2cfg().om_locked) && (st.om_sway_n || st.om_locked_n || st.om_sway_chk))
++					r2log("objmv own velocity: %u attribute-swayed draws (RSX_DLSS_OBJMV_SWAY, %u probe checks), %u camera-locked skinned draws (RSX_DLSS_OBJMV_LOCKED)",
++						st.om_sway_n, st.om_sway_chk, st.om_locked_n);
++				st.om_sway_n = st.om_locked_n = st.om_sway_chk = 0;
 +				if (r2cfg().om_pair_near)
 +					r2log("objmv pairing by nearest constants (RSX_DLSS_OBJMV_PAIR_NEAREST=%u): %u changed skinned / non-affine pairs checked, %u re-paired with another occurrence (%u identical: static); late-start copies at command buffer ends %u, kept %u (RSX_AA_OBJMV_DEFER_SPEC=%d)",
 +						r2cfg().om_pair_near, st.om_pn_checked, st.om_pn_repaired, st.om_pn_static, o.t_late_spec, o.t_late_promo, r2cfg().om_late_spec ? 1 : 0);
@@ -37043,11 +37385,12 @@ index 0000000..5178015
 +			st.om_fast = st.om_fast_chk = 0;
 +			if (r2cfg().om_defer || st.fast_draws)
 +			{
-+				r2log("objmv defer (RSX_AA_OBJMV_DEFER=%d): %u frames, %u draws predicted static and classified after the scene (%.0f us/frame%s); late-start %u (moving while predicted static: camera motion this frame; %u given a history copy, RSX_AA_OBJMV_DEFER_HIST); fast exit (RSX_AA_FAST_EXIT) %u of %u draws",
++				r2log("objmv defer (RSX_AA_OBJMV_DEFER=%d): %u frames, %u draws predicted static and classified after the scene (%.0f us/frame%s); late-start %u (moving while predicted static: camera motion this frame; %u given a history copy, RSX_AA_OBJMV_DEFER_HIST; moved 2 frames before %u, 3-8 frames before %u, longer ago / never %u); %u not predicted: moved in the last %u frames (RSX_AA_OBJMV_DEFER_HOLD); fast exit (RSX_AA_FAST_EXIT) %u of %u draws",
 +					r2cfg().om_defer, st.om_def_frames, st.om_def_draws, st.om_def_frames ? static_cast<double>(st.om_def_ns) / 1000.0 / st.om_def_frames : 0.0,
-+					r2cfg().om_defer == 1 ? " on the worker thread" : " on the render thread at the flip", st.om_late_start, g_om2.t_late_hist, st.fast_hits, st.fast_draws);
++					r2cfg().om_defer == 1 ? " on the worker thread" : " on the render thread at the flip", st.om_late_start, g_om2.t_late_hist, st.om_ls_age[0], st.om_ls_age[1], st.om_ls_age[2], st.om_def_held, r2cfg().om_defer_hold, st.fast_hits, st.fast_draws);
 +				g_om2.t_late_hist = 0;
-+				st.om_def_frames = st.om_def_draws = st.om_late_start = 0;
++				st.om_def_frames = st.om_def_draws = st.om_late_start = st.om_def_held = 0;
++				st.om_ls_age[0] = st.om_ls_age[1] = st.om_ls_age[2] = 0;
 +				st.om_def_ns = 0;
 +				st.fast_hits = st.fast_draws = 0;
 +			}
@@ -40806,7 +41149,8 @@ index 0000000..5178015
 +		const bool dfm_on = pre && g_om_vu && o.dhalf && r2cfg().om_deform && om1_on() && !m_attrib_ring_info.has_shadow();
 +		bool dfm = false, d_fresh = false;
 +		u32 d_src = 0, d_size = 0;
-+		u64 d_key = 0;
++		u64 d_key = 0, d_lkey = 0;
++		u32 d_cnt = 0;
 +		if (dfm_on)
 +		{
 +			if (!(e.om & om_hashed))
@@ -40849,17 +41193,22 @@ index 0000000..5178015
 +					// Same layout, vertex range and size last frame = the same vertices at the same stream offsets
 +					u64 k = mix64(g_om_vu->first_vertex, (static_cast<u64>(g_om_vu->allocated_vertex_count) << 32) | bytes);
 +					k = mix64(k, g_om_vu->vertex_index_base);
++					u64 lk = 0x0b5; // RSX_DLSS_OBJMV_DEFORM_REBASE: the same without the vertex range
 +					for (const auto* b : m_vertex_layout.interleaved_blocks)
 +					{
 +						if (!b) continue;
 +						k = mix64(k, (static_cast<u64>(b->attribute_stride) << 40) | (static_cast<u64>(b->single_vertex) << 32) | b->memory_location);
++						lk = mix64(lk, (static_cast<u64>(b->attribute_stride) << 40) | (static_cast<u64>(b->single_vertex) << 32) | b->memory_location);
 +						k = mix64(k, (static_cast<u64>(b->vertex_range.first) << 32) | b->vertex_range.second);
 +						for (const auto& l : b->locations)
 +						{
 +							const auto& a = regs->vertex_arrays_info[l.index];
 +							k = mix64(k, static_cast<u64>((a.offset() & 0x7fffffff) - b->base_offset));
-+							k = mix64(k, (static_cast<u64>(l.index) << 48) | (static_cast<u64>(l.modulo) << 40) | (static_cast<u64>(l.frequency) << 16) |
-+								(static_cast<u64>(static_cast<u8>(a.type())) << 8) | a.size());
++							const u64 la = (static_cast<u64>(l.index) << 48) | (static_cast<u64>(l.modulo) << 40) | (static_cast<u64>(l.frequency) << 16) |
++								(static_cast<u64>(static_cast<u8>(a.type())) << 8) | a.size();
++							k = mix64(k, la);
++							lk = mix64(lk, static_cast<u64>((a.offset() & 0x7fffffff) - b->base_offset));
++							lk = mix64(lk, la);
 +						}
 +					}
 +					// RSX_DLSS_OBJMV_DEFORM_NEW: unpaired copies only in the first half of the buffer, 1 MB each at most
@@ -40868,6 +41217,8 @@ index 0000000..5178015
 +					d_src = static_cast<u32>(src);
 +					d_size = bytes;
 +					d_key = k | 1;
++					d_lkey = lk | 1;
++					d_cnt = g_om_vu->allocated_vertex_count;
 +					if (carry) o.dg_carry++;
 +					d_fresh = dw.fresh;
 +				}
@@ -40921,6 +41272,8 @@ index 0000000..5178015
 +					e.om_doff = static_cast<u32>(dst);
 +					e.om_dsize = d_size;
 +					e.om_dkey = d_key;
++					e.om_dlkey = d_lkey;
++					e.om_dcnt = d_cnt;
 +					o.dused += (static_cast<VkDeviceSize>(d_size) + 255) & ~VkDeviceSize{255};
 +					o.dn++;
 +					o.n_dcap++;
@@ -40962,6 +41315,15 @@ index 0000000..5178015
 +				}
 +			}
 +		}
++		// RSX_DLSS_OBJMV_DEFORM_REBASE: same attribute layout, vertex count and size, only the range moved (the copy's
++		// vertex k is this draw's vertex k: positions in the window, the attribute offsets in it equal)
++		if (dfm && dp && !use_dfm && !dq && r2cfg().om_rebase && dp->om_dsize == d_size && dp->om_dcnt == d_cnt && d_cnt &&
++			dp->om_dlkey == d_lkey && dp->om_dkey != d_key && dp->om_hslot && dp->om_hslot - 1u < o.cap &&
++			o.hvalid[o.hpar ^ 1][dp->om_hslot - 1u] && dp->om_doff + static_cast<u64>(d_size) <= o.dhalf * 2)
++		{
++			use_dfm = true;
++			o.dm_rebase++;
++		}
 +		if (dfm && dp && !use_dfm)
 +		{
 +			o.n_dmiss++;
@@ -40972,7 +41334,13 @@ index 0000000..5178015
 +				const int why = r2om_noprev_reason((dp->om & om_matched) != 0, dp->om_dage);
 +				(why == R2OM_NP_UNPAIRED ? o.dm_np_unp : why == R2OM_NP_FIRST ? o.dm_np_first : o.dm_np_aged)++;
 +			}
-+			else if (dp->om_dsize != d_size || dp->om_dkey != d_key) o.dm_key++;
++			else if (dp->om_dsize != d_size || dp->om_dkey != d_key)
++			{
++				o.dm_key++;
++				if (dp->om_dlkey != d_lkey) o.dm_key_lay++;
++				else if (dp->om_dcnt != d_cnt || dp->om_dsize != d_size) o.dm_key_cnt++;
++				else o.dm_key_base++;
++			}
 +			else o.dm_hist++;
 +		}
 +		if (dfm && !use_dfm && dp && (regs->alpha_test_enabled() || (m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_META_USES_DISCARD)))
@@ -41059,16 +41427,27 @@ index 0000000..5178015
 +		const auto& ps = m_pipeline_properties.state;
 +		const VkDescriptorSet set0 = cmd->r2_bound_set(0);
 +		const VkDescriptorSetLayout set0_layout = m_program->r2_set_layout(0);
-+		if (!ds || ds != st.ds_ptr || ds->samples() != 1 || !draw_count || !m_vertex_prog->handle || !set0 || !set0_layout ||
-+			!m_device->get_shader_draw_parameters_support() || clause.is_trivial_instanced_draw || !clause.is_single_draw() ||
-+			(cmd->flags & vk::command_buffer::cb_has_conditional_render) ||
-+			(m_ctx->program.vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS) ||
-+			(m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) ||
++		// RSX_DLSS_OBJMV_MULTI: multi-range / trivially instanced draws in onepass (all ranges / instances are issued
++		// with the bound variant; instanced constants stay out: one constants history per draw)
++		const bool multi_ok = r2cfg().om_multi && om1_on();
++		int skip_why = 0;
++		if (!ds || ds != st.ds_ptr || ds->samples() != 1) skip_why = 1;
++		else if (m_ctx->program.vertex_program.ctrl & RSX_SHADER_CONTROL_INSTANCED_CONSTANTS) skip_why = 4;
++		else if (clause.is_trivial_instanced_draw && !multi_ok) skip_why = 3;
++		else if (!clause.is_trivial_instanced_draw && !clause.is_single_draw() && !multi_ok) skip_why = 2;
++		else if (cmd->flags & vk::command_buffer::cb_has_conditional_render) skip_why = 5;
++		else if (m_ctx->program.fragment_program.ctrl & RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING) skip_why = 6;
++		else if (!draw_count || !m_vertex_prog->handle || !set0 || !set0_layout || !m_device->get_shader_draw_parameters_support() ||
 +			(ps.ds.depthTestEnable && ps.ds.depthCompareOp == VK_COMPARE_OP_NEVER))
++			skip_why = 7;
++		if (skip_why)
 +		{
 +			o.n_skip++;
++			(skip_why == 1 ? o.sk_ds : skip_why == 2 ? o.sk_multi : skip_why == 3 ? o.sk_inst : skip_why == 4 ? o.sk_iconst :
++				skip_why == 5 ? o.sk_cond : skip_why == 6 ? o.sk_blend : o.sk_misc)++;
 +			return;
 +		}
++		const bool is_multi = clause.is_trivial_instanced_draw || !clause.is_single_draw();
 +		if (om1_on())
 +		{
 +			// onepass: the variant of this very pipeline, bound for the draw that follows
@@ -41138,6 +41517,7 @@ index 0000000..5178015
 +			}
 +			o.vb_written = true;
 +			o.n_op++;
++			if (is_multi) o.op_multi++;
 +			e.om |= om_replayed;
 +			return;
 +		}
