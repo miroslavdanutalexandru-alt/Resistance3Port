@@ -8,6 +8,11 @@ A native PC port of *Resistance 3* (PS3) built by static recompilation: the game
 
 This is a **beta**. I have played through the intro and the opening Haven level myself, on one PC (Ryzen 5 5600X, GeForce RTX 5070, Windows 11); community testers have played further into the game. Expect bugs, and please report them (see *Reporting problems*).
 
+## Unreleased
+
+### New
+- **Ambient occlusion: CACAO, and the choice of AO (issue #45). Not yet tested in game.** *Graphics › Quality › Ambient occlusion* (and F9) is now Game / Port SSAO (extra) / CACAO / Off (`R3_AO_MODE`), with *Ambient occlusion quality* Low / Medium / High (`R3_AO_QUALITY`). CACAO (AMD FidelityFX CACAO) replaces the game's own AO where the game reads it, computed from the current frame, so it no longer fades in slowly after the view changes; Off removes AO. Game is the default and unchanged; a saved "On" is Port SSAO.
+
 ## 0.3.1-beta
 
 Fixes for the black screen in the Haven town fight, the black / purple flashes when shooting, AMD GPUs and controllers, the European disc (experimental) and a lot of new options. Items marked *Not yet tested* are new and have not been played with yet; please report how they work.

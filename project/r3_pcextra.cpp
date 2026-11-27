@@ -804,6 +804,12 @@ static void opts_init(void)
     opt_add(L"Brightness", L"Picture gamma on top of the game's own brightness option (SDR; in HDR use HDR paper white). Takes effect on restart.",
             "gamma", "PS3_DISPLAY_GAMMA", 1,
             { {L"Game default", ""}, {L"Brighter", "0.9"}, {L"Brightest", "0.8"}, {L"Darker", "1.1"}, {L"Darkest", "1.2"} }, "", NULL);
+    /* same keys, values and env as the launcher's "ssao" / "aoquality" rows; the renderer reads them at start-up */
+    opt_add(L"Ambient occlusion", L"Game: the game's own AO. CACAO replaces it (no slow fade-in). Port SSAO: the port's extra AO. CACAO: AMD FidelityFX CACAO. Takes effect on restart.",
+            "ssao", ENVN("AO_MODE"), 1,
+            { {L"Game", ""}, {L"Port SSAO", "1"}, {L"CACAO", "cacao"}, {L"Off", "off"} }, "", NULL);
+    opt_add(L"AO quality", L"CACAO quality: Low (3 samples), Medium (5) or High (12). Takes effect on restart.",
+            "aoquality", ENVN("AO_QUALITY"), 1, { {L"Medium", ""}, {L"Low", "low"}, {L"High", "high"} }, "", NULL);
     opt_add(L"Game crosshair", L"The game's own crosshair (the lines around the screen centre). Weapon scopes are not affected.",
             "reticle", ENVN("RETICLE"), 0, onoff, "", live_reticle);
     opt_add(L"Hit markers", L"The marker the game draws over the crosshair when a shot hits.", "hitmarker", ENVN("HITMARKER"), 0,
