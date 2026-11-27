@@ -22410,10 +22410,10 @@ index 0000000..fc62095
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
 new file mode 100644
-index 0000000..4ced351
+index 0000000..cec04de
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
-@@ -0,0 +1,2939 @@
+@@ -0,0 +1,2944 @@
 +// R2PORT: optional graphics-quality upgrades for the Resistance ports (see VKR2Gfx.h for the switches).
 +//
 +// Per-surface resolution: RPCS3 already supports surfaces of different resolution scales side by side (the
@@ -23753,6 +23753,11 @@ index 0000000..4ced351
 +		const double sy = double(s->height()) / std::max<u32>(1, s->get_surface_height<rsx::surface_metrics::pixels>());
 +		w = std::clamp<u32>(static_cast<u32>(std::lround(gw * sx)), 1u, s->width());
 +		h = std::clamp<u32>(static_cast<u32>(std::lround(gh * sy)), 1u, s->height());
++		// the drawn region at the surface's scale (as r2gx_ssao / RSX_SSAO_UV): under DLSS/FSR a surface can hold a
++		// reduced-scale frame in its top-left
++		const auto [cw, ch] = rsx::apply_resolution_scale<true>(s->resolution_scaling_config, gw, gh);
++		w = std::clamp<u32>(std::min<u32>(w, cw), 1u, s->width());
++		h = std::clamp<u32>(std::min<u32>(h, ch), 1u, s->height());
 +	}
 +}
 +
@@ -25355,16 +25360,18 @@ index 0000000..4ced351
 +#include "Emu/RSX/NV47/HW/context_accessors.undef.h"
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Gfx.h b/rpcs3/Emu/RSX/VK/VKR2Gfx.h
 new file mode 100644
-index 0000000..65ed71b
+index 0000000..0049b23
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Gfx.h
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,92 @@
 +// R2PORT: optional graphics-quality upgrades (VKR2Gfx.cpp). Everything here is inert unless its switch is set:
 +//   RSX_SHADOW_SCALE=2|4   shadow maps (square depth-only targets) rendered at 2x/4x the resolution
 +//   RSX_FX_FULLRES=1|2     half-resolution (1) and also quarter-resolution (2) effect targets at scene resolution
 +//   RSX_HUD_FIX=1          with a stretched Hor+ picture (R2_ASPECT), draws into the display buffer are squeezed
 +//                          back to 16:9 proportions around the centre (full-screen quads are left alone)
 +//   RSX_SSAO=1             experimental screen-space ambient occlusion on the opaque scene
++//   R3_AO_MODE=cacao|off   the game's own AO replaced by FidelityFX CACAO (VKR2Cacao.h) or by none; port = RSX_SSAO
++//   R3_AO_QUALITY=low|medium|high  CACAO quality preset (default medium)
 +//   RSX_TEXDUMP=1          dump every uploaded 2D texture (DDS for DXT1/3/5, PNG for A8R8G8B8) to texdump\
 +//                          (=ui: only textures drawn into the display buffer, i.e. menus / HUD, for tools\hd_ui_pack.py)
 +//   RSX_TEXPACK=1|<dir>    replace textures by guest-data hash from mods\textures (or <dir>)
