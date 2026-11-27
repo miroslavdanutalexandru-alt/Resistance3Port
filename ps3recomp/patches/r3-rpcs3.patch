@@ -15238,7 +15238,7 @@ index c9bed75..be01c7f 100644
  }
  
 diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
-index 4afff84..f54f380 100644
+index 4afff84..ca910d0 100644
 --- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
 @@ -1,10 +1,12 @@
@@ -15254,7 +15254,7 @@ index 4afff84..f54f380 100644
  #include "Emu/Cell/Modules/cellVideoOut.h"
  
  #include "upscalers/bilinear_pass.hpp"
-@@ -12,10 +14,117 @@
+@@ -12,10 +14,147 @@
  #include "upscalers/nearest_pass.hpp"
  #include "util/asm.hpp"
  #include "util/video_provider.h"
@@ -15272,7 +15272,9 @@ index 4afff84..f54f380 100644
 +// "[display] VRR effective: yes/no". On a fixed refresh (auto: VRR measured not working; fixed: always) the
 +// present mode becomes FIFO and the frame limit refresh / k (/ the frame-generation multiplier), phase-locked
 +// to the vblanks when k >= 2, so every frame stays on screen for k refreshes. vrr = the old behaviour (still
-+// measured and logged); off = no measurement. Restored when VRR is seen working again.
++// measured and logged); off = no measurement. Restored when VRR is seen working again. A PC that can't hold
++// refresh / k gets refresh / (k + 1) until the faster plan holds again (PORT_PACING_ADAPT, default on;
++// pds_adapt_frame: 144 Hz 72 -> 48, not 2 / 3 refresh judder; never faster than the frame-rate setting).
 +#include "../../../../../../../project/port_display_sync.h"
 +extern "C" double r2_fps_target(void);           // project/stubs.cpp: the frame-rate setting (30 = the game's own)
 +extern "C" void r2_fps_pacing_set(double fps);   // project/stubs.cpp: frame limit override, 0 = the setting
@@ -15293,20 +15295,28 @@ index 4afff84..f54f380 100644
 +	HWND pds_game_hwnd() { return s_pds_hwnd; }
 +	int pds_out_mult() { const int m = g_r2fg_active; return m > 1 ? m : 1; }
 +
++	pds_adapt s_pds_ad; // PORT_PACING_ADAPT step-down state (render thread)
++
 +	// Once a flip, before the swapchain checks: start the measurement, switch the pacing on / off.
-+	void pds_frame(HWND hwnd)
++	// game_flip: a game frame (not a native UI flip), timed for the step-down.
++	void pds_frame(HWND hwnd, bool game_flip)
 +	{
 +		static bool started = false;
 +		static vsync_mode orig = vsync_mode::off;
-+		static int cur = 0, cmult = 0, nlog = 0;
++		static int cur = 0, cmult = 0, nlog = 0, ad_log = 0;
 +		static LONG cgen = -1;
 +		static pds_plan cp{};
++		static double qms = 0.0;
 +		if (hwnd) s_pds_hwnd = hwnd;
 +		if (!started)
 +		{
 +			started = true;
 +			orig = g_cfg.video.vsync;
 +			pds_start(PORT_DISPLAY_SYNC_ENV, pds_game_hwnd);
++			pds_adapt_init(&s_pds_ad, pds_parse_adapt(std::getenv("PORT_PACING_ADAPT")));
++			LARGE_INTEGER qf;
++			QueryPerformanceFrequency(&qf);
++			qms = 1000.0 / static_cast<double>(qf.QuadPart);
 +		}
 +		if (!pds_fixed())
 +		{
@@ -15316,6 +15326,7 @@ index 4afff84..f54f380 100644
 +				s_pds_pll = 0;
 +				s_pds_paced = 0;
 +				r2_fps_pacing_set(0.0);
++				pds_adapt_reset(&s_pds_ad);
 +				if (g_cfg.video.vsync != orig) g_cfg.video.vsync.set(orig);
 +				std::fprintf(stderr, "[display] fixed-refresh pacing off: frame limit and present mode back to the settings%c", 10);
 +			}
@@ -15324,10 +15335,19 @@ index 4afff84..f54f380 100644
 +		const int mult = pds_out_mult();
 +		const double hz = pds_hz();
 +		if (!(hz > 1.0)) return;
-+		if (!cur || mult != cmult || pds_gen() != cgen)
++		const double maxr = pds_max_real(r2_fps_target());
++		if (cur && mult != cmult) pds_adapt_reset(&s_pds_ad); // frame generation switched: the player's plan again
++		int adapted = 0;
++		if (game_flip && cur && mult == cmult && cp.k >= 1)
++		{
++			LARGE_INTEGER t;
++			QueryPerformanceCounter(&t);
++			adapted = pds_adapt_frame(&s_pds_ad, static_cast<double>(t.QuadPart) * qms, 1000.0 / cp.real, 1000.0 / hz, pds_plan_max_extra(hz, mult, maxr, 30.0));
++		}
++		if (!cur || adapted || mult != cmult || pds_gen() != cgen)
 +		{
 +			pds_plan p;
-+			pds_make_plan(hz, mult, pds_max_real(r2_fps_target()), 30.0, &p);
++			pds_make_plan_step(hz, mult, maxr, 30.0, s_pds_ad.extra, &p);
 +			cgen = pds_gen();
 +			cmult = mult;
 +			if (!cur || !pds_plan_same(&p, &cp))
@@ -15336,12 +15356,22 @@ index 4afff84..f54f380 100644
 +				// (exactly refresh / k, phase-locked); at k = 1 a hair faster so FIFO sets the pace
 +				// k = 0: even every refresh would be too slow for the game -- no pacing, the settings stay
 +				r2_fps_pacing_set(p.k >= 2 ? p.real : p.k == 1 ? p.limiter : 0.0);
-+				if (nlog < 16)
++				if (adapted && cur)
++				{
++					if (ad_log < 64)
++					{
++						char b[224];
++						pds_adapt_str(&s_pds_ad, &p, &cp, b, sizeof b);
++						std::fprintf(stderr, "[display] fixed-refresh pacing: %s%s%c", b, ++ad_log == 64 ? " (further changes not logged)" : "", 10);
++					}
++				}
++				else if (nlog < 16)
 +				{
 +					char b[192];
 +					pds_plan_str(&p, b, sizeof b);
 +					nlog++;
-+					std::fprintf(stderr, "[display] fixed-refresh pacing: %s%s%s%c", b, p.k >= 1 ? " -- Vulkan FIFO" : "", p.k >= 2 ? ", frame limit phase-locked to the refresh" : "", 10);
++					std::fprintf(stderr, "[display] fixed-refresh pacing: %s%s%s%s%c", b, p.k >= 1 ? " -- Vulkan FIFO" : "", p.k >= 2 ? ", frame limit phase-locked to the refresh" : "",
++						!cur && p.k >= 1 ? (s_pds_ad.enabled ? " (steps slower while the PC can't hold it; PORT_PACING_ADAPT=0 = never)" : " (PORT_PACING_ADAPT=0: never steps slower)") : "", 10);
 +				}
 +			}
 +			cp = p;
@@ -15372,7 +15402,7 @@ index 4afff84..f54f380 100644
  extern atomic_t<recording_mode> g_recording_mode;
  
  namespace
-@@ -55,6 +164,7 @@ bool VKGSRender::reinitialize_swapchain()
+@@ -55,6 +194,7 @@ bool VKGSRender::reinitialize_swapchain()
  	close_and_submit_command_buffer();
  	m_current_command_buffer->reset();
  	m_current_command_buffer->begin();
@@ -15380,7 +15410,7 @@ index 4afff84..f54f380 100644
  
  	for (auto &ctx : m_frame_context_storage)
  	{
-@@ -142,6 +252,7 @@ bool VKGSRender::reinitialize_swapchain()
+@@ -142,6 +282,7 @@ bool VKGSRender::reinitialize_swapchain()
  
  	m_current_command_buffer->reset();
  	m_current_command_buffer->begin();
@@ -15388,7 +15418,7 @@ index 4afff84..f54f380 100644
  
  	swapchain_unavailable = false;
  	should_reinitialize_swapchain = false;
-@@ -158,7 +269,10 @@ void VKGSRender::present(vk::frame_context_t *ctx)
+@@ -158,7 +299,10 @@ void VKGSRender::present(vk::frame_context_t *ctx)
  
  	if (!swapchain_unavailable)
  	{
@@ -15400,7 +15430,7 @@ index 4afff84..f54f380 100644
  		{
  		case VK_SUCCESS:
  			break;
-@@ -185,6 +299,7 @@ void VKGSRender::present(vk::frame_context_t *ctx)
+@@ -185,6 +329,7 @@ void VKGSRender::present(vk::frame_context_t *ctx)
  
  void VKGSRender::advance_queued_frames()
  {
@@ -15408,7 +15438,7 @@ index 4afff84..f54f380 100644
  	// Check all other frames for completion and clear resources
  	check_present_status();
  
-@@ -209,6 +324,8 @@ void VKGSRender::advance_queued_frames()
+@@ -209,6 +354,8 @@ void VKGSRender::advance_queued_frames()
  		resources->vertex_cache->purge();
  	}
  	m_current_frame->tag_frame_end();
@@ -15417,7 +15447,7 @@ index 4afff84..f54f380 100644
  
  	m_queued_frames.push_back(m_current_frame);
  	ensure(m_queued_frames.size() <= m_max_async_frames);
-@@ -245,6 +362,8 @@ void VKGSRender::queue_swap_request()
+@@ -245,6 +392,8 @@ void VKGSRender::queue_swap_request()
  	m_current_command_buffer = m_primary_cb_list.next();
  	m_current_command_buffer->reset();
  	m_current_command_buffer->begin();
@@ -15426,7 +15456,7 @@ index 4afff84..f54f380 100644
  
  	// Set up new pointers for the next frame
  	advance_queued_frames();
-@@ -255,11 +374,13 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
+@@ -255,11 +404,13 @@ void VKGSRender::frame_context_cleanup(vk::frame_context_t *ctx)
  	ensure(ctx->swap_command_buffer);
  
  	// Perform hard swap here
@@ -15440,7 +15470,7 @@ index 4afff84..f54f380 100644
  
  	// Resource cleanup.
  	{
-@@ -398,6 +519,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+@@ -398,6 +549,7 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  			flush_command_queue();
  		}
  
@@ -15448,7 +15478,7 @@ index 4afff84..f54f380 100644
  		res()->texture_cache.invalidate_range(*m_current_command_buffer, range, rsx::invalidation_cause::read);
  		image_to_flip = res()->texture_cache.upload_image_simple(*m_current_command_buffer, expected_format, info->address, info->width, info->height, info->pitch);
  	}
-@@ -434,12 +556,26 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
+@@ -434,12 +586,26 @@ vk::viewable_image* VKGSRender::get_present_source(/* inout */ vk::present_surfa
  
  bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  {
@@ -15475,16 +15505,16 @@ index 4afff84..f54f380 100644
  	if (!info.emu_flip)
  	{
  		// Native UI flips are requested from the local task. Submit outstanding work first.
-@@ -456,6 +592,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -456,6 +622,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		}
  	}
  
-+	pds_frame(m_frame->handle()); // R2PORT: display sync (may switch g_cfg.video.vsync to full)
++	pds_frame(m_frame->handle(), info.emu_flip); // R2PORT: display sync (may switch g_cfg.video.vsync to full)
 +
  	if (m_vsync_mode != g_cfg.video.vsync)
  	{
  		swapchain_unavailable = true;
-@@ -484,9 +622,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -484,9 +652,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		}
  	}
  
@@ -15502,7 +15532,7 @@ index 4afff84..f54f380 100644
  
  	if (m_current_frame == &m_aux_frame_context)
  	{
-@@ -605,14 +749,17 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -605,14 +779,17 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  
  	if (info.emu_flip)
  	{
@@ -15520,7 +15550,7 @@ index 4afff84..f54f380 100644
  	while (VkResult status = m_swapchain->acquire_next_swapchain_image(m_current_frame->acquire_signal_semaphore, timeout, &m_current_frame->present_image))
  	{
  		switch (status)
-@@ -655,6 +802,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -655,6 +832,7 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  
  	// Confirm that the driver did not silently fail
  	ensure(m_current_frame->present_image != umax);
@@ -15528,7 +15558,7 @@ index 4afff84..f54f380 100644
  
  	// Calculate output dimensions. Done after swapchain acquisition in case it was recreated.
  	areai aspect_ratio;
-@@ -847,9 +995,16 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -847,9 +1025,16 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  	{
  		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
  
@@ -15547,7 +15577,7 @@ index 4afff84..f54f380 100644
  			if (image_to_flip2) calibration_src.push_back(image_to_flip2);
  
  			if (m_output_scaling == output_scaling_mode::fsr && !avconfig.stereo_enabled) // 3D will be implemented later
-@@ -890,11 +1045,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -890,11 +1075,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		else
  		{
  			// Do raw transfer here as there is no image object associated with textures owned by the driver (TODO)
@@ -15564,7 +15594,7 @@ index 4afff84..f54f380 100644
  			rgn.dstOffsets[0] = { aspect_ratio.x1, aspect_ratio.y1, 0 };
  			rgn.dstOffsets[1] = { aspect_ratio.x2, aspect_ratio.y2, 1 };
  
-@@ -904,10 +1063,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -904,10 +1093,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  				target_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
  			}
  
@@ -15578,7 +15608,7 @@ index 4afff84..f54f380 100644
  	if (g_cfg.video.debug_overlay || has_overlay)
  	{
  		if (target_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-@@ -997,6 +1158,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -997,6 +1188,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		direct_fbo->release();
  	}
  
