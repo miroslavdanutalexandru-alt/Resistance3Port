@@ -1430,6 +1430,9 @@ extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
 extern "C" uint32_t g_null_sweep_hi = 0;   /* 0 = not sweeping */
 static uint32_t g_null_sweep_last = 0;
 static unsigned g_null_sweep_tid = 0;
+/* Optional port diagnostic on the first null-page stores (the port names a known
+ * writer from the guest registers). Runs only on a null store: free otherwise. */
+extern "C" void (*volatile g_port_null_store_hook)(uint32_t a, uint32_t v, int width, ppu_context* ctx) = nullptr;
 static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
 {
     static int en = -1;
@@ -1444,6 +1447,7 @@ static int vm_null_store_report(uint32_t a, uint32_t v, int width, void* ra)
     { static long n = 0;
       enum { NW_MAX = 8 };
       long i = n++;
+      if (i < 64 && g_port_null_store_hook) g_port_null_store_hook(a, v, width, g_active_ctx);
       if (i < NW_MAX)
           fprintf(stderr, "[null-write] guest wrote%d 0x%X to 0x%08X (NULL+0x%X)"
                           " by guest-fn=0x%08X -- DROPPED\n",

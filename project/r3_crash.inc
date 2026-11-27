@@ -8,6 +8,10 @@
  * that was installed before it). A hang -- the game loop, r2_game_frames,
  * counted in the stubs.cpp frame limiter, stops -- writes R3_<time>_hang.dmp/.txt
  * once per stall and keeps running.
+ * The game quitting on its own (libc exit() / sys_process_exit: an internal error,
+ * back to the XMB on PS3) writes R3_<time>_exit.dmp/.txt, shows a message box and
+ * ends the process instead of freezing on the last frame.
+ *   PORT_GUEST_EXIT_QUIT=0   no report / box: the old freeze
  *   R2_CRASH_DUMPS=0 / PORT_CRASH_DUMPS=0          both off
  *   R2_CRASH_DUMPS=full (or CRASH_DUMP_FULL=1)      full-memory dumps (several GB)
  *   PORT_HANG_DUMP=1   strict watchdog: 20 s (PORT_HANG_S) without a game frame,
@@ -88,6 +92,71 @@ static void r3_thread_fatal(const char* thread_name, const char* reason)
     TerminateProcess(GetCurrentProcess(), code);
 }
 
+/* RL160363: the game quit on its own -- libc exit() after an internal error (a net worker hit corrupted
+ * memory) -> sys_prx_exitspawn_with_level, which used to be a no-op, so it froze on the last frame until the
+ * player closed it. sysPrxForUser.c calls this once (not for a player quit): write the report, tell the
+ * player, and the caller exits. PORT_GUEST_EXIT_QUIT=0: the old behaviour. */
+extern "C" int (*volatile g_port_guest_exit_hook)(const char* via, int32_t* code, int code_known);
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+static int r3_guest_exit(const char* via, int32_t* code, int code_known)
+{
+    const char* q = getenv("PORT_GUEST_EXIT_QUIT");
+    if (q && *q == '0') return 0;
+    uint64_t tid = 0; uint32_t lr = 0, sp = 0, sc_in = 0, sc_last = 0, site = 0;
+    const int g = ppu_crash_guest_state(&tid, &lr, &sp, &sc_in, &sc_last, &site);
+    /* R3's libc exit() keeps its status in r29 across the exit syscall (988) and the exitspawn call */
+    if (!code_known && g && sc_last == 988 && g_active_ctx) { *code = (int32_t)(uint32_t)g_active_ctx->gpr[29]; code_known = 1; }
+    char cs[32] = "unknown";
+    if (code_known) snprintf(cs, sizeof cs, "%d", (int)*code);
+    fprintf(stderr, "[exit] the game quit on its own: %s (guest exit code %s)\n", via, cs);
+    if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "exit");
+    fflush(stdout); fflush(stderr);
+    char d[400];
+    if (g)
+        snprintf(d, sizeof d, "the game called %s (guest exit code %s) on guest thread %llu, lr=0x%08X sp=0x%08X, "
+                 "last syscall %u, callsite 0x%08X", via, cs, (unsigned long long)tid, lr, sp, sc_last, site);
+    else
+        snprintf(d, sizeof d, "the game called %s (guest exit code %s) off a guest thread", via, cs);
+    const int saved = port_crash::guest_exit(d);
+    rsx_null_refresh_restore_on_crash();
+    ClipCursor(NULL);
+    if (HWND w = (HWND)rsx_null_backend_get_hwnd()) ShowWindowAsync(w, SW_MINIMIZE);
+    fprintf(stderr, "[exit] closing the game\n");
+    fflush(stderr);
+    MessageBoxA(NULL, saved ? "The game hit an internal error and closed. A report was saved in logs\\crash."
+                            : "The game hit an internal error and closed.",
+                "Resistance 3", MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+    if (!code_known) *code = 1;
+    return 1;
+}
+
+/* RL160363: func_006D8C2C (node + id-slot allocator) found its owner's free id-slot list (owner+0x2E0)
+ * empty, went on with a NULL node and wrote it through NULL+0x8C (dropped by [null-write]); the leak
+ * corrupted memory that a net worker later died on. Say so in one line, with the owner. Runs only on a
+ * null-page store (ppu_loader.cpp). */
+extern "C" void (*volatile g_port_null_store_hook)(uint32_t a, uint32_t v, int width, ppu_context* ctx);
+static uint32_t r3_rd32(uint32_t ea)
+{
+    if (!vm_base || ea < 0x10000u) return 0;
+    uint32_t x; memcpy(&x, vm_base + ea, 4);
+    return _byteswap_ulong(x);
+}
+static void r3_null_store(uint32_t a, uint32_t v, int width, ppu_context* c)
+{
+    (void)v; (void)width;
+    static volatile LONG s_once = 0;
+    if (!c || a != 0x8C || (uint32_t)c->gpr[4] != 0x01276860u) return;
+    if (InterlockedExchange(&s_once, 1)) return;
+    const uint32_t owner = (uint32_t)c->gpr[31], pa = 0x01276840u;
+    const unsigned cnt = owner >= 0x10000u && vm_base ? vm_base[owner + 0x2F0] : 0;
+    fprintf(stderr, "[r3] func_006D8C2C node/slot allocator: owner 0x%08X has no free id slot (+0x2E0=0x%08X, count +0x2F0=%u); "
+            "pool A free 0x%08X used %u/%u allocs %u; node leaked (lr 0x%08X)\n",
+            owner, r3_rd32(owner + 0x2E0), cnt, r3_rd32(pa + 4), r3_rd32(pa + 0x10), r3_rd32(pa + 8), r3_rd32(pa + 0x14),
+            (uint32_t)c->lr);
+    fflush(stderr);
+}
+
 static void r2_crash_init(void)
 {
     PortCrashConfig c = {};
@@ -107,6 +176,8 @@ static void r2_crash_init(void)
     c.after_report = port_ft_on_report;
     port_crash::init(c);
     g_port_thread_fatal_hook = r3_thread_fatal;
+    g_port_guest_exit_hook = r3_guest_exit;
+    g_port_null_store_hook = r3_null_store;
     PortFtConfig f = {};
     f.title = c.title;
     f.paused = r3_crash_paused;

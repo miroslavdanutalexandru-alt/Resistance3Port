@@ -36,6 +36,7 @@ char* rsx_getenv(const char* name);
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+extern volatile int g_port_user_quit;   /* sysPrxForUser.c: the player closed the window, not a guest exit */
 
 /* We need these GUIDs — define them here to avoid uuid.lib dependency.
  * initguid.h only turns DEFINE_GUID into a definition for headers included
@@ -951,7 +952,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_RETURN) return 0;   /* no "ding" on Alt+Enter */
         break;
     case WM_CLOSE:
-        s_d3d.window_closed = 1;
+        g_port_user_quit = 1; s_d3d.window_closed = 1;
         DestroyWindow(hwnd);
         return 0;
     case WM_DESTROY:
@@ -961,7 +962,7 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* Resistance port: Esc is the game's pause button now (controls.txt);
          * ESC_CLOSES=1 restores closing the window on it. */
         if (wp == VK_ESCAPE && getenv("ESC_CLOSES")) {
-            s_d3d.window_closed = 1;
+            g_port_user_quit = 1; s_d3d.window_closed = 1;
             DestroyWindow(hwnd);
         }
         return 0;
@@ -8112,7 +8113,7 @@ static void render_frame_impl(void)
           GetWindowThreadProcessId(s_d3d.hwnd, NULL) == GetCurrentThreadId()) {
           last = now; MSG msg;
           while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-              if (msg.message == WM_QUIT) { s_d3d.window_closed = 1; break; }
+              if (msg.message == WM_QUIT) { g_port_user_quit = 1; s_d3d.window_closed = 1; break; }
               TranslateMessage(&msg); DispatchMessageA(&msg);
           }
       } }
