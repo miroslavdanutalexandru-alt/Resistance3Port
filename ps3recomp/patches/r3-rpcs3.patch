@@ -15238,7 +15238,7 @@ index c9bed75..be01c7f 100644
  }
  
 diff --git a/rpcs3/Emu/RSX/VK/VKPresent.cpp b/rpcs3/Emu/RSX/VK/VKPresent.cpp
-index 4afff84..e867e3d 100644
+index 4afff84..f54f380 100644
 --- a/rpcs3/Emu/RSX/VK/VKPresent.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKPresent.cpp
 @@ -1,10 +1,12 @@
@@ -15528,7 +15528,7 @@ index 4afff84..e867e3d 100644
  
  	// Calculate output dimensions. Done after swapchain acquisition in case it was recreated.
  	areai aspect_ratio;
-@@ -847,9 +995,14 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -847,9 +995,16 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  	{
  		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
  
@@ -15539,13 +15539,15 @@ index 4afff84..e867e3d 100644
 +			if (image_to_flip && m_output_scaling == output_scaling_mode::bilinear && !avconfig.stereo_enabled) // R2PORT: RSX_PRESENT_DOWNSCALE
 +			{
 +				u32 ds_w = buffer_width, ds_h = buffer_height;
-+				calibration_src.push_back(vk::r2_present_downscale(*m_current_command_buffer, image_to_flip, ds_w, ds_h, aspect_ratio.width(), aspect_ratio.height()));
++				vk::viewable_image* ds_src = vk::r2_present_downscale(*m_current_command_buffer, image_to_flip, ds_w, ds_h, aspect_ratio.width(), aspect_ratio.height());
++				calibration_src.push_back(vk::r2_present_crop(*m_current_command_buffer, ds_src, ds_w, ds_h)); // R3 #13
 +			}
-+			else if (image_to_flip) calibration_src.push_back(image_to_flip);
++			else if (image_to_flip) calibration_src.push_back(avconfig.stereo_enabled || m_output_scaling == output_scaling_mode::fsr ? image_to_flip :
++				vk::r2_present_crop(*m_current_command_buffer, image_to_flip, buffer_width, buffer_height)); // R3 #13
  			if (image_to_flip2) calibration_src.push_back(image_to_flip2);
  
  			if (m_output_scaling == output_scaling_mode::fsr && !avconfig.stereo_enabled) // 3D will be implemented later
-@@ -890,11 +1043,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -890,11 +1045,15 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		else
  		{
  			// Do raw transfer here as there is no image object associated with textures owned by the driver (TODO)
@@ -15562,7 +15564,7 @@ index 4afff84..e867e3d 100644
  			rgn.dstOffsets[0] = { aspect_ratio.x1, aspect_ratio.y1, 0 };
  			rgn.dstOffsets[1] = { aspect_ratio.x2, aspect_ratio.y2, 1 };
  
-@@ -904,10 +1061,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -904,10 +1063,12 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  				target_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
  			}
  
@@ -15576,7 +15578,7 @@ index 4afff84..e867e3d 100644
  	if (g_cfg.video.debug_overlay || has_overlay)
  	{
  		if (target_layout != VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
-@@ -997,6 +1156,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
+@@ -997,6 +1158,8 @@ bool VKGSRender::present_frame(const rsx::display_flip_info_t& info)
  		direct_fbo->release();
  	}
  
@@ -24735,10 +24737,10 @@ index 0000000..65ed71b
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Hdr.cpp b/rpcs3/Emu/RSX/VK/VKR2Hdr.cpp
 new file mode 100644
-index 0000000..aecb001
+index 0000000..8db5c46
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Hdr.cpp
-@@ -0,0 +1,216 @@
+@@ -0,0 +1,226 @@
 +// R2PORT PC extras (not upstream RPCS3): HDR output settings, Windows HDR detection, SDR -> HDR present code.
 +//
 +// Inverse tone mapping (same curve as R1's port_hdr.h, the C reference; keep them in step):
@@ -24911,6 +24913,16 @@ index 0000000..aecb001
 +		return on;
 +	}
 +
++	bool present_fix()
++	{
++		static const bool on = []
++		{
++			const char* e = henv("HDR_FIX");
++			return !(e && (!std::strcmp(e, "0") || !_stricmp(e, "off")));
++		}();
++		return on;
++	}
++
 +	const char* glsl()
 +	{
 +		return R"(
@@ -24957,10 +24969,10 @@ index 0000000..aecb001
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Hdr.h b/rpcs3/Emu/RSX/VK/VKR2Hdr.h
 new file mode 100644
-index 0000000..36ca558
+index 0000000..60dea5e
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Hdr.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,39 @@
 +// R2PORT PC extras: HDR output settings, Windows HDR detection and the SDR -> HDR present code
 +// (VKR2PcExtras.cpp does the Vulkan side and calls these). Nothing here runs unless HDR is asked for.
 +#pragma once
@@ -24989,6 +25001,12 @@ index 0000000..36ca558
 +	// R3 #13: NaN colour channels are zeroed before the HDR encode (as the 8-bit SDR swapchain write does), so one bad
 +	// channel cannot spread through the BT.2020 matrix. *_HDR_SANITIZE=0 turns it off. Cached.
 +	bool sanitize();
++
++	// R3 #13 present fix (default on; *_HDR_FIX=0 = 0.3.1's behaviour): the HDR / colour-filter present pass samples
++	// the whole present image, so a game surface larger than the display buffer brought its rows / columns past the
++	// buffer (stale or never written memory) into the frame, where the SDR blit crops them; the image is now cropped to
++	// the buffer first. The NaN guard also tests the float bits, which the driver cannot fold away like isnan(). Cached.
++	bool present_fix();
 +
 +	// GLSL for the present pass: vec3 r2pc_hdr(vec3 c, vec2 frag_xy, int mode, float paper, float peak, float sat),
 +	// c = the final SDR colour (0..1, gamma), mode 1 = HDR10 (PQ), 2 = scRGB.
@@ -26341,10 +26359,10 @@ index 0000000..95d632e
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2PcExtras.cpp b/rpcs3/Emu/RSX/VK/VKR2PcExtras.cpp
 new file mode 100644
-index 0000000..873ed81
+index 0000000..8fd88c3
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2PcExtras.cpp
-@@ -0,0 +1,537 @@
+@@ -0,0 +1,539 @@
 +// R2PORT PC extras (not upstream RPCS3): HDR output, colour-blind filter, NVIDIA Reflex.
 +//
 +//  * HDR (R2_HDR=0 / auto / 1 HDR10 / scrgb, R2_HDR_PAPER nits, R2_HDR_PEAK nits, R2_HDR_SAT 0..2;
@@ -26849,7 +26867,9 @@ index 0000000..873ed81
 +	const int hdr = int(right_anaglyph_matrix[0].x + 0.5);
 +	const int cvd = int(right_anaglyph_matrix[0].y + 0.5);
 +	vec3 c = o.rgb;
-+	if (hdr > 0 && right_anaglyph_matrix[1].z > 0.5) c = mix(c, vec3(0.0), isnan(c)); // R3 #13: *_HDR_SANITIZE
++	if (hdr > 0 && right_anaglyph_matrix[1].z > 1.5) // R3 #13: *_HDR_SANITIZE, bit test (*_HDR_FIX)
++		c = mix(c, vec3(0.0), greaterThan(floatBitsToUint(c) & uvec3(0x7FFFFFFFu), uvec3(0x7F800000u)));
++	else if (hdr > 0 && right_anaglyph_matrix[1].z > 0.5) c = mix(c, vec3(0.0), isnan(c)); // R3 #13: *_HDR_SANITIZE
 +	if (cvd > 0) c = r2pc_cvd(c, cvd);
 +	if (hdr > 0) c = r2pc_hdr(c, gl_FragCoord.xy, hdr, right_anaglyph_matrix[1].x, right_anaglyph_matrix[1].y, right_anaglyph_matrix[0].z);
 +	return vec4(c, o.a);
@@ -26879,7 +26899,7 @@ index 0000000..873ed81
 +		col0[2] = hdr ? r2hdr::sat() : 0.f;
 +		col1[0] = hdr ? r2hdr::paper() : 203.f;
 +		col1[1] = hdr ? r2hdr::peak() : 203.f;
-+		col1[2] = hdr && r2hdr::sanitize() ? 1.f : 0.f; // R3 #13: NaN guard before the HDR encode
++		col1[2] = hdr && r2hdr::sanitize() ? (r2hdr::present_fix() ? 2.f : 1.f) : 0.f; // R3 #13: NaN guard before the HDR encode
 +	}
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2PcExtras.h b/rpcs3/Emu/RSX/VK/VKR2PcExtras.h
@@ -28294,10 +28314,10 @@ index 0000000..3cb23c0
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..cd10ea9
+index 0000000..f8ae9a1
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,12087 @@
+@@ -0,0 +1,12121 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2/4; 4 = Intel XeSS, VKR2XeSS.cpp, FSR 3.1 fallback):
@@ -28313,6 +28333,7 @@ index 0000000..cd10ea9
 +
 +#include "stdafx.h"
 +#include "VKR2Upscaler.h"
++#include "VKR2Hdr.h" // R3 #13: *_HDR_FIX (r2_present_crop)
 +#include "VKR2XeSS.h"
 +#include "VKR2FrameGen.h" // R2PORT frame generation
 +#include "Emu/RSX/port_r2preload.h" // R2PORT: r2preload::driver_call (issue #10/#23)
@@ -35345,6 +35366,39 @@ index 0000000..cd10ea9
 +		}
 +		return cur;
 +	}
++
++	vk::viewable_image* r2_present_crop(const vk::command_buffer& cmd, vk::viewable_image* src, u32 w, u32 h)
++	{
++		static std::unique_ptr<vk::viewable_image> crop;
++		if (!src || !w || !h || (src->width() <= w && src->height() <= h) || src->aspect() != VK_IMAGE_ASPECT_COLOR_BIT || !r2hdr::present_fix())
++			return src;
++		w = std::min(w, src->width());
++		h = std::min(h, src->height());
++		auto* pdev = vk::get_current_renderer();
++		if (crop && (crop->width() != w || crop->height() != h || crop->format() != src->format()))
++			vk::get_resource_manager()->dispose(crop);
++		if (!crop)
++		{
++			crop = std::make_unique<vk::viewable_image>(*pdev, pdev->get_memory_mapping().device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
++				VK_IMAGE_TYPE_2D, src->format(), w, h, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_TILING_OPTIMAL,
++				VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
++				vk::VK_IMAGE_CREATE_ALLOW_NULL_RPCS3, VMM_ALLOCATION_POOL_SWAPCHAIN, RSX_FORMAT_CLASS_COLOR);
++			if (!crop->value)
++			{
++				crop.reset();
++				return src;
++			}
++		}
++		VkImageCopy region{};
++		region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++		region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
++		region.extent = { w, h, 1 };
++		src->push_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++		crop->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++		vkCmdCopyImage(cmd, src->value, src->current_layout, crop->value, crop->current_layout, 1, &region);
++		src->pop_layout(cmd);
++		return crop.get();
++	}
 +}
 +
 +void VKGSRender::r2aa_set_section(bool on)
@@ -40387,10 +40441,10 @@ index 0000000..cd10ea9
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.h b/rpcs3/Emu/RSX/VK/VKR2Upscaler.h
 new file mode 100644
-index 0000000..60ce11f
+index 0000000..6ac7145
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.h
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,81 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3).
 +// Temporal anti-aliasing of the 3D scene with AMD FSR 3.1 (FidelityFX API, amd_fidelityfx_vk.dll) or
 +// NVIDIA DLAA (r2_dlss.dll, NGX) or Intel XeSS (libxess.dll, VKR2XeSS.cpp). Enabled by RSX_FSR=1 (FSR 3.1) /
@@ -40459,6 +40513,10 @@ index 0000000..60ce11f
 +	// VKPresent.cpp: area-filtered shrink (exact 2:1 box steps) of the w x h region of 'src' while it is at least twice
 +	// the dw x dh output; returns the image to present and updates w, h (RSX_PRESENT_DOWNSCALE=0: returns src)
 +	vk::viewable_image* r2_present_downscale(const vk::command_buffer& cmd, vk::viewable_image* src, u32& w, u32& h, u32 dw, u32 dh);
++
++	// VKPresent.cpp, R3 #13: the calibration (HDR / colour filter) pass samples its whole source image; returns 'src'
++	// cropped to its top-left w x h when it is larger (*_HDR_FIX=0 or no fit: returns src)
++	vk::viewable_image* r2_present_crop(const vk::command_buffer& cmd, vk::viewable_image* src, u32 w, u32 h);
 +
 +	// instance.cpp: add the instance extensions NGX (RSX_FSR=2) or XeSS (RSX_FSR=4) needs
 +	void r2aa_extend_instance(std::vector<const char*>& extensions);
