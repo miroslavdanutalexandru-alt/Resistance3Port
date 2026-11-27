@@ -22839,10 +22839,10 @@ index 0000000..4df809b
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
 new file mode 100644
-index 0000000..cec04de
+index 0000000..df3f6f5
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
-@@ -0,0 +1,2944 @@
+@@ -0,0 +1,2958 @@
 +// R2PORT: optional graphics-quality upgrades for the Resistance ports (see VKR2Gfx.h for the switches).
 +//
 +// Per-surface resolution: RPCS3 already supports surfaces of different resolution scales side by side (the
@@ -23608,6 +23608,20 @@ index 0000000..cec04de
 +		const bool r = !(e && *e && (e[0] == '0' || _stricmp(e, "off") == 0));
 +		gxlog("vertex-program DP4/DPH: %s (RSX_VP_PRECISE_DOT)", r ? "compensated dot product (stable depth where surfaces meet)" :
 +			"plain fp32 dot()");
++		return r;
++	}();
++	return on;
++}
++
++// R2PORT: RSX_VP_PRECISE_ALL (see VKR2Gfx.h)
++bool r2gx::vp_precise_all()
++{
++	static const bool on = []
++	{
++		const char* e = std::getenv("RSX_VP_PRECISE_ALL");
++		const bool r = !(e && *e && (e[0] == '0' || _stricmp(e, "off") == 0));
++		gxlog(r ? "vertex-program registers declared precise (no FMA contraction; RSX_VP_PRECISE_ALL=0: off)" :
++			"vertex-program registers not precise (RSX_VP_PRECISE_ALL=0)");
 +		return r;
 +	}();
 +	return on;
@@ -25789,10 +25803,10 @@ index 0000000..cec04de
 +#include "Emu/RSX/NV47/HW/context_accessors.undef.h"
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Gfx.h b/rpcs3/Emu/RSX/VK/VKR2Gfx.h
 new file mode 100644
-index 0000000..0049b23
+index 0000000..21a29ef
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Gfx.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,98 @@
 +// R2PORT: optional graphics-quality upgrades (VKR2Gfx.cpp). Everything here is inert unless its switch is set:
 +//   RSX_SHADOW_SCALE=2|4   shadow maps (square depth-only targets) rendered at 2x/4x the resolution
 +//   RSX_FX_FULLRES=1|2     half-resolution (1) and also quarter-resolution (2) effect targets at scene resolution
@@ -25868,6 +25882,12 @@ index 0000000..0049b23
 +	const char* vp_precise_dot_glsl();
 +	// log counters: one compiled vertex program (ops: DP4/DPH instructions using the helper)
 +	void vp_precise_dot_count(u32 ops);
++	// VKVertexProgram.cpp: RSX_VP_PRECISE_ALL (default 1 = on; 0 = off): every vertex-program register (outputs and
++	// float temps) is declared 'precise' (SPIR-V NoContraction), so no host compiler may fuse or reorder the math
++	// feeding the position differently in two programs. A depth pre-pass and its EQUAL colour pass then get the same
++	// depth bit for bit (R3 #43: the green lower eyelid in the Capelli close-up was such a mismatch; RC19 removed it).
++	// Compiled programs only (not the interpreter). Changing it changes every vertex shader: one full recompile.
++	bool vp_precise_all();
 +
 +	// VKTextureCache.cpp: texture packs. 'texpack_active' is a plain bool so the upload path costs one test
 +	// when neither RSX_TEXDUMP nor RSX_TEXPACK is set.
@@ -50682,7 +50702,7 @@ index 72342f9..2745a50 100644
  		vk::clear_status_interrupt(vk::heap_changed);
  	}
 diff --git a/rpcs3/Emu/RSX/VK/VKVertexProgram.cpp b/rpcs3/Emu/RSX/VK/VKVertexProgram.cpp
-index f0d9ebc..bbbbf6a 100644
+index f0d9ebc..6c6c5b4 100644
 --- a/rpcs3/Emu/RSX/VK/VKVertexProgram.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKVertexProgram.cpp
 @@ -6,6 +6,9 @@
@@ -50727,7 +50747,7 @@ index f0d9ebc..bbbbf6a 100644
  }
  
  void VKVertexDecompilerThread::insertFSExport(std::stringstream& OS)
-@@ -370,6 +389,12 @@ void VKVertexDecompilerThread::insertMainStart(std::stringstream& OS)
+@@ -370,10 +389,19 @@ void VKVertexDecompilerThread::insertMainStart(std::stringstream& OS)
  	properties2.emulate_depth_range = !!(m_prog.ctrl & RSX_SHADER_CONTROL_EMULATE_DEPTH_RANGE);
  
  	glsl::insert_glsl_legacy_function(OS, properties2);
@@ -50740,7 +50760,32 @@ index f0d9ebc..bbbbf6a 100644
  	glsl::insert_vertex_input_fetch(OS, glsl::glsl_rules_vulkan);
  
  	insertFSExport(OS);
-@@ -462,12 +487,24 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
+ 
++	// R2PORT: RSX_VP_PRECISE_ALL (VKR2Gfx.h): no contraction / reassociation of any register math
++	const char* r2_precise = r2gx::vp_precise_all() ? "precise " : "";
++
+ 	// Declare global registers with optional initialization
+ 	std::string registers;
+ 	if (ParamType *vec4Types = m_parr.SearchParam(PF_PARAM_OUT, "vec4"))
+@@ -383,7 +411,7 @@ void VKVertexDecompilerThread::insertMainStart(std::stringstream& OS)
+ 			if (registers.length())
+ 				registers += ", ";
+ 			else
+-				registers = "vec4 ";
++				registers = std::string(r2_precise) + "vec4 ";
+ 
+ 			registers += PI.name;
+ 
+@@ -422,7 +450,7 @@ void VKVertexDecompilerThread::insertMainStart(std::stringstream& OS)
+ 			if (PI.name.starts_with("dst_reg"))
+ 				continue;
+ 
+-			OS << "	" << PT.type << " " << PI.name;
++			OS << "	" << ((PT.type.starts_with("vec") || PT.type == "float") ? r2_precise : "") << PT.type << " " << PI.name;
+ 			if (!PI.value.empty())
+ 				OS << " = " << PI.value;
+ 
+@@ -462,12 +490,24 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
  	// FS payload
  	OS << "write_fs_payload();\n\n";
  
@@ -50765,7 +50810,7 @@ index f0d9ebc..bbbbf6a 100644
  				std::string condition = (!i.cond.empty()) ? "(" + i.cond + ") " : "";
  
  				if (condition.empty() || i.default_val.empty())
-@@ -498,9 +535,54 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
+@@ -498,9 +538,54 @@ void VKVertexDecompilerThread::insertMainEnd(std::stringstream& OS)
  		}
  	}
  
@@ -50821,7 +50866,7 @@ index f0d9ebc..bbbbf6a 100644
  	{
  		OS << "	gl_Position = apply_zclip_xform(gl_Position, z_near, z_far);\n";
  	}
-@@ -562,3 +644,15 @@ void VKVertexProgram::SetInputs(std::vector<vk::glsl::program_input>& inputs)
+@@ -562,3 +647,15 @@ void VKVertexProgram::SetInputs(std::vector<vk::glsl::program_input>& inputs)
  		uniforms.push_back(it);
  	}
  }
