@@ -32,6 +32,7 @@ void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context
     s_nid = nid;
     s_fn = fn;
 }
+int cellAudio_host_channels(void) { return 2; }
 
 static int32_t set_gamma(double g)
 {

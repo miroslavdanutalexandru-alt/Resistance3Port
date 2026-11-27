@@ -340,12 +340,20 @@ static void register_pc_options()
     // default (= the recommended choice) follows the default playback device: stereo -> Stereo, 8+ ch -> 7.1
     const int spk_ch = default_speaker_channels();
     add_option(SEC_PC, "speakers", "Speaker layout",
-               "The channel layout the game mixes for. Windows down-mixes to your real speakers or headphones. "
+               "The channel layout the game mixes for. Auto is 7.1 when Audio output is 7.1, else 5.1. "
                "The recommended choice follows your default playback device. "
-               "Pros of 5.1 / 7.1: proper surround on a surround system. Cons: on plain stereo Stereo can sound a little "
-               "fuller, since nothing is down-mixed.",
-               "PORT_SPEAKERS", { {"5.1 surround", ""}, {"7.1 surround", "8"}, {"Stereo", "2"} },
-               (spk_ch > 0 && spk_ch <= 2) ? 2 : spk_ch >= 8 ? 1 : 0);
+               "Pros of 5.1 / 7.1: proper surround on a surround system (it is folded down on stereo). Cons: on plain "
+               "stereo, Stereo can sound a little fuller, since nothing is folded down.",
+               "PORT_SPEAKERS", { {"Auto", ""}, {"7.1 surround", "8"}, {"Stereo", "2"}, {"5.1 surround", "6"} },
+               (spk_ch > 0 && spk_ch <= 2) ? 2 : 0);
+    // cellAudio.c audio_backend_init (GitHub R1 #39): host output channels
+    add_option(SEC_PC, "audio_channels", "Audio output",
+               "The channels the port sends to Windows. Auto follows the default playback device's speaker setup "
+               "(Windows Sound settings > your device > Speaker setup / Configure): 5.1 or 7.1 there gives every "
+               "surround speaker its own channel; stereo devices get the surround mix folded down as before. "
+               "Force 5.1 / 7.1 if Windows reports fewer channels than your receiver has; Windows down-mixes "
+               "a forced layout on a device that has fewer.",
+               "PORT_AUDIO_CHANNELS", { {"Auto", ""}, {"Stereo", "2"}, {"5.1", "6"}, {"7.1", "8"} }, 0);
     add_option(SEC_PC, "audio_buffer", "Audio buffer",
                "How much sound is buffered ahead. Auto is 100 ms (150 ms on CPUs with fewer than 12 threads). "
                "Pros of a larger buffer: no crackles or stretching when the CPU is busy. Cons: sound lags the picture a "

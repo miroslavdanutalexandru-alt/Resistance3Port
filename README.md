@@ -345,7 +345,8 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Audio › In the background | When the game is in the background | **Pause and mute**, Mute only, Keep running | `R2_BACKGROUND` |
 | Audio › In the background | Controller in the background | **Auto**, On, Off | `PAD_BACKGROUND_INPUT` (`1` / `0`) |
 | Audio › Sound | Master volume, Mono audio | **100 %** … Muted / **Off**, On | `PORT_VOLUME` (`0`–`90`), `PORT_AUDIO_MONO` (`1`) |
-| Audio › Sound | Speaker layout | **5.1 surround**, 7.1 surround, Stereo | `PORT_SPEAKERS` (`8` / `2`) |
+| Audio › Sound | Speaker layout | **Auto** (7.1 on a 7.1 output, else 5.1), 7.1 surround, Stereo, 5.1 surround | `PORT_SPEAKERS` (`8` / `2` / `6`) |
+| Audio › Sound | Audio output | **Auto** (the Windows device's speaker setup), Stereo, 5.1, 7.1 | `PORT_AUDIO_CHANNELS` (`2` / `6` / `8`) |
 | Audio › Sound | Audio buffer | **Auto** (100 ms; 150 ms under 12 CPU threads), 80, 100, 150, 200 ms | `PORT_AUDIO_BUFFER_MS` |
 | Interface & Notifications › Overlays | Performance overlay | **Off (F3 shows it)**, On at start, Disabled | `R2_OVERLAY` (unset / `1` / `0`) |
 | Interface & Notifications › Overlays | Frame-time graph, UI scale | **On**, Off / **Auto**, 75 % … 200 % | `PORT_OVERLAY_GRAPH` (`0`), `PORT_UI_SCALE` |
@@ -726,6 +727,8 @@ When the frame rate drops, the game's own audio mixing (on the recompiled PPU/SP
 |---|---|---|
 | `PORT_AUDIO_STRETCH` | `1` | SoundTouch buffer and time stretching. `0` = the previous audio output path, unchanged (the older built-in WSOLA stretcher; `PORT_AUDIO_WSOLA=0` turns that off too). |
 | `PORT_AUDIO_BUFFER_MS` | `100` (`150` with fewer than 12 logical CPUs) | Target buffer, 20–500 ms. More = fewer underruns, more latency. |
+| `PORT_AUDIO_CHANNELS` | auto | Host output channels: 2 / 6 / 8 (`stereo` / `5.1` / `7.1`). Unset: the Windows default device's mix format; a 5.1 / 7.1 device gets every PS3 channel on its own speaker (L R C LFE, Ls/Rs on the side pair, Lb/Rb on the back pair). The `[audio] host output:` log line shows what was opened. |
+| `PORT_AUDIO_SWAP_SURROUND` | `0` | `1`: PS3 Ls/Rs to the back speakers and Lb/Rb to the sides (if 7.1 surrounds sound swapped). |
 | `PORT_AUDIO_STRETCH_THRESHOLD` | `75` | Stretch below this % of the target buffer. |
 | `PORT_AUDIO_STRETCH_MIN` | `0.5` | Slowest tempo while stretching (0.1–1). |
 | `PORT_AUDIO_FADE_MS` | `5` | Fade-out / fade-in length on an underrun. |

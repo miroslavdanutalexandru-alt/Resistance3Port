@@ -22,6 +22,8 @@ void spu_lockline_unlock(void) {}
 void spu_coh_notify_write(uint32_t addr) { (void)addr; }
 void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width) { (void)addr; (void)val; (void)width; }
 void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*)) { (void)nid; (void)name; (void)fn; }
+/* cellAudio.c: the host output; TEST_HOST_CH=6/8 = a surround device */
+int cellAudio_host_channels(void) { const char* e = getenv("TEST_HOST_CH"); return e ? atoi(e) : 2; }
 
 int main(int argc, char** argv)
 {
@@ -33,7 +35,9 @@ int main(int argc, char** argv)
         setenv("PORT_SPEAKERS", v, 1);
 #endif
     }
-    const s32 want = strcmp(v, "2") == 0 ? 2 : strcmp(v, "8") == 0 ? 8 : 6;
+    const int host = cellAudio_host_channels();   /* unset PORT_SPEAKERS follows a 7.1 host */
+    const s32 want = strcmp(v, "2") == 0 ? 2 : strcmp(v, "8") == 0 ? 8 :
+                     (strcmp(v, "6") != 0 && host >= 8) ? 8 : 6;
 
     /* the game's selection (R3 0x008140F8 loop): the first type with the highest count */
     const u32 types[3] = { CELL_AUDIO_OUT_CODING_TYPE_LPCM, CELL_AUDIO_OUT_CODING_TYPE_AC3,

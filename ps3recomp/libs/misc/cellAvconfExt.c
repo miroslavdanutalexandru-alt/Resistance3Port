@@ -32,7 +32,17 @@ static float s_gamma = 1.0f;
  * API implementations
  * -----------------------------------------------------------------------*/
 
-/* PC port: the launcher's "Speaker layout" (PORT_SPEAKERS = 2 / 6 / 8, unset = 6).
+/* cellAudio.c: channels of the host output (2, 6 or 8) -- the Windows default
+ * device's layout or PORT_AUDIO_CHANNELS (GitHub R1 #39, same in R3). */
+extern int cellAudio_host_channels(void);
+static u8 avconf_host_chnum(void)
+{
+    const int ch = cellAudio_host_channels();
+    return ch >= 8 ? CELL_AUDIO_OUT_CHNUM_8 : ch >= 6 ? CELL_AUDIO_OUT_CHNUM_6 : CELL_AUDIO_OUT_CHNUM_2;
+}
+
+/* PC port: the launcher's "Speaker layout" (PORT_SPEAKERS = 2 / 6 / 8; unset =
+ * 8 on a 7.1 host output, else 6).
  * Resistance 3 picks its mix layout from the highest channel count reported
  * below for coding types 0 / 1 / 6 (func_008140D4 area: Configure with it; its
  * sound setup then mixes for that many speakers), so this is what
@@ -42,9 +52,10 @@ static u32 port_speaker_channels(void)
     static int sp = -1;
     if (sp < 0) {
         const char* e = getenv("PORT_SPEAKERS");
-        sp = e ? atoi(e) : 6;
-        if (sp != 2 && sp != 6 && sp != 8) sp = 6;
-        if (sp != 6) printf("[cellAvconfExt] speaker layout: %d channels (PORT_SPEAKERS)\n", sp);
+        sp = (e && *e) ? atoi(e) : 0;
+        if (sp != 2 && sp != 6 && sp != 8) sp = avconf_host_chnum() == CELL_AUDIO_OUT_CHNUM_8 ? 8 : 6;
+        if (sp != 6) printf("[cellAvconfExt] speaker layout: %d channels%s\n", sp,
+                            (e && *e) ? " (PORT_SPEAKERS)" : " (7.1 host output)");
     }
     return (u32)sp;
 }
@@ -145,7 +156,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
+    config->channel = avconf_host_chnum();
     config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
 
     return CELL_OK;
@@ -174,7 +185,7 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     vm_write8(ea + 3, 0);
     vm_write32(ea + 4, 0);                                  /* no down-mixer  */
     vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+    vm_write8(ea + 9, avconf_host_chnum());
     vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
     vm_write8(ea + 11, 0);
     vm_write32(ea + 12, 0);
