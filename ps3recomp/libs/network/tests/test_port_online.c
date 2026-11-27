@@ -185,6 +185,27 @@ int main(void)
     assert(port_online_parse_config("rpcn_host=np.rpcs3.net\n", &c) == 1 && c.rpcn_port == RPCN_DEFAULT_PORT);
     assert(port_online_parse_config("rpcn_host=x:99999\n", &c) == 0);
 
+    /* --- RPCN password derivation (PBKDF2-HMAC-SHA3-256, Python hashlib) -- */
+    {
+        uint8_t d[32], big[200];
+        char hx[65];
+        port_online_sha3_256("", 0, d);
+        for (int i = 0; i < 32; i++) sprintf(hx + 2 * i, "%02x", d[i]);
+        assert(!strcmp(hx, "a7ffc6f8bf1ed76651c14756a061d662f580ff4de43b49fa82d80a4b80f8434a"));
+        memset(big, 'a', sizeof(big));
+        port_online_sha3_256(big, sizeof(big), d);   /* spans the 136-byte rate */
+        for (int i = 0; i < 32; i++) sprintf(hx + 2 * i, "%02x", d[i]);
+        assert(!strcmp(hx, "cce34485baf2bf2aca99b94833892a4f52896d3d153f7b840cc4f9fe695f1387"));
+        memset(big, 'k', sizeof(big));               /* key longer than the block */
+        port_online_pbkdf2_sha3_256((const char*)big, sizeof(big), (const uint8_t*)"salt", 4, 3, d);
+        for (int i = 0; i < 32; i++) sprintf(hx + 2 * i, "%02x", d[i]);
+        assert(!strcmp(hx, "a0c51840c29c7de3e2a0aacdf167b269c03f133d0c65769befd852edb3ddddb3"));
+        port_online_rpcn_password("p@ss=word", hx);
+        assert(!strcmp(hx, "4087EC21929B552EBD6404870CE2283F812FEB9EC6720A77FA91B0F64C5CA49B"));
+        port_online_rpcn_password("4087ec21929b552ebd6404870ce2283f812feb9ec6720a77fa91b0f64c5ca49b", hx);
+        assert(!strcmp(hx, "4087EC21929B552EBD6404870CE2283F812FEB9EC6720A77FA91B0F64C5CA49B"));
+    }
+
     /* --- DNS wire format -------------------------------------------------- */
     uint8_t q[300];
     int ql = port_dns_build_query(0x1234, "a.bc", q, sizeof(q));

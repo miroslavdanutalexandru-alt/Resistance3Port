@@ -361,6 +361,135 @@ int port_online_resolve(const char* name, uint32_t* ip_out)
 }
 
 /* ---------------------------------------------------------------------------
+ * RPCN password: RPCN stores PBKDF2-HMAC-SHA3-256(password, salt, 200000)
+ * as 64 uppercase hex chars and Login carries that digest, never the plain
+ * text (RPCS3 rpcn_settings_dialog.cpp derive_password). SHA3 is not in every
+ * Windows CNG, so a small Keccak lives here.
+ * -----------------------------------------------------------------------*/
+
+#define PO_SHA3_RATE 136   /* SHA3-256: 1600 - 2*256 bits */
+
+static void po_keccakf(uint64_t s[25])
+{
+    static const uint64_t rc[24] = {
+        0x0000000000000001ULL, 0x0000000000008082ULL, 0x800000000000808aULL, 0x8000000080008000ULL,
+        0x000000000000808bULL, 0x0000000080000001ULL, 0x8000000080008081ULL, 0x8000000000008009ULL,
+        0x000000000000008aULL, 0x0000000000000088ULL, 0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL, 0x8000000000008089ULL, 0x8000000000008003ULL,
+        0x8000000000008002ULL, 0x8000000000000080ULL, 0x000000000000800aULL, 0x800000008000000aULL,
+        0x8000000080008081ULL, 0x8000000000008080ULL, 0x0000000080000001ULL, 0x8000000080008008ULL };
+    static const int rot[25] = { 0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39,
+                                 41, 45, 15, 21, 8, 18, 2, 61, 56, 14 };
+    for (int r = 0; r < 24; r++) {
+        uint64_t c[5], b[25];
+        for (int x = 0; x < 5; x++) c[x] = s[x] ^ s[x + 5] ^ s[x + 10] ^ s[x + 15] ^ s[x + 20];
+        for (int x = 0; x < 5; x++) {
+            uint64_t d = c[(x + 4) % 5] ^ (c[(x + 1) % 5] << 1 | c[(x + 1) % 5] >> 63);
+            for (int y = 0; y < 25; y += 5) s[y + x] ^= d;
+        }
+        for (int x = 0; x < 5; x++)
+            for (int y = 0; y < 5; y++) {
+                int i = x + 5 * y, n = rot[i];
+                b[y + 5 * ((2 * x + 3 * y) % 5)] = n ? (s[i] << n | s[i] >> (64 - n)) : s[i];
+            }
+        for (int y = 0; y < 25; y += 5)
+            for (int x = 0; x < 5; x++) s[y + x] = b[y + x] ^ (~b[y + (x + 1) % 5] & b[y + (x + 2) % 5]);
+        s[0] ^= rc[r];
+    }
+}
+
+typedef struct { uint64_t s[25]; size_t n; } po_sha3;
+
+static void po_sha3_init(po_sha3* h) { memset(h, 0, sizeof(*h)); }
+
+static void po_sha3_update(po_sha3* h, const uint8_t* p, size_t len)
+{
+    while (len--) {
+        h->s[h->n >> 3] ^= (uint64_t)*p++ << (8 * (h->n & 7));
+        if (++h->n == PO_SHA3_RATE) { po_keccakf(h->s); h->n = 0; }
+    }
+}
+
+static void po_sha3_final(po_sha3* h, uint8_t out[32])
+{
+    h->s[h->n >> 3] ^= (uint64_t)0x06 << (8 * (h->n & 7));
+    h->s[(PO_SHA3_RATE - 1) >> 3] ^= (uint64_t)0x80 << (8 * ((PO_SHA3_RATE - 1) & 7));
+    po_keccakf(h->s);
+    for (int i = 0; i < 32; i++) out[i] = (uint8_t)(h->s[i >> 3] >> (8 * (i & 7)));
+}
+
+void port_online_sha3_256(const void* data, size_t len, uint8_t out[32])
+{
+    po_sha3 h;
+    po_sha3_init(&h);
+    po_sha3_update(&h, (const uint8_t*)data, len);
+    po_sha3_final(&h, out);
+}
+
+/* HMAC keyed state: inner/outer hashes after absorbing the padded key. */
+typedef struct { po_sha3 in, out; } po_hmac;
+
+static void po_hmac_init(po_hmac* m, const uint8_t* key, size_t klen)
+{
+    uint8_t k[PO_SHA3_RATE] = { 0 }, pad[PO_SHA3_RATE];
+    if (klen > PO_SHA3_RATE) port_online_sha3_256(key, klen, k);
+    else memcpy(k, key, klen);
+    for (int i = 0; i < PO_SHA3_RATE; i++) pad[i] = k[i] ^ 0x36;
+    po_sha3_init(&m->in); po_sha3_update(&m->in, pad, sizeof(pad));
+    for (int i = 0; i < PO_SHA3_RATE; i++) pad[i] = k[i] ^ 0x5c;
+    po_sha3_init(&m->out); po_sha3_update(&m->out, pad, sizeof(pad));
+}
+
+static void po_hmac_run(const po_hmac* m, const uint8_t* a, size_t alen,
+                        const uint8_t* b, size_t blen, uint8_t out[32])
+{
+    po_sha3 h = m->in;
+    uint8_t inner[32];
+    po_sha3_update(&h, a, alen);
+    if (blen) po_sha3_update(&h, b, blen);
+    po_sha3_final(&h, inner);
+    h = m->out;
+    po_sha3_update(&h, inner, sizeof(inner));
+    po_sha3_final(&h, out);
+}
+
+/* PBKDF2-HMAC-SHA3-256, one 32-byte block. */
+void port_online_pbkdf2_sha3_256(const char* pass, size_t plen, const uint8_t* salt, size_t slen,
+                                 uint32_t iters, uint8_t out[32])
+{
+    po_hmac m;
+    uint8_t u[32];
+    static const uint8_t block1[4] = { 0, 0, 0, 1 };
+    po_hmac_init(&m, (const uint8_t*)pass, plen);
+    po_hmac_run(&m, salt, slen, block1, 4, u);
+    memcpy(out, u, 32);
+    for (uint32_t i = 1; i < iters; i++) {
+        po_hmac_run(&m, u, 32, NULL, 0, u);
+        for (int j = 0; j < 32; j++) out[j] ^= u[j];
+    }
+}
+
+/* online.ini may hold the plain password or the already derived 64-hex-char
+ * value (e.g. copied from RPCS3's rpcn.yml); the latter goes out unchanged. */
+void port_online_rpcn_password(const char* configured, char out[65])
+{
+    static const char salt[] = "No matter where you go, everybody's connected.";
+    static const char hex[] = "0123456789ABCDEF";
+    size_t n = strlen(configured);
+    int is_hex = n == 64;
+    for (size_t i = 0; is_hex && i < n; i++) is_hex = isxdigit((unsigned char)configured[i]) != 0;
+    if (is_hex) {
+        for (size_t i = 0; i < 64; i++) out[i] = (char)toupper((unsigned char)configured[i]);
+        out[64] = '\0';
+        return;
+    }
+    uint8_t d[32];
+    port_online_pbkdf2_sha3_256(configured, n, (const uint8_t*)salt, sizeof(salt) - 1, 200000, d);
+    for (int i = 0; i < 32; i++) { out[2 * i] = hex[d[i] >> 4]; out[2 * i + 1] = hex[d[i] & 15]; }
+    out[64] = '\0';
+}
+
+/* ---------------------------------------------------------------------------
  * RPCN wire format
  * -----------------------------------------------------------------------*/
 
@@ -804,7 +933,9 @@ static int po_rpcn_session(const char* service_id, const uint8_t* cookie, uint32
     if (!service_id) { rc = 0; goto done; }
 
     uint8_t buf[RPCN_HEADER_SIZE + 4 + 64 + SCE_NP_COOKIE_MAX_SIZE + 256];
-    int n = rpcn_build_login(buf, sizeof(buf), 1, s_cfg.rpcn_user, s_cfg.rpcn_password, s_cfg.rpcn_token);
+    static char s_derived[65];
+    if (!s_derived[0]) port_online_rpcn_password(s_cfg.rpcn_password, s_derived);
+    int n = rpcn_build_login(buf, sizeof(buf), 1, s_cfg.rpcn_user, s_derived, s_cfg.rpcn_token);
     if (n < 0 || po_tls_send(&t, buf, (size_t)n) < 0 || po_rpcn_reply(&t, RPCN_CMD_LOGIN, 1, &p, &pl) < 0) {
         printf("[online] rpcn: login exchange failed\n");
         goto done;

@@ -6,6 +6,8 @@
 # RPCN server (host or host:port, default port 31313)
 rpcn_host = np.rpcs3.net
 rpcn_user =
+# Your RPCN password, or the 64-character derived value from RPCS3's rpcn.yml.
+# The port derives it the way RPCS3 does; the plain text never goes on the wire.
 rpcn_password =
 # Only if the server asked for an email token when the account was made
 rpcn_token =

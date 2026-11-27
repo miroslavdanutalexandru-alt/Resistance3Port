@@ -178,6 +178,10 @@ int32_t  sys_net_bnet_inet_aton(const char* cp, uint32_t* inp);
 uint32_t sys_net_bnet_inet_addr(const char* cp);
 uint32_t sys_net_bnet_inet_ntoa(uint32_t addr);
 uint32_t sys_net_bnet_gethostbyname(const char* name);
+uint32_t sys_net_bnet_gethostbyaddr(const void* addr, uint32_t len, int32_t type);
+uint32_t sys_net_bnet_inet_ntop(int32_t family, const void* src, char* dst, uint32_t size);
+int32_t  sys_net_bnet_sendmsg(int32_t s, const void* msg, int32_t flags);
+int32_t  sys_net_bnet_recvmsg(int32_t s, void* msg, int32_t flags);
 
 /* Guest address of the errno cell. */
 uint32_t sys_net_errno_loc(void);

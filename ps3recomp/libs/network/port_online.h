@@ -75,6 +75,14 @@ int64_t rpcn_parse_server_info(const uint8_t* pkt, size_t len);
 int  rpcn_parse_login_reply(const uint8_t* p, size_t len, char* online_name, size_t name_cap);
 int  rpcn_parse_ticket_reply(const uint8_t* p, size_t len, const uint8_t** ticket, uint32_t* ticket_len);
 
+/* RPCN Login sends PBKDF2-HMAC-SHA3-256(password, RPCS3 salt, 200000) as 64
+ * uppercase hex chars; a configured 64-hex-char value is taken as already
+ * derived. out gets 64 chars + NUL. */
+void port_online_rpcn_password(const char* configured, char out[65]);
+void port_online_sha3_256(const void* data, size_t len, uint8_t out[32]);
+void port_online_pbkdf2_sha3_256(const char* pass, size_t plen, const uint8_t* salt, size_t slen,
+                                 uint32_t iters, uint8_t out[32]);
+
 /* NP ticket (version 0x21010000, as RPCN issues; RPCS3 np::ticket layout).
  * kind: 1 = u32 in v, 2 = u64 in v, 3 = n bytes in data. Returns 0, or -1
  * when the ticket is malformed or the field is missing or the wrong size. */
