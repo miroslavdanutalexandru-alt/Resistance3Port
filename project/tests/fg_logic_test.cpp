@@ -266,6 +266,44 @@ static void test_gap()
 	for (int i = 0; i < 30; ++i) { const int sc = (i % 7) != 3; a = pfg_streak(a, sc); b = pfg_streak_gap(b, sc, &gap, 0); CHECK(a == b); }
 }
 
+// R?_DLSS_FG_REAL_CAMERA: camera from a view-projection P * W (W: world -> view with a known pose)
+static void test_camera_from_vp()
+{
+	const double yaw = 0.7, pitch = -0.2, ys = 1.0 / std::tan(0.39), xs = ys / (16.0 / 9.0);
+	const double cp = std::cos(pitch), sp = std::sin(pitch), cy = std::cos(yaw), sy = std::sin(yaw);
+	const double fw[3] = { cp * sy, sp, cp * cy };
+	const double rt[3] = { cy, 0.0, -sy };
+	const double up[3] = { fw[1] * rt[2] - fw[2] * rt[1], fw[2] * rt[0] - fw[0] * rt[2], fw[0] * rt[1] - fw[1] * rt[0] };
+	const double pos[3] = { 12.5, -3.0, 470.0 };
+	const double n = 0.08, fa = 4000.0;
+	const double* rows[4] = { rt, up, fw, fw };
+	const double sc[4] = { xs, ys, fa / (fa - n), 1.0 };
+	double V[16];
+	for (int r = 0; r < 4; ++r)
+	{
+		for (int i = 0; i < 3; ++i) V[r * 4 + i] = sc[r] * rows[r][i];
+		V[r * 4 + 3] = -sc[r] * pfg_dot3(rows[r], pos) + (r == 2 ? -n * fa / (fa - n) : 0.0);
+	}
+	// jitter in clip x / y (j * w) must not move the camera
+	V[0] += 0.001 * V[12]; V[1] += 0.001 * V[13]; V[2] += 0.001 * V[14]; V[3] += 0.001 * V[15];
+	pfg_camera c{};
+	CHECK(pfg_camera_from_vp(V, &c));
+	for (int i = 0; i < 3; ++i)
+	{
+		CHECK(std::fabs(c.pos[i] - pos[i]) < 1e-6);
+		CHECK(std::fabs(c.fwd[i] - fw[i]) < 1e-9);
+		CHECK(std::fabs(c.right[i] - rt[i]) < 1e-9);
+		CHECK(std::fabs(c.up[i] - up[i]) < 1e-9);
+	}
+	CHECK(std::fabs(c.xs - xs) < 1e-9 && std::fabs(c.ys - ys) < 1e-9);
+	CHECK(std::fabs(2.0 * std::atan(1.0 / c.ys) - 0.78) < 1e-9);
+	double bad[16] = {};
+	pfg_camera k = c;
+	CHECK(!pfg_camera_from_vp(bad, &k) && k.pos[0] == c.pos[0]);
+	bad[0] = 1.0; bad[5] = 1.0; bad[14] = 1.0; bad[3] = std::nan("");
+	CHECK(!pfg_camera_from_vp(bad, &k));
+}
+
 // RSX_DLSS_OBJMV_DEFORM capture policy (VKR2DeformLogic.h, VKR2Upscaler.cpp om2 record path)
 static void test_deform()
 {
@@ -452,6 +490,7 @@ int main()
 	test_gate();
 #ifndef PFG_R1
 	test_gap();
+	test_camera_from_vp();
 	test_deform();
 	test_vp_pick();
 	test_pair_nearest();
