@@ -16,10 +16,15 @@ set "FREEZE_RELAUNCH=900"
 set "PS3_MAPPER_BASE=30000000"
 rem skip the logo + "story so far" recap movie (plays during the first load)
 set "SKIP_INTRO=1"
-rem your copy of the game (Setup.bat put it here)
-set "PS3_VFS_ROOT=%~dp0gamefiles"
+rem your copy of the game: gamefiles\ (Setup.bat put it there), or the folder set in the launcher (Saves and tools,
+rem Game files folder: settings.bat PORT_GAMEFILES). A PS3_VFS_ROOT set before this line (in the environment, or by
+rem hand right here, like set "PS3_VFS_ROOT=E:\Games\gamefiles") wins over both. Updates replace run.bat, so prefer
+rem the launcher setting.
 rem Launcher.exe writes settings.bat (display mode, frame limit, vsync, filtering, keys)
 if exist "%~dp0settings.bat" call "%~dp0settings.bat"
+if not defined PS3_VFS_ROOT if defined PORT_GAMEFILES set "PS3_VFS_ROOT=%PORT_GAMEFILES%"
+if not defined PS3_VFS_ROOT set "PS3_VFS_ROOT=%~dp0gamefiles"
+if not exist "%PS3_VFS_ROOT%\PS3_GAME\USRDIR\" (echo Your game files were not found - run Setup.bat, or check the game files folder in the launcher, Saves and tools page. & pause & exit /b 1)
 rem crash dumps are opt-in: set R2_DUMPS=1 to have Windows write minidumps to logs\dumps (newest 3 kept)
 set "R2_WER=HKCU\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Resistance3.exe"
 if "%R2_DUMPS%"=="1" (
