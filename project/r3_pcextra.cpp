@@ -277,19 +277,24 @@ extern "C" int r3_fx_dof_aim_skip(uint32_t player)
     last_skip = skip; last_player = player; last_t = t;
     return skip;
 }
-/* R3_FG_MBLUR_SCALE (default 1 = unchanged): multiplies the camera blur strength (p+0x14) and the object blur
- * sample scale (p+0xC) while frame generation is selected (R3_DLSS_FG / R2_DLSS_FG set and not 0). NVIDIA's DLSS-G
- * guide asks for half the motion-blur distance with FG on (0.5): blur already in the colour image is interpolated
- * as smear. Frame generation is a restart setting, so the choice is made once. */
+/* R3_FG_MBLUR_SCALE (default 0.5; 1 = unchanged): multiplies the camera blur strength (p+0x14) and the object blur
+ * sample scale (p+0xC) while frame generation is selected (R3_DLSS_FG / R2_DLSS_FG set and not 0, or PORT_FG=dlssg|fsr3;
+ * PORT_FG=off wins). NVIDIA's DLSS-G guide asks for half the motion-blur distance with FG on (0.5): blur already in the
+ * colour image is interpolated as smear. Frame generation is a restart setting, so the choice is made once. */
 static void fx_mb_scale(uint32_t ea)
 {
     static float scale = -1.0f;
     if (scale < 0.0f) {
         std::string fg = envs("DLSS_FG", "");
         if (fg.empty()) { const char* e = getenv("R2_DLSS_FG"); if (e) fg = e; }
+        bool fg_on = !fg.empty() && fg != "0";
+        if (const char* pf = getenv("PORT_FG")) {
+            if (!_stricmp(pf, "off")) fg_on = false;
+            else if (!_stricmp(pf, "dlssg") || !_stricmp(pf, "fsr3")) fg_on = true;
+        }
         const std::string v = envs("FG_MBLUR_SCALE", "");
         scale = 1.0f;
-        if (!fg.empty() && fg != "0" && !v.empty()) scale = std::clamp((float)atof(v.c_str()), 0.0f, 1.0f);
+        if (fg_on) scale = v.empty() ? 0.5f : std::clamp((float)atof(v.c_str()), 0.0f, 1.0f);
         if (scale != 1.0f) LOG("[fx] motion blur x%.2f under frame generation (R3_FG_MBLUR_SCALE)", scale);
     }
     if (scale != 1.0f && ea && vm_base) fx_setf(ea, fx_getf(ea) * scale);

@@ -19587,7 +19587,7 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..d26bc31
+index 0000000..085aa0c
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 @@ -0,0 +1,2845 @@
@@ -19712,8 +19712,8 @@ index 0000000..d26bc31
 +		float depth_sep = 40.f; // R2_DLSS_FG_DEPTH_SEP: minRelativeLinearDepthObjectSeparation (Streamline default 40)
 +		int limit_fps = 0; // R2_DLSS_FG_LIMIT_FPS: cap on presented fps with DLSS-G on (0 = refresh-based cap); evens out an uneven base rate
 +		// R3_DLSS_FG_REAL_CAMERA=1: camera position / axes / projection from the game's view-projection instead of fixed defaults.
-+		// Off by default in R3 until checked on an R3 RSX_MV_DUMP (R3's dumps carry no game_vp yet; R2's validate it)
-+		bool real_cam = false;
++		// On by default (as R2 / R1); R3_DLSS_FG_REAL_CAMERA=0 = the old fixed camera
++		bool real_cam = true;
 +		unsigned gap = 2; // R?_DLSS_FG_GAP: scene-less frames mid-play that resume without the warm-up (pfg_streak_gap; 0 = old)
 +		int pace = PFG_PACE_VRR; // FSR 3 present pacer (PORT_FG_PACE)
 +		// R?_DLSS_FG_REFLEX_IDS: Reflex / PCL frame id of a present. 1: the game frame it shows (finished game frames are
@@ -19757,7 +19757,7 @@ index 0000000..d26bc31
 +			r.cam_reset = std::clamp(penv_int("DLSS_FG_CAM_RESET", 1), 0, 2);
 +			r.gap = static_cast<unsigned>(std::clamp(penv_int("DLSS_FG_GAP", 2), 0, 8));
 +			r.cam_ident = penv_int("DLSS_FG_CAM_IDENT", 0) != 0;
-+			r.real_cam = penv_int("DLSS_FG_REAL_CAMERA", 0) != 0;
++			r.real_cam = penv_int("DLSS_FG_REAL_CAMERA", 1) != 0;
 +		r.limit_fps = std::clamp(penv_int("DLSS_FG_LIMIT_FPS", 0), 0, 1000);
 +		if (r.limit_fps) std::fprintf(stderr, "[fg-vk] DLSS_FG_LIMIT_FPS=%d (presented frames)\n", r.limit_fps);
 +			if (const char* e = penv("DLSS_FG_DEPTH_SEP")) { const float v = static_cast<float>(std::atof(e)); if (v > 0.f && v < 10000.f) r.depth_sep = v; }
@@ -21455,7 +21455,7 @@ index 0000000..d26bc31
 +		vk::r2aa_camera(cn, cf, cv);
 +		const double n = cn, fa = cf, fov = cv, aspect = f.rh ? static_cast<double>(f.rw) / f.rh : 16.0 / 9.0;
 +		const double ys = 1.0 / std::tan(fov * 0.5), xs = ys / aspect;
-+		// R3_DLSS_FG_REAL_CAMERA (default off): position, axes and x / y scales of the game's camera (vk::r2fg_game_vp)
++		// R3_DLSS_FG_REAL_CAMERA (default on): position, axes and x / y scales of the game's camera (vk::r2fg_game_vp)
 +		// not with an identity clipToPrevClip (CAM_IDENT): a moving camera would contradict it
 +		const pfg_camera* rc = fgcfg().real_cam && vk::g_fg_cam_ok && !fgcfg().cam_ident ? &vk::g_fg_cam : nullptr;
 +		mat4 P{};
