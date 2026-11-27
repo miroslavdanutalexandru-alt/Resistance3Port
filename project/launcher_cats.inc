@@ -31,7 +31,7 @@ static const CatGroup g_cat[] = {
     { P_UI,       "OVERLAYS",                      "overlay ovgraph uiscale benchkey" },
     { P_UI,       "PHOTO MODE AND DISCORD",        "photo discord" },
     { P_ADVANCED, "START-UP",                      "skipintro" },
-    { P_ADVANCED, "CHEATS (SINGLE PLAYER)",        "cheat_god cheat_ammo cheat_grenades cheat_keys" },
+    { P_ADVANCED, "CHEATS (SINGLE PLAYER)",        "cheat_god cheat_ammo cheat_grenades cheat_keys unlock_all" },
     { P_ADVANCED, "MODS AND TEXTURES",             "mods texpack texdump hdui" },
     { P_ADVANCED, "SAVES",                         "savedir savebackup" },
     { P_ADVANCED, "CPU THREADS",                   "pcores threadprio" },

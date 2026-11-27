@@ -78,6 +78,7 @@ void r2pf_toast(const char* title, const char* text, char badge);
 void r2pf_hint(const char* title, const char* text, unsigned ms);
 int r3_cheat_set(int which, int on);                         /* r3_cheats.cpp: new state, -1 bench / -2 online */
 void r3_cheats_init_env(void);
+int r3_unlock_all_set(int on);                               /* r3_cheats.cpp: R3_UNLOCK_ALL, same return values */
 extern volatile int g_r3_cheat_ammo;                         /* r3_cheats.cpp */
 int r2pf_overlay_get(void);
 void r2pf_overlay_set(int on);
@@ -770,6 +771,11 @@ static void live_cheat_god(const std::string& v) { cheat_row(0, v); }
 static void live_cheat_ammo(const std::string& v) { cheat_row(1, v); }
 static void live_cheat_gren(const std::string& v) { cheat_row(2, v); }
 static void live_cheat_keys(const std::string& v) { s_cheat_keys = v == "1"; }
+static void live_unlock_all(const std::string& v)
+{
+    const int on = r3_unlock_all_set(v == "1");
+    if (on < 0 && v == "1") r2pf_hint("Unlock all", on == -2 ? "Off while online (PORT_ONLINE)" : "Off in a benchmark run", 2500);
+}
 static void opt_add(const wchar_t* title, const wchar_t* help, const char* ini, const char* env, int restart,
                     std::vector<XChoice> ch, const char* def, void (*live)(const std::string&))
 {
@@ -914,6 +920,9 @@ static void opts_init(void)
             "cheat_grenades", "PORT_CHEAT_GRENADES", 0, offon, "", live_cheat_gren);
     opt_add(L"Cheat hotkeys", L"Ctrl+F1 toggles God mode, Ctrl+F2 Infinite ammo and grenades (not while F1 / F2 is bound in controls.txt).",
             "cheat_keys", "PORT_CHEAT_KEYS", 0, offon, "", live_cheat_keys);
+    opt_add(L"Unlock all chapters and extras", L"Every chapter in Campaign > Load Level and every Extras item (the game's own cheats "
+            L"such as Bloody Hell, skins, concept art, videos). Your save is not changed. Trophies are off once you turn one of "
+            L"the game's cheats on, until the game is restarted.", "unlock_all", "R3_UNLOCK_ALL", 0, offon, "", live_unlock_all);
 }
 enum { PG_MAIN, PG_KEYS, PG_PAD };
 static int s_open = 0, s_page = PG_MAIN, s_sel = 0, s_top = 0, s_capture = 0, s_release = 0;

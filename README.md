@@ -359,6 +359,7 @@ The options are sorted into pages, each with group headings (the same pages as t
 | Advanced › Start-up | Skip intro movies | **On**, Off | `SKIP_INTRO` |
 | Advanced › Cheats (single player) | God mode / Infinite ammo / Infinite grenades | **Off**, On | `PORT_CHEAT_GODMODE`, `PORT_CHEAT_AMMO`, `PORT_CHEAT_GRENADES` (`1` = on; also F9 rows; never online (`PORT_ONLINE`) or in a benchmark run; trophies are off from the first use until the game is restarted) |
 | Advanced › Cheats (single player) | Cheat hotkeys | **Off**, On | `PORT_CHEAT_KEYS` (`1`: Ctrl+F1 toggles God mode, Ctrl+F2 Infinite ammo and grenades; ignored if that F key is bound in `controls.txt`) |
+| Advanced › Cheats (single player) | Unlock all chapters and extras | **Off**, On | `R3_UNLOCK_ALL` (`1`: every Campaign › Load Level chapter and every Extras item, the game's own cheats such as Bloody Hell, skins, concept art and videos, report unlocked; the save is not written. Not online or in a benchmark run. Turning one of the game's cheats on stops trophies until the game is restarted; turn the game's cheats off before turning this off) |
 | Advanced › Mods and textures | Mods folder | **Off**, On | `R2_MODS` (`1` / `<folder>`) |
 | Advanced › Mods and textures | Texture pack / Dump textures / HD UI pack | **Off**, On (Dump: also Menus / HUD only) | `RSX_TEXPACK`, `RSX_TEXDUMP` (`1` / `ui` / `<folder>`), `RSX_HD_UI` (`1` / `<folder>`) |
 | Advanced › Saves | Save location | **Game folder**, Saved Games\Resistance 3, a picked folder | `PS3_GAMEDATA_ROOT` |

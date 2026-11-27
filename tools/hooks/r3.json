@@ -1393,6 +1393,146 @@
      "        ctx->gpr[3] = R_3 = (uint64_t)(int64_t)r3_movie_skip_btn_hook((int32_t)R_3);"
     ]
    }
+  ],
+  "func_0034AE78": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_0034AE78(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" uint32_t r3_unlock_locmask(uint32_t mask);   /* R3: R3_UNLOCK_ALL (r3_cheats.cpp) */",
+     "void func_0034AE78(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 417,
+    "ctx": "loc_0034B428:",
+    "rm": [
+     "        ctx->gpr[3] = R_3 = vm_read16(R_29 + 0x88);"
+    ],
+    "add": [
+     "        ctx->gpr[3] = R_3 = vm_read16(R_29 + 0x88);",
+     "        ctx->gpr[3] = R_3 = r3_unlock_locmask((uint32_t)R_3);   /* R3_UNLOCK_ALL: Load Level offered */"
+    ]
+   }
+  ],
+  "func_00438230": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00438230(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r3_unlock_extra(uint32_t lr, uint32_t category);   /* R3: R3_UNLOCK_ALL, Extras items report unlocked (r3_cheats.cpp) */",
+     "void func_00438230(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 35,
+    "ctx": "        goto loc_004383CC;",
+    "rm": [
+     "loc_00438270:"
+    ],
+    "add": [
+     "loc_00438270:",
+     "        if ((int32_t)R_30 != 0 && r3_unlock_extra((uint32_t)R_lr, (uint32_t)R_4)) { ctx->gpr[3] = R_3 = (int64_t)(int32_t)(1); goto loc_004383CC; }   /* R3_UNLOCK_ALL: unlocked (not for the store points total) */"
+    ]
+   }
+  ],
+  "func_00357DE0": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00357DE0(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" uint32_t r3_unlock_locmask(uint32_t mask);   /* R3: R3_UNLOCK_ALL (r3_cheats.cpp) */",
+     "void func_00357DE0(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 416,
+    "ctx": "        { uint64_t _a = R_1; uint64_t _r = _a + (uint64_t)(int64_t)(0x158); ctx->gpr[4] = R_4 = _r; ctx->xer = R_xer = (R_xer & ~(1u << 29)) | ((_r < _a) ? (1u << 29) : 0u); }",
+    "rm": [
+     "        ctx->gpr[3] = R_3 = vm_read16(R_3 + 0x2C6C);"
+    ],
+    "add": [
+     "        ctx->gpr[3] = R_3 = vm_read16(R_3 + 0x2C6C);",
+     "        ctx->gpr[3] = R_3 = r3_unlock_locmask((uint32_t)R_3);   /* R3_UNLOCK_ALL: Load Level offered */"
+    ]
+   }
+  ],
+  "func_0034A558": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_0034A558(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" uint32_t r3_unlock_locmask(uint32_t mask); extern \"C\" uint32_t r3_unlock_chapter(uint32_t v);   /* R3: R3_UNLOCK_ALL, Load Level (r3_cheats.cpp) */",
+     "void func_0034A558(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 76,
+    "ctx": "        ctx->gpr[4] = R_4 = (uint64_t)((R_4 & 0x20) ? 0u : ((uint32_t)R_5 << (R_4 & 0x1F)));",
+    "rm": [
+     "        ctx->gpr[5] = R_5 = vm_read16(R_29 + 0x88);"
+    ],
+    "add": [
+     "        ctx->gpr[5] = R_5 = vm_read16(R_29 + 0x88);",
+     "        ctx->gpr[5] = R_5 = r3_unlock_locmask((uint32_t)R_5);   /* R3_UNLOCK_ALL: every location */"
+    ]
+   },
+   {
+    "at": 90,
+    "ctx": "        ctx->gpr[5] = R_5 = ppc_rldicl(R_3, 0, 32);",
+    "rm": [
+     "        ctx->gpr[5] = R_5 = vm_read8(R_5 + 0x8A);"
+    ],
+    "add": [
+     "        ctx->gpr[5] = R_5 = vm_read8(R_5 + 0x8A);",
+     "        ctx->gpr[5] = R_5 = r3_unlock_chapter((uint32_t)R_5);   /* R3_UNLOCK_ALL: every chapter reached */"
+    ]
+   },
+   {
+    "at": 319,
+    "ctx": "        ctx->gpr[3] = R_3 = ppc_rldicl(R_3, 0, 32);",
+    "rm": [
+     "        ctx->gpr[24] = R_24 = vm_read8(R_3 + 0x89);"
+    ],
+    "add": [
+     "        ctx->gpr[24] = R_24 = vm_read8(R_3 + 0x89);",
+     "        ctx->gpr[24] = R_24 = r3_unlock_chapter((uint32_t)R_24);"
+    ]
+   },
+   {
+    "at": 548,
+    "ctx": "        ctx->gpr[3] = R_3 = ppc_rldicl(R_3, 0, 32);",
+    "rm": [
+     "        ctx->gpr[3] = R_3 = vm_read8(R_3 + 0x8A);"
+    ],
+    "add": [
+     "        ctx->gpr[3] = R_3 = vm_read8(R_3 + 0x8A);",
+     "        ctx->gpr[3] = R_3 = r3_unlock_chapter((uint32_t)R_3);"
+    ]
+   },
+   {
+    "at": 568,
+    "ctx": "        { uint64_t a = (uint32_t)R_4; uint64_t b = (uint32_t)R_6; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((R_xer >> 31) & 1u); ctx->cr = R_cr = (R_cr & ~(0xFu << 28)) | (cr_val << 28); }",
+    "rm": [
+     "        ctx->gpr[7] = R_7 = vm_read8(R_7 + 0x8A);"
+    ],
+    "add": [
+     "        ctx->gpr[7] = R_7 = vm_read8(R_7 + 0x8A);",
+     "        ctx->gpr[7] = R_7 = r3_unlock_chapter((uint32_t)R_7);"
+    ]
+   }
   ]
  },
  "preamble": [],
