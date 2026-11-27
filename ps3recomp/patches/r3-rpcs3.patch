@@ -19042,10 +19042,10 @@ index 0000000..d9b6d17
 +}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
 new file mode 100644
-index 0000000..3ac00bc
+index 0000000..3f89ec8
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2FrameGen.cpp
-@@ -0,0 +1,2829 @@
+@@ -0,0 +1,2830 @@
 +// R2PORT: Resistance 2/3 port addition (not upstream RPCS3).
 +// Frame generation, two backends:
 +//  * NVIDIA DLSS Frame Generation through Streamline (manual hooking): sl.interposer.dll is loaded at run time
@@ -20896,7 +20896,8 @@ index 0000000..3ac00bc
 +		const double n = cn, fa = cf, fov = cv, aspect = f.rh ? static_cast<double>(f.rw) / f.rh : 16.0 / 9.0;
 +		const double ys = 1.0 / std::tan(fov * 0.5), xs = ys / aspect;
 +		// R3_DLSS_FG_REAL_CAMERA (default off): position, axes and x / y scales of the game's camera (vk::r2fg_game_vp)
-+		const pfg_camera* rc = fgcfg().real_cam && vk::g_fg_cam_ok ? &vk::g_fg_cam : nullptr;
++		// not with an identity clipToPrevClip (CAM_IDENT): a moving camera would contradict it
++		const pfg_camera* rc = fgcfg().real_cam && vk::g_fg_cam_ok && !fgcfg().cam_ident ? &vk::g_fg_cam : nullptr;
 +		mat4 P{};
 +		P[0][0] = rc ? rc->xs : xs;
 +		P[1][1] = rc ? rc->ys : ys;
