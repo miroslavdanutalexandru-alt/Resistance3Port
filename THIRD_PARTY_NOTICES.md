@@ -1,4 +1,4 @@
-# Third-party notices: Resistance 3 PC port (0.3.1-beta)
+# Third-party notices: Resistance 3 PC port (0.3.2-beta)
 
 **How this port is distributed.** The release is source code plus Setup: this repository at the release tag (or the GitHub source archive), and `Resistance3Port-Setup-<version>.exe`, an installer that contains the same files plus the port's own `Launcher.exe`. **No built game program, no game data, and no NVIDIA, Intel or FFmpeg binaries are distributed by this project.** Setup runs on your PC: it reads your own copy of the game, downloads the optional SDKs below from their publishers (after you accept their licences) and builds `build\Resistance3.exe` there.
 
