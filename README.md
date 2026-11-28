@@ -96,6 +96,16 @@ The checks run on your PC only. Nothing is uploaded.
 
 **First launch:** the game shows its own one-time setup screens and an autosave notice. Before the game starts, the launcher prepares the shader cache from your game files (a progress panel; **Skip for now** or Esc skips it), and the game then compiles every known shader behind a **Compiling shaders N / M (P%), about N min left** panel (the window title shows the same; see *Shader precompile*), so levels play without shader stutter from the first visit. Shaders are cached for later starts.
 
+
+### Optional Fast Intro mod
+
+The [Fast Intro mod](docs/FAST_INTRO.md) skips three redundant startup
+branding/notice cards while retaining the epilepsy warning. It is generated
+locally from your own copy of the game using tools/install_fast_intro.py;
+no game assets are shipped. It uses the existing Mods folder support and
+does not alter original game archives, saves, or executables.
+
+
 ## Controls
 
 Keyboard and mouse are supported out of the box: WASD move, Space jump, C/Ctrl crouch, Shift sprint, direct mouse look, Mouse1 fire, Mouse2 aim, Mouse3/F secondary fire, R reload, V/Mouse4 melee, G/Mouse5 grenade, 1/2 grenade type, Q / wheel weapon select, E use, Esc pause, Tab select, F8 releases the mouse. Controllers work too. All keyboard and mouse bindings can be changed in the launcher (Controls page, two keys per action; saved in `controls.txt`).

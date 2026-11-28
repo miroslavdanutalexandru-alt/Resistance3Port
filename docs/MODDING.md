@@ -20,6 +20,14 @@ mods\
   file, or the same archive member or asset, the later one wins.
 - Every override is listed in `logs\run.log` as `[mods]` lines.
 
+
+## Ready-to-use Fast Intro example
+
+[Fast Intro](FAST_INTRO.md) is an optional, reversible startup-card reduction.
+The installer generates a single PSARC member override from the user's own
+game archive, with no game binary or extracted SWF included in the repository.
+
+
 ## 1. Whole files
 
 `mods\MyMod\USRDIR\<path>` replaces `USRDIR\<path>` of the game. This works for loose files
