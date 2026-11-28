@@ -22926,7 +22926,7 @@ index 0000000..4df809b
 +#endif
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
 new file mode 100644
-index 0000000..2e0a4ba
+index 0000000..76406b6
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Gfx.cpp
 @@ -0,0 +1,2964 @@
@@ -24019,7 +24019,7 @@ index 0000000..2e0a4ba
 +	if (logged < 8)
 +	{
 +		logged++;
-+		gxlog("%s target %ux%u (color 0x%08x, depth 0x%08x): scale %u%% -> %u%%", shadow ? "shadow map" : aa_full ? "4-sample (RSX_AA_SAMPLE_RES)" : "effect",
++		gxlogd("%s target %ux%u (color 0x%08x, depth 0x%08x): scale %u%% -> %u%%", shadow ? "shadow map" : aa_full ? "4-sample (RSX_AA_SAMPLE_RES)" : "effect",
 +			L.width, L.height, L.color_addresses[0], L.zeta_address, st.saved.scale_percent, pct);
 +	}
 +}
